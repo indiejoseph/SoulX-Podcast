@@ -186,6 +186,11 @@ class TrainConfig:
     eval_split_size: int = 0               # 0 = no eval split
     max_samples: int = 0                   # 0 = use full dataset, >0 = first N (overfit tests)
     shuffle: bool = True                   # disable for repeatable overfit cycles
+    # Weights & Biases logging
+    wandb: bool = False                    # enable wandb logging
+    wandb_project: str = "soulxpodcast-mtp"
+    wandb_run_name: str = ""               # blank = let wandb autogenerate
+    wandb_entity: str = ""                 # blank = default user/team
 
 
 def parse_args() -> TrainConfig:
@@ -217,6 +222,12 @@ def parse_args() -> TrainConfig:
                    help="If >0, use only the first N samples (overfit tests).")
     p.add_argument("--no_shuffle", action="store_true",
                    help="Disable shuffling (useful for repeatable overfit).")
+    # wandb
+    p.add_argument("--wandb", action="store_true",
+                   help="Log metrics + config to Weights & Biases.")
+    p.add_argument("--wandb_project", default="soulxpodcast-mtp")
+    p.add_argument("--wandb_run_name", default="")
+    p.add_argument("--wandb_entity", default="")
     args = p.parse_args()
     args_dict = vars(args)
     args_dict["shuffle"] = not args_dict.pop("no_shuffle")
@@ -280,6 +291,31 @@ def trunk_forward(base, input_ids, attention_mask):
     return hidden, logits
 
 
+def _maybe_init_wandb(cfg: TrainConfig):
+    """Initialize wandb if enabled. Returns the wandb module or None."""
+    if not cfg.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        log.warning("--wandb passed but `wandb` package not installed; "
+                    "skipping (run `pip install wandb` to enable).")
+        return None
+    init_kwargs = dict(
+        project=cfg.wandb_project,
+        config=asdict(cfg),
+        dir=cfg.output_dir,
+    )
+    if cfg.wandb_run_name:
+        init_kwargs["name"] = cfg.wandb_run_name
+    if cfg.wandb_entity:
+        init_kwargs["entity"] = cfg.wandb_entity
+    wandb.init(**init_kwargs)
+    log.info(f"wandb logging enabled: project={cfg.wandb_project} "
+             f"run={wandb.run.name}")
+    return wandb
+
+
 def train(cfg: TrainConfig):
     torch.manual_seed(cfg.seed)
     dtype = get_dtype(cfg.dtype)
@@ -287,6 +323,8 @@ def train(cfg: TrainConfig):
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "train_config.json").open("w") as f:
         json.dump(asdict(cfg), f, indent=2)
+
+    wandb_run = _maybe_init_wandb(cfg)
 
     # ---- Tokenizer + dataset --------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, use_fast=True)
@@ -402,15 +440,30 @@ def train(cfg: TrainConfig):
                 if global_step % cfg.log_every == 0:
                     dt = time.perf_counter() - t_last_log
                     tps = tokens_since_log / max(dt, 1e-6)
+                    lr_now = scheduler.get_last_lr()[0]
                     head_summary = " | ".join(
                         f"k={h['k']} acc={h['acc_top1']:.3f} ce={h['ce']:.3f} kl={h['kl']:.3f}"
                         for h in per_head
                     )
                     log.info(
                         f"step={global_step}/{total_steps}  "
-                        f"loss={accum_loss:.4f}  lr={scheduler.get_last_lr()[0]:.2e}  "
+                        f"loss={accum_loss:.4f}  lr={lr_now:.2e}  "
                         f"tok/s={tps:.0f}  | {head_summary}"
                     )
+                    if wandb_run is not None:
+                        metrics = {
+                            "train/loss": accum_loss,
+                            "train/lr": lr_now,
+                            "train/tok_per_sec": tps,
+                            "train/step": global_step,
+                        }
+                        for h in per_head:
+                            k = h["k"]
+                            metrics[f"head_{k}/acc_top1"] = h["acc_top1"]
+                            metrics[f"head_{k}/ce"] = h["ce"]
+                            metrics[f"head_{k}/kl"] = h["kl"]
+                            metrics[f"head_{k}/n_positions"] = h["n"]
+                        wandb_run.log(metrics, step=global_step)
                     accum_loss = 0.0
                     tokens_since_log = 0
                     t_last_log = time.perf_counter()
@@ -424,6 +477,9 @@ def train(cfg: TrainConfig):
                         "step": global_step,
                     }, save_path)
                     log.info(f"saved {save_path}")
+                    if wandb_run is not None:
+                        wandb_run.log({"checkpoint/step": global_step},
+                                      step=global_step)
 
                 if cfg.max_steps > 0 and global_step >= cfg.max_steps:
                     break
@@ -444,6 +500,8 @@ def train(cfg: TrainConfig):
         "step": global_step,
     }, save_path)
     log.info(f"done. saved {save_path}")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
