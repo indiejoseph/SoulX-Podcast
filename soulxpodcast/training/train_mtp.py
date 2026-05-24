@@ -73,72 +73,106 @@ def _masked_mean(loss_per_position: torch.Tensor, mask: torch.Tensor) -> torch.T
 
 
 def mtp_loss(
-    mtp_logits_list: list,                # length K-1, each [B, T-k, V]
-    trunk_logits: torch.Tensor,            # [B, T, V] — teacher (detached)
-    input_ids: torch.LongTensor,           # [B, T]
-    speech_mask: torch.LongTensor,         # [B, T]  1 at speech-token positions
+    mtp_hiddens_list: list,                # length K-1, each [B, T-k, H]   (req grad)
+    trunk_hidden: torch.Tensor,             # [B, T, H]  (no grad — teacher hidden)
+    lm_head: nn.Module,                     # shared lm_head (frozen)
+    input_ids: torch.LongTensor,            # [B, T]
+    speech_mask: torch.LongTensor,          # [B, T]
     ce_weight: float = 0.3,
     kl_weight: float = 0.7,
     kl_temperature: float = 1.0,
-    depth_decay: float = 0.5,              # λ_k = depth_decay ** (k-1)
+    depth_decay: float = 0.5,
+    loss_chunk_size: int = 256,             # chunk along seq to bound peak memory
 ):
-    """Per-batch composite loss + per-head metrics.
+    """Memory-efficient MTP loss.
 
-    Layer k (1-indexed) predicts the token at offset +k+1 relative to the
-    trunk hidden's source position. We compute:
-      - CE against `input_ids[:, k+1:]` at positions where the TARGET is a
-        speech token.
-      - KL(student || teacher_detached) where teacher = trunk's own logits at
-        the same target positions. Both softmaxed at `kl_temperature`.
+    The naive version materializes [B, T, V] tensors for student logits,
+    teacher logits, log_softmax outputs, and teacher probs — for each of K-1
+    MTP heads. With V≈159K this is many GB and OOMs at production batch
+    sizes. This version chunks the sequence dimension: for each chunk we
+      1) project hiddens through lm_head to get [B, chunk, V]
+      2) compute CE + KL on that chunk
+      3) accumulate the sums; free intermediates before next chunk
+
+    Peak memory per chunk: O(B * chunk_size * V). With chunk=256 and B=16
+    that's ~1.3 GiB per logits tensor (bf16), comfortable on H100.
+
+    NOTE: trunk_hidden[t] is the trunk's hidden at position t. Projecting
+    through lm_head gives the trunk's prediction for position t+1. The CE
+    target for MTP head k_idx at position p (in the sliced frame) is the
+    token at position k_idx+1+p in `input_ids`; the matching teacher logit
+    comes from `lm_head(trunk_hidden[k_idx + p])` — i.e. teacher hidden
+    slice starts at offset k_idx, not k_idx+1 (off-by-one was the original
+    bug fixed earlier in development).
     """
     B, T = input_ids.shape
     total_loss = input_ids.new_zeros((), dtype=torch.float32)
     per_head = []
 
-    for k_idx, mtp_h_logits in enumerate(mtp_logits_list, start=1):
-        # mtp_h_logits: [B, T-k_idx, V] — predictions made FROM positions [0, T-k_idx)
-        # Targets at offset +1 in that frame → input_ids positions [k_idx+1, T)
-        # Number of valid target positions = T - k_idx - 1
+    for k_idx, mtp_h in enumerate(mtp_hiddens_list, start=1):
+        # mtp_h: [B, T-k_idx, H]. The first valid position predicts token at
+        # offset +k_idx+1. To have a real target we need T - k_idx - 1 positions.
         valid_len = T - k_idx - 1
         if valid_len <= 0:
             per_head.append({"k": k_idx, "ce": 0.0, "kl": 0.0, "n": 0,
                              "acc_top1": 0.0})
             continue
 
-        student_logits = mtp_h_logits[:, :valid_len].contiguous()  # [B, valid, V]
-        target_ids = input_ids[:, k_idx + 1: k_idx + 1 + valid_len]  # [B, valid]
-        mask = speech_mask[:, k_idx + 1: k_idx + 1 + valid_len].to(student_logits.dtype)  # [B, valid]
+        mtp_h_slice = mtp_h[:, :valid_len]                                  # [B, valid, H]
+        trunk_h_slice = trunk_hidden[:, k_idx: k_idx + valid_len]            # [B, valid, H]
+        target_ids = input_ids[:, k_idx + 1: k_idx + 1 + valid_len]          # [B, valid]
+        mask = speech_mask[:, k_idx + 1: k_idx + 1 + valid_len].to(torch.float32)  # [B, valid]
 
-        # CE per position, then masked mean.
-        ce_per_pos = F.cross_entropy(
-            student_logits.reshape(-1, student_logits.size(-1)),
-            target_ids.reshape(-1),
-            reduction="none",
-        ).view(B, valid_len)
-        ce = _masked_mean(ce_per_pos, mask)
+        ce_sum = mtp_h.new_zeros((), dtype=torch.float32)
+        kl_sum = mtp_h.new_zeros((), dtype=torch.float32)
+        correct_sum = mtp_h.new_zeros((), dtype=torch.float32)
+        n_total = mask.sum().clamp_min(1).to(torch.float32)
 
-        # KL(student || teacher_detached) per position.
-        # log-softmax student, softmax teacher — KL formula:
-        # KL = Σ p_teacher * (log p_teacher - log p_student)
-        #
-        # IMPORTANT: trunk_logits[t] is the trunk's prediction of the token at
-        # position t+1 (standard next-token convention). The target token here
-        # is input_ids[k_idx + 1 + i] (position k_idx+1+i), so the matching
-        # teacher logit is trunk_logits[k_idx + i] — NOT trunk_logits[k_idx+1+i],
-        # which would predict the wrong-by-one position.
-        with torch.no_grad():
-            teacher_logits = trunk_logits[:, k_idx: k_idx + valid_len].detach()
-            teacher_log_probs = F.log_softmax(teacher_logits / kl_temperature, dim=-1)
-            teacher_probs = teacher_log_probs.exp()
-        student_log_probs = F.log_softmax(student_logits / kl_temperature, dim=-1)
-        kl_per_pos = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
-        kl = _masked_mean(kl_per_pos, mask) * (kl_temperature ** 2)
+        # Iterate chunks along the sequence dim.
+        for start in range(0, valid_len, loss_chunk_size):
+            end = min(start + loss_chunk_size, valid_len)
+            mask_chunk = mask[:, start:end]
+            # Skip chunks with no mask-active positions — saves a full lm_head.
+            if mask_chunk.sum() == 0:
+                continue
 
-        # Per-head metrics (top-1 acc on speech targets — proxy for acceptance).
-        with torch.no_grad():
-            top1 = student_logits.argmax(dim=-1)
-            correct = ((top1 == target_ids).to(student_logits.dtype) * mask)
-            acc = correct.sum() / mask.sum().clamp_min(1)
+            s_logits = lm_head(mtp_h_slice[:, start:end])  # [B, chunk, V]
+            with torch.no_grad():
+                t_logits = lm_head(trunk_h_slice[:, start:end])  # [B, chunk, V]
+
+            target_chunk = target_ids[:, start:end]
+
+            # CE (fused log_softmax + nll, memory-efficient).
+            ce_pos = F.cross_entropy(
+                s_logits.reshape(-1, s_logits.size(-1)),
+                target_chunk.reshape(-1),
+                reduction="none",
+            ).view(B, end - start)
+            ce_sum = ce_sum + (ce_pos * mask_chunk).sum()
+
+            # KL(student || teacher). Materializes log/probs only on this chunk.
+            s_log = F.log_softmax(s_logits / kl_temperature, dim=-1)
+            with torch.no_grad():
+                t_log = F.log_softmax(t_logits / kl_temperature, dim=-1)
+                t_prob = t_log.exp()
+            kl_pos = (t_prob * (t_log - s_log)).sum(dim=-1)
+            kl_sum = kl_sum + (kl_pos * mask_chunk).sum() * (kl_temperature ** 2)
+
+            # Top-1 acc against dataset tokens (metric only; under KL-only
+            # training this stays low because the model mimics trunk, not data).
+            with torch.no_grad():
+                top1 = s_logits.argmax(dim=-1)
+                correct_sum = correct_sum + (
+                    (top1 == target_chunk).to(torch.float32) * mask_chunk
+                ).sum()
+
+            # Explicitly drop chunk tensors before the next iteration so the
+            # autograd graph doesn't retain them all simultaneously.
+            del s_logits, t_logits, s_log, t_log, t_prob
+
+        ce = ce_sum / n_total
+        kl = kl_sum / n_total
+        acc = correct_sum / n_total
 
         layer_loss = ce_weight * ce + kl_weight * kl
         weight = depth_decay ** (k_idx - 1)
@@ -148,7 +182,7 @@ def mtp_loss(
             "k": k_idx,
             "ce": float(ce.detach().item()),
             "kl": float(kl.detach().item()),
-            "n": int(mask.sum().item()),
+            "n": int(n_total.item()),
             "acc_top1": float(acc.item()),
         })
 
@@ -405,8 +439,15 @@ def train(cfg: TrainConfig):
             attention_mask = batch["attention_mask"].cuda(non_blocking=True)
             speech_mask = batch["speech_mask"].cuda(non_blocking=True)
 
-            # 1) Trunk forward (frozen).
-            trunk_hidden, trunk_logits = trunk_forward(base, input_ids, attention_mask)
+            # 1) Trunk forward (frozen). Don't materialize trunk_logits here —
+            # the chunked loss applies lm_head() on the fly per chunk to avoid
+            # the [B, T, 159K] tensor that would OOM at production batch sizes.
+            with torch.no_grad():
+                out = base.model(
+                    input_ids=input_ids, attention_mask=attention_mask,
+                    use_cache=False, return_dict=True,
+                )
+                trunk_hidden = out.last_hidden_state
 
             # 2) MTP forward (trainable).
             causal_4d = build_causal_mask_4d(attention_mask, dtype=dtype)
@@ -417,11 +458,14 @@ def train(cfg: TrainConfig):
                 rotary_emb=base.model.rotary_emb,
                 causal_mask_4d=causal_4d,
             )
-            mtp_logits_list = [lm_head(h) for h in mtp_hiddens]
 
-            # 3) Loss.
+            # 3) Loss (chunked: lm_head applied per sequence chunk).
             loss, per_head = mtp_loss(
-                mtp_logits_list, trunk_logits, input_ids, speech_mask,
+                mtp_hiddens_list=mtp_hiddens,
+                trunk_hidden=trunk_hidden,
+                lm_head=lm_head,
+                input_ids=input_ids,
+                speech_mask=speech_mask,
                 ce_weight=cfg.ce_weight, kl_weight=cfg.kl_weight,
                 kl_temperature=cfg.kl_temperature, depth_decay=cfg.depth_decay,
             )
@@ -434,8 +478,14 @@ def train(cfg: TrainConfig):
             tokens_since_log += int(speech_mask.sum().item())
 
             if accum_count >= cfg.grad_accum_steps:
-                if cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(mtp.parameters(), cfg.grad_clip)
+                # Always compute the grad norm — when grad_clip <= 0 we still
+                # log it (just don't clip). clip_grad_norm_ returns the
+                # pre-clip total L2 norm across all trainable params.
+                clip_max = cfg.grad_clip if cfg.grad_clip > 0 else float("inf")
+                grad_norm_t = torch.nn.utils.clip_grad_norm_(
+                    mtp.parameters(), max_norm=clip_max
+                )
+                grad_norm = float(grad_norm_t.item()) if grad_norm_t is not None else 0.0
                 optim.step()
                 scheduler.step()
                 optim.zero_grad(set_to_none=True)
@@ -453,12 +503,14 @@ def train(cfg: TrainConfig):
                     log.info(
                         f"step={global_step}/{total_steps}  "
                         f"loss={accum_loss:.4f}  lr={lr_now:.2e}  "
+                        f"|grad|={grad_norm:.3f}  "
                         f"tok/s={tps:.0f}  | {head_summary}"
                     )
                     if wandb_run is not None:
                         metrics = {
                             "train/loss": accum_loss,
                             "train/lr": lr_now,
+                            "train/grad_norm": grad_norm,
                             "train/tok_per_sec": tps,
                             "train/step": global_step,
                         }
