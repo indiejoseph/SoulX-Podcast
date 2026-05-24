@@ -39,20 +39,30 @@ class HFLLMEngine:
         prompt: list[str],
         sampling_param: SamplingParams,
         past_key_values=None,
+        streamer=None,
     ) -> dict:
-        
+
         stopping_criteria = StoppingCriteriaList([EosTokenCriteria(eos_token_id=self.config.hf_config.eos_token_id)])
         if sampling_param.use_ras:
-            sample_hf_engine_handler = partial(_ras_sample_hf_engine, 
-                    use_ras=sampling_param.use_ras, 
-                    win_size=sampling_param.win_size, tau_r=sampling_param.tau_r)
+            # HF's generate() drops `streamer` from the kwargs it forwards to a
+            # custom_generate callable (it filters to keys unique to the custom
+            # function, and `streamer` is shared with the built-in `_sample`).
+            # Bind it into the partial so the custom sampler still receives it.
+            handler_kwargs = dict(
+                use_ras=sampling_param.use_ras,
+                win_size=sampling_param.win_size,
+                tau_r=sampling_param.tau_r,
+            )
+            if streamer is not None:
+                handler_kwargs["streamer"] = streamer
+            sample_hf_engine_handler = partial(_ras_sample_hf_engine, **handler_kwargs)
         else:
             sample_hf_engine_handler = None
         rep_pen_processor = RepetitionPenaltyLogitsProcessor(
             penalty=sampling_param.repetition_penalty,
             prompt_ignore_length=len(prompt)
         ) # exclude the input prompt, consistent with vLLM implementation;
-        with torch.no_grad(): 
+        with torch.no_grad():
             input_len = len(prompt)
             generated_ids = self.model.generate(
                 input_ids = torch.tensor([prompt], dtype=torch.int64).to(self.device),
@@ -66,7 +76,8 @@ class HFLLMEngine:
                 past_key_values=past_key_values,
                 custom_generate=sample_hf_engine_handler,
                 use_cache=True,
-                logits_processor=[rep_pen_processor]
+                logits_processor=[rep_pen_processor],
+                streamer=streamer,
             )
             generated_ids = generated_ids[:, input_len:].cpu().numpy().tolist()[0]
         output = {
@@ -99,14 +110,21 @@ class VLLMEngine:
         prompt: list[str],
         sampling_param: SamplingParams,
         past_key_values=None,
+        streamer=None,
     ) -> dict:
+        # vLLM token-level streaming is not wired here yet; fall back to
+        # post-hoc replay so callers that pass a streamer still observe tokens.
         sampling_param.stop_token_ids = [self.config.hf_config.eos_token_id]
         with torch.no_grad():
             generated_ids = self.model.generate(
-                TokensPrompt(prompt_token_ids=prompt), 
+                TokensPrompt(prompt_token_ids=prompt),
                 VllmSamplingParams(**asdict(sampling_param)),
                 use_tqdm=False,
             )[0].outputs[0].token_ids
+        if streamer is not None:
+            for tok in generated_ids:
+                streamer.put(torch.tensor([tok]))
+            streamer.end()
         output = {
             "text": self.tokenizer.decode(generated_ids),
             "token_ids": list(generated_ids),
