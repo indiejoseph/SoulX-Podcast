@@ -13,3 +13,4 @@ onnxruntime-gpu
 einops
 gradio
 wandb
+datasets<=3.0.0

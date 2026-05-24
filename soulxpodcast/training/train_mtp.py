@@ -178,6 +178,7 @@ class TrainConfig:
     depth_decay: float = 0.5
     num_mtp_layers: int = 3
     max_total_tokens: int = 2048
+    max_speech_tokens: int = 750           # drop clips with >this many speech tokens (~30s @ 25Hz)
     num_workers: int = 2
     log_every: int = 10
     save_every: int = 500
@@ -212,6 +213,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--depth_decay", type=float, default=0.5)
     p.add_argument("--num_mtp_layers", type=int, default=3)
     p.add_argument("--max_total_tokens", type=int, default=2048)
+    p.add_argument("--max_speech_tokens", type=int, default=750)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=500)
@@ -349,7 +351,10 @@ def train(cfg: TrainConfig):
         hf_ds = hf_ds.select(range(cfg.max_samples))
         log.info(f"truncated dataset to first {cfg.max_samples} samples (overfit mode)")
 
-    ds_cfg = MtpDatasetConfig(max_total_tokens=cfg.max_total_tokens)
+    ds_cfg = MtpDatasetConfig(
+        max_total_tokens=cfg.max_total_tokens,
+        max_speech_tokens=cfg.max_speech_tokens,
+    )
     dataset = MtpDataset(hf_ds, tokenizer, ds_cfg)
 
     collator = MtpCollator(pad_token_id=tokenizer.pad_token_id or 0)
