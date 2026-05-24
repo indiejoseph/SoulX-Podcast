@@ -81,6 +81,7 @@ def mtp_loss(
     ce_weight: float = 0.3,
     kl_weight: float = 0.7,
     kl_temperature: float = 1.0,
+    kl_top_k: int = 0,                      # 0 = full-vocab KL; >0 = top-K KL distillation
     depth_decay: float = 0.5,
     loss_chunk_size: int = 256,             # chunk along seq to bound peak memory
 ):
@@ -150,12 +151,40 @@ def mtp_loss(
             ).view(B, end - start)
             ce_sum = ce_sum + (ce_pos * mask_chunk).sum()
 
-            # KL(student || teacher). Materializes log/probs only on this chunk.
-            s_log = F.log_softmax(s_logits / kl_temperature, dim=-1)
-            with torch.no_grad():
-                t_log = F.log_softmax(t_logits / kl_temperature, dim=-1)
-                t_prob = t_log.exp()
-            kl_pos = (t_prob * (t_log - s_log)).sum(dim=-1)
+            # KL(student || teacher).
+            #
+            # Two variants:
+            #   - kl_top_k == 0: full-vocab KL. Materializes log/probs over all
+            #     V≈159K positions per chunk position. Strong supervision
+            #     including tail suppression, but expensive.
+            #   - kl_top_k >  0: top-K KL. Distills only against teacher's
+            #     top-K positions, renormalizing both teacher and student
+            #     over that set. Tail mass is left unconstrained.
+            #
+            # Top-K KL is the natural fit for SoulX-Podcast because:
+            #   1. At inference we already apply top_k=100 sampling, so tail
+            #      mass never gets sampled — distilling it wastes capacity.
+            #   2. Vocab has 152K text + 6.5K speech tokens; at a speech
+            #      position the teacher assigns ~0 mass to text region.
+            #      Top-K skips this uninformative bulk.
+            #   3. ~1600× memory saving on the KL intermediates (K=100 vs V=159K).
+            if kl_top_k > 0:
+                with torch.no_grad():
+                    t_topk_vals, t_topk_idx = t_logits.topk(kl_top_k, dim=-1)
+                    t_log_topk = F.log_softmax(t_topk_vals / kl_temperature, dim=-1)
+                    t_prob_topk = t_log_topk.exp()
+                # Gather student logits at teacher's top-K positions, then
+                # renormalize within that K-element support. This matches
+                # MiniLLM / DistiLLM truncated-KL convention.
+                s_topk = s_logits.gather(-1, t_topk_idx)
+                s_log_topk = F.log_softmax(s_topk / kl_temperature, dim=-1)
+                kl_pos = (t_prob_topk * (t_log_topk - s_log_topk)).sum(dim=-1)
+            else:
+                s_log = F.log_softmax(s_logits / kl_temperature, dim=-1)
+                with torch.no_grad():
+                    t_log = F.log_softmax(t_logits / kl_temperature, dim=-1)
+                    t_prob = t_log.exp()
+                kl_pos = (t_prob * (t_log - s_log)).sum(dim=-1)
             kl_sum = kl_sum + (kl_pos * mask_chunk).sum() * (kl_temperature ** 2)
 
             # Top-1 acc against dataset tokens (metric only; under KL-only
@@ -168,7 +197,11 @@ def mtp_loss(
 
             # Explicitly drop chunk tensors before the next iteration so the
             # autograd graph doesn't retain them all simultaneously.
-            del s_logits, t_logits, s_log, t_log, t_prob
+            del s_logits, t_logits
+            if kl_top_k > 0:
+                del t_topk_vals, t_topk_idx, t_log_topk, t_prob_topk, s_topk, s_log_topk
+            else:
+                del s_log, t_log, t_prob
 
         ce = ce_sum / n_total
         kl = kl_sum / n_total
@@ -209,6 +242,7 @@ class TrainConfig:
     ce_weight: float = 0.3
     kl_weight: float = 0.7
     kl_temperature: float = 1.0
+    kl_top_k: int = 0                      # 0 = full-vocab KL; >0 = top-K KL distillation
     depth_decay: float = 0.5
     num_mtp_layers: int = 3
     max_total_tokens: int = 2048
@@ -244,6 +278,10 @@ def parse_args() -> TrainConfig:
     p.add_argument("--ce_weight", type=float, default=0.3)
     p.add_argument("--kl_weight", type=float, default=0.7)
     p.add_argument("--kl_temperature", type=float, default=1.0)
+    p.add_argument("--kl_top_k", type=int, default=0,
+                   help="If >0, distill against teacher's top-K positions only "
+                        "(MiniLLM-style). 0 = full-vocab KL. Recommended: 100-200 "
+                        "to match inference top_k.")
     p.add_argument("--depth_decay", type=float, default=0.5)
     p.add_argument("--num_mtp_layers", type=int, default=3)
     p.add_argument("--max_total_tokens", type=int, default=2048)
@@ -467,7 +505,8 @@ def train(cfg: TrainConfig):
                 input_ids=input_ids,
                 speech_mask=speech_mask,
                 ce_weight=cfg.ce_weight, kl_weight=cfg.kl_weight,
-                kl_temperature=cfg.kl_temperature, depth_decay=cfg.depth_decay,
+                kl_temperature=cfg.kl_temperature, kl_top_k=cfg.kl_top_k,
+                depth_decay=cfg.depth_decay,
             )
             loss = loss / cfg.grad_accum_steps
 
