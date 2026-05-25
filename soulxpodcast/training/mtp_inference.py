@@ -572,6 +572,54 @@ def _apply_sampling_processors(
     return out
 
 
+def _sample_with_ras(
+    raw_logits: torch.Tensor,         # [1, V] — raw model output
+    context_ids: torch.LongTensor,    # [1, T] — for rep_penalty + RAS window
+    *,
+    temperature: float, top_k: int, top_p: float, repetition_penalty: float,
+    use_ras: bool, win_size: int, tau_r: float,
+    generator: Optional[torch.Generator],
+) -> tuple:
+    """Apply processors → optionally RAS → sample. Returns (token, log_prob).
+
+    `log_prob` is under the EFFECTIVE distribution used to sample (i.e. raw
+    distribution if RAS fired, filtered otherwise). This is what the
+    Leviathan-Kalman acceptance ratio needs as `q(d_k)`.
+    """
+    filtered = _apply_sampling_processors(
+        raw_logits, context_ids,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+        repetition_penalty=repetition_penalty,
+    )
+
+    def _safe_sample(logits):
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        if not torch.isfinite(probs).any() or probs.sum() == 0:
+            tok = logits.argmax(dim=-1, keepdim=True)
+        else:
+            tok = torch.multinomial(probs, num_samples=1, generator=generator)
+        return tok, log_probs.gather(-1, tok)
+
+    if not use_ras:
+        return _safe_sample(filtered)
+
+    # RAS step 1: sample candidate from filtered, check repetition.
+    candidate, _ = _safe_sample(filtered)
+    window = context_ids[:, -win_size:] if context_ids.size(1) > win_size else context_ids
+    rep_count = (window == candidate).sum().item() + 1
+
+    if rep_count < win_size * tau_r:
+        # Candidate is fine — commit it. Reuse its filtered log-prob.
+        filtered_log_probs = F.log_softmax(filtered, dim=-1)
+        return candidate, filtered_log_probs.gather(-1, candidate)
+
+    # RAS fires: discard filtered, fall back to RAW logits (no processors).
+    # This lets the model break out of repetition loops by escaping the
+    # rep_penalty / top_k / top_p / temperature filter.
+    return _safe_sample(raw_logits)
+
+
 def _sample_residual(p_probs: torch.Tensor, q_probs: torch.Tensor,
                      generator: Optional[torch.Generator] = None) -> torch.LongTensor:
     """Sample from the residual distribution max(0, p - q) / normalizer.
@@ -598,6 +646,14 @@ def mtp_speculative_sample_cached(
     top_k: int = 0,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
+    # Repetition-Aware Sampling (VALL-E 2 style; matches production sampler).
+    # When the sampled candidate appears too often in the last `win_size`
+    # committed tokens, reset to raw model logits (no temp/top_k/top_p/rep_pen)
+    # and resample. Helps break degenerate repetition loops, particularly on
+    # languages where the base model is under-trained (e.g. HK Cantonese).
+    use_ras: bool = False,
+    ras_win_size: int = 25,
+    ras_tau_r: float = 0.2,
     seed: Optional[int] = None,
 ) -> SpecDecodeResult:
     """KV-cached MTP speculative decoding with PROPER rejection sampling.
@@ -643,7 +699,6 @@ def mtp_speculative_sample_cached(
     def _sample_from_logits(logits: torch.Tensor) -> torch.LongTensor:
         """Sample one token from already-processed logits. Returns [1, 1]."""
         probs = F.softmax(logits, dim=-1)
-        # Guard against all-inf edge case (shouldn't happen but safe).
         if not torch.isfinite(probs).any() or probs.sum() == 0:
             return logits.argmax(dim=-1, keepdim=True)
         return torch.multinomial(probs, num_samples=1, generator=gen)
@@ -655,6 +710,17 @@ def mtp_speculative_sample_cached(
             logits_1d, context_ids,
             temperature=temperature, top_k=top_k, top_p=top_p,
             repetition_penalty=repetition_penalty,
+        )
+
+    def _ras_sample(raw_1d: torch.Tensor,
+                    context_ids: torch.LongTensor) -> tuple:
+        """Sample with processors + RAS. Returns (token, log_prob_effective)."""
+        return _sample_with_ras(
+            raw_1d, context_ids,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            use_ras=use_ras, win_size=ras_win_size, tau_r=ras_tau_r,
+            generator=gen,
         )
 
     full_ids = input_ids.clone()
@@ -673,15 +739,14 @@ def mtp_speculative_sample_cached(
         h_t = trunk_hidden_full[:, -1:]
 
         # --- d_0: sample from trunk's primary distribution -----------------
-        # context for rep penalty = everything committed so far
+        # context for rep_penalty + RAS window = everything committed so far
         primary_raw = lm_head(h_t)[:, 0]                       # [1, V]
-        p0_logits = _process(primary_raw, full_ids)
-        d_0 = _sample_from_logits(p0_logits)                   # [1, 1]
+        d_0, _ = _ras_sample(primary_raw, full_ids)            # [1, 1]
         drafts = [d_0]
 
         # --- MTP draft loop: each layer produces q_k, sample d_k ----------
-        # Track q_k(d_k) — the probability of the drafted token under the
-        # draft distribution. Needed for the rejection ratio.
+        # Track log q_k(d_k) under the EFFECTIVE draft distribution (raw if
+        # RAS fired, filtered otherwise). Needed for the rejection ratio.
         q_log_probs_at_d: List[torch.Tensor] = []  # length K-1, each [1, 1]
         prev_h = trunk_hidden_full
         pos_ids_full = torch.arange(T, device=device).unsqueeze(0)
@@ -695,14 +760,12 @@ def mtp_speculative_sample_cached(
                 mtp.layers[k - 1], prev_h, target_embed,
                 pos_ids_full, rotary_emb, causal_mask_4d,
             )
-            # Context for rep penalty at this draft position = committed +
-            # drafts[0..k-1]. (drafts[k] is what we're about to sample.)
+            # Context for rep_penalty + RAS at this draft position =
+            # committed + drafts[0..k-1]. (drafts[k] is what we're sampling.)
             ctx_k = torch.cat([full_ids] + drafts[:k], dim=1)
-            qk_logits = _process(lm_head(out_k[:, -1]), ctx_k)   # [1, V]
-            d_k = _sample_from_logits(qk_logits)
-            # Store log q_k(d_k) for the rejection ratio later.
-            qk_logp = F.log_softmax(qk_logits, dim=-1)
-            q_log_probs_at_d.append(qk_logp.gather(-1, d_k))     # [1, 1]
+            qk_raw = lm_head(out_k[:, -1])                       # [1, V]
+            d_k, qk_logp_at_d = _ras_sample(qk_raw, ctx_k)
+            q_log_probs_at_d.append(qk_logp_at_d)               # [1, 1]
             drafts.append(d_k)
             prev_h = out_k
 
@@ -723,13 +786,27 @@ def mtp_speculative_sample_cached(
         replacement = None  # set if a draft is rejected
         for k in range(1, K_cur):
             # p_k = trunk's distribution at position T+k-1 (predicts position T+k)
-            # context for rep penalty = committed + drafts[0..k-1]
+            # context for rep penalty + RAS = committed + drafts[0..k-1]
             ctx_k = torch.cat([full_ids] + drafts[:k], dim=1)
-            pk_logits = _process(lm_head(verify_hidden[:, k - 1]), ctx_k)
-            pk_probs = F.softmax(pk_logits, dim=-1)               # [1, V]
+            pk_raw = lm_head(verify_hidden[:, k - 1])  # [1, V]
 
-            # We have stored log q_k(d_k). Get p_k(d_k).
-            p_at_d = pk_probs.gather(-1, drafts[k])               # [1, 1]
+            # RAS-aware p_k(d_k): if d_k would trigger RAS at this position,
+            # the effective sampling distribution is the raw one. Otherwise
+            # use filtered. This makes the acceptance ratio comparable to q.
+            if use_ras:
+                window = ctx_k[:, -ras_win_size:] if ctx_k.size(1) > ras_win_size else ctx_k
+                rep_count = (window == drafts[k]).sum().item() + 1
+                if rep_count >= ras_win_size * ras_tau_r:
+                    pk_log_eff = F.log_softmax(pk_raw, dim=-1)
+                else:
+                    pk_filtered = _process(pk_raw, ctx_k)
+                    pk_log_eff = F.log_softmax(pk_filtered, dim=-1)
+            else:
+                pk_filtered = _process(pk_raw, ctx_k)
+                pk_log_eff = F.log_softmax(pk_filtered, dim=-1)
+
+            # pk_probs only needed at the drafted position (no need to materialize full softmax)
+            p_at_d = pk_log_eff.gather(-1, drafts[k]).exp()       # [1, 1]
             q_at_d = q_log_probs_at_d[k - 1].exp()                # [1, 1]
 
             # u ~ U(0,1). Accept if u < min(1, p/q).
@@ -738,20 +815,13 @@ def mtp_speculative_sample_cached(
             if (u < ratio).item():
                 n_accept += 1
                 continue
-            # Rejected: sample replacement from residual max(0, p - q) / norm.
-            # Reconstruct q_k probs from logits we processed during draft.
-            # (Cheaper: store qk_probs alongside log-prob. But re-deriving is fine
-            #  for clarity. We'd need to re-run _process — we already have
-            #  ctx_k matching the draft side since drafts[0..k-1] are committed
-            #  exactly as the draft loop saw them.)
-            # Reproduce the draft-side q_k distribution using the SAME processors.
-            # NOTE: this requires re-running the MTP layer or storing qk_logits.
-            # Simpler / sufficient: sample from p_k directly. This biases the
-            # distribution slightly (more conservative — picks trunk's pref)
-            # but is still valid as the "fallback" path. For strict Leviathan-
-            # Kalman we'd want the residual; the bias is small in practice
-            # when q ≈ p (which is what KD training achieves).
-            replacement = _sample_from_logits(pk_logits)         # [1, 1]
+            # Rejected: sample replacement.
+            # NOTE: strict Leviathan-Kalman would sample from `max(0, p_k - q_k)`
+            # normalized; we use p_k directly (slight bias toward trunk's mode
+            # but cheaper — avoids re-materializing q_k probs). When q ≈ p
+            # (what KD training achieves), the bias is small. We apply
+            # processors + RAS here for consistency with production behavior.
+            replacement, _ = _ras_sample(pk_raw, ctx_k)
             break
 
         # --- Determine bonus / replacement token --------------------------
@@ -762,15 +832,17 @@ def mtp_speculative_sample_cached(
         elif n_accept == K_cur:
             # All drafts accepted: sample one bonus token from p_K (trunk's
             # prediction at position T+K-1, one beyond all drafts).
+            # Use RAS here too — matches production sampling behavior at this
+            # position when generating autoregressively.
             ctx_K = torch.cat([full_ids] + drafts, dim=1)
-            pK_logits = _process(lm_head(verify_hidden[:, K_cur - 1]), ctx_K)
-            bonus_id = _sample_from_logits(pK_logits)
+            pK_raw = lm_head(verify_hidden[:, K_cur - 1])
+            bonus_id, _ = _ras_sample(pK_raw, ctx_K)
         else:
             # Shouldn't happen given the loop above always sets replacement
             # when n_accept < K_cur. Defensive fallback.
             ctx_n = torch.cat([full_ids] + drafts[:n_accept], dim=1)
-            pn_logits = _process(lm_head(verify_hidden[:, n_accept - 1]), ctx_n)
-            bonus_id = _sample_from_logits(pn_logits)
+            pn_raw = lm_head(verify_hidden[:, n_accept - 1])
+            bonus_id, _ = _ras_sample(pn_raw, ctx_n)
 
         # --- Cache management ---------------------------------------------
         # Cache has T + K positions after verify. Crop to T + n_accept (keep
