@@ -156,12 +156,20 @@ def overfit_train(tokenizer, hf_ds, eos_id):
         r=32, lora_alpha=64, lora_dropout=0.0, bias="none",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
+        modules_to_save=["lm_head"],   # critical — see CosyVoice2 recipe
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(base, lora_cfg)
     model.train()
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"trainable params: {n_trainable/1e6:.1f}M")
+
+    # Verify lm_head is unfrozen.
+    lm_head_trainable = any(
+        p.requires_grad for n, p in model.named_parameters() if "lm_head" in n
+    )
+    log.info(f"lm_head trainable={lm_head_trainable}")
+    assert lm_head_trainable, "lm_head should be in modules_to_save"
 
     optim = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -191,6 +199,7 @@ def overfit_train(tokenizer, hf_ds, eos_id):
             shift_logits.reshape(-1, shift_logits.size(-1)),
             shift_targets.reshape(-1),
             reduction="none",
+            label_smoothing=0.1,    # borrowed from CosyVoice2 recipe
         ).reshape(shift_targets.shape)
         loss = (ce * shift_mask).sum() / shift_mask.sum().clamp_min(1.0)
 

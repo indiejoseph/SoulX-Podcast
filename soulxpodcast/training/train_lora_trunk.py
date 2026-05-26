@@ -100,13 +100,30 @@ class TrainConfig:
     grad_clip: float = 1.0
     dtype: str = "bf16"
     seed: int = 42
-    # LoRA
-    lora_rank: int = 32
-    lora_alpha: int = 64
+    # LoRA — matches CosyVoice2's working recipe (r=8, alpha=16, scale=2.0).
+    # r=8 is sufficient to steer language/style bias and dramatically reduces
+    # hidden-state drift (vs r=32) → safer co-adaptation with lm_head.
+    lora_rank: int = 8
+    lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    # Fully-trained modules (NOT LoRA-factorized). Default: just lm_head, which
+    # matches CosyVoice2's working recipe and is required to prevent the
+    # frozen-lm_head-can't-decode-drifted-hidden-states garbling. Qwen3 uses
+    # `tie_word_embeddings=True`, so including embed_tokens here would unmake
+    # the tie and double memory; lm_head alone is sufficient and safe.
+    lora_modules_to_save: str = "lm_head"
     # Loss
     include_text_loss: bool = False         # if False, CE only on speech-token positions
+    # Label smoothing for CE — borrowed from CosyVoice2's LabelSmoothingLoss.
+    # Prevents the model from becoming over-confident on training tokens, which
+    # is especially important when the dataset's "correct" speech token is just
+    # one of many acoustically-equivalent draws. 0.0 = no smoothing (vanilla
+    # CE); 0.1 is the common default in seq2seq / speech-LM training.
+    label_smoothing: float = 0.1
+    # Activation memory saver — necessary when lm_head is in modules_to_save
+    # (adds 326M trainable params worth of optimizer/grad state).
+    gradient_checkpointing: bool = True
     # Dataset filtering
     lang_filter: str = ""                   # if non-empty, only train on this lang (en/zh/yue)
     max_total_tokens: int = 2048
@@ -139,14 +156,25 @@ def parse_args() -> TrainConfig:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--lora_rank", type=int, default=32)
-    p.add_argument("--lora_alpha", type=int, default=64)
+    p.add_argument("--lora_rank", type=int, default=8)
+    p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--lora_target_modules", type=str,
                    default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
                    help="Comma-separated list of module suffix names to apply LoRA to.")
+    p.add_argument("--lora_modules_to_save", type=str,
+                   default="lm_head",
+                   help="Modules to fully unfreeze (NOT LoRA-factorized). Set "
+                        "empty string to disable. Default unfreezes lm_head — "
+                        "required to prevent frozen-lm_head garbling when the "
+                        "LoRA shifts hidden states.")
     p.add_argument("--include_text_loss", action="store_true",
                    help="Include text-token positions in CE loss (default: speech only).")
+    p.add_argument("--label_smoothing", type=float, default=0.1,
+                   help="Label smoothing for CE (CosyVoice2 recipe). 0.0 disables. "
+                        "Default 0.1 prevents over-confidence on training tokens.")
+    p.add_argument("--no_gradient_checkpointing", action="store_true",
+                   help="Disable gradient checkpointing (default ON; needed for lm_head trainable).")
     p.add_argument("--lang_filter", type=str, default="",
                    help="If set (en/zh/yue), train only on samples of this language.")
     p.add_argument("--max_total_tokens", type=int, default=2048)
@@ -163,6 +191,7 @@ def parse_args() -> TrainConfig:
     args = p.parse_args()
     args_dict = vars(args)
     args_dict["shuffle"] = not args_dict.pop("no_shuffle")
+    args_dict["gradient_checkpointing"] = not args_dict.pop("no_gradient_checkpointing")
     return TrainConfig(**args_dict)
 
 
@@ -180,18 +209,27 @@ def build_model_with_lora(cfg: TrainConfig, dtype: torch.dtype):
     base = AutoModelForCausalLM.from_pretrained(
         cfg.model_path, dtype=dtype, device_map="cuda",
     )
+    if cfg.gradient_checkpointing:
+        # Necessary headroom for lm_head being trainable (326M extra params +
+        # AdamW state). Without checkpointing, peak activation memory ≈ 30 GB
+        # at batch=8/T=512; checkpointing trades ~30% compute for ~3x memory.
+        base.gradient_checkpointing_enable()
+        log.info("gradient checkpointing: ON")
 
     target_modules = [m.strip() for m in cfg.lora_target_modules.split(",") if m.strip()]
+    modules_to_save = [m.strip() for m in cfg.lora_modules_to_save.split(",") if m.strip()]
     lora_config = LoraConfig(
         r=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
         lora_dropout=cfg.lora_dropout,
         target_modules=target_modules,
+        modules_to_save=modules_to_save or None,
         bias="none",
         task_type="CAUSAL_LM",
     )
     log.info(f"applying LoRA: rank={cfg.lora_rank} alpha={cfg.lora_alpha} "
-             f"dropout={cfg.lora_dropout} targets={target_modules}")
+             f"dropout={cfg.lora_dropout} targets={target_modules} "
+             f"modules_to_save={modules_to_save}")
     model = get_peft_model(base, lora_config)
 
     # Sanity log: param counts.
@@ -212,6 +250,7 @@ def compute_lm_loss(
     input_ids: torch.LongTensor,    # [B, T]
     loss_mask: torch.LongTensor,    # [B, T]  — 1 at positions where loss applies
     top_ks: tuple = (1, 5, 20),
+    label_smoothing: float = 0.0,
 ):
     """Standard causal LM loss, masked by `loss_mask`.
 
@@ -219,6 +258,12 @@ def compute_lm_loss(
     The loss at position t therefore uses logits[t] vs target input_ids[t+1].
     We apply the mask AT THE TARGET POSITION (t+1) — if the target is a speech
     token (mask=1), include the loss; otherwise skip.
+
+    Label smoothing borrowed from CosyVoice2's LabelSmoothingLoss recipe:
+    PyTorch's built-in `label_smoothing` parameter on F.cross_entropy gives
+    the same effect (slight numerical difference vs CosyVoice's `eps/(V-1)`
+    formulation that's irrelevant at V=159K) and uses the optimized
+    log-softmax kernel — no [B*T, V] target distribution materialization.
 
     Returns (loss, accs_dict, n_masked) where accs_dict maps each k in top_ks
     to top-k accuracy at masked positions. With a 159K vocab and CE training,
@@ -236,6 +281,7 @@ def compute_lm_loss(
         shift_logits.reshape(-1, V),
         shift_targets.reshape(-1),
         reduction="none",
+        label_smoothing=label_smoothing,
     ).view(B, Tm1)
     denom = shift_mask.sum().clamp_min(1)
     loss = (ce_per_pos * shift_mask).sum() / denom
@@ -392,7 +438,10 @@ def train(cfg: TrainConfig):
             )
             logits = out.logits  # [B, T, V]
 
-            loss, accs, n_loss_tokens = compute_lm_loss(logits, input_ids, loss_mask)
+            loss, accs, n_loss_tokens = compute_lm_loss(
+                logits, input_ids, loss_mask,
+                label_smoothing=cfg.label_smoothing,
+            )
             loss = loss / cfg.grad_accum_steps
 
             loss.backward()
