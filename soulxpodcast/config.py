@@ -39,7 +39,7 @@ class SoulXPodcastLLMConfig:
     lm_head_bias: bool = False
     qkv_bias: bool = False
     fp16_flow: bool = False
-    speech_token_offset: int = 152927
+    speech_token_offset: int = 153595  # id of <|0|> in tokenizer vocab; overridden by soulxpodcast_config.json at load
 
     @classmethod
     def from_initial_and_json(

@@ -69,7 +69,7 @@ DIALECT_PREFIX = {
 @dataclass
 class MtpDatasetConfig:
     """Knobs for `MtpDataset`. Keep small + serializable."""
-    speech_token_offset: int = 152927      # from soulxpodcast_config.json
+    speech_token_offset: int = 153595      # from soulxpodcast_config.json — id of <|0|> in tokenizer vocab
     max_total_tokens: int = 2048           # drop full sequences longer than this
     min_speech_tokens: int = 8             # filter trivially-short clips, also catches None/empty speech_tokens
     max_speech_tokens: int = 750           # drop clips with >this many speech tokens
