@@ -326,6 +326,11 @@ def train(cfg: TrainConfig):
     ds_cfg = MtpDatasetConfig(
         max_total_tokens=cfg.max_total_tokens,
         max_speech_tokens=cfg.max_speech_tokens,
+        # Trunk LM training needs the EOS (semantic_token_end) position in the
+        # loss mask so it learns when to stop. The default (False) is correct
+        # for MTP training but wrong for trunk LM — fixes the runaway-generation
+        # bug seen in the first lora_hk_full run.
+        include_eos_in_speech_mask=True,
     )
     dataset = MtpDataset(hf_ds, tokenizer, ds_cfg)
 

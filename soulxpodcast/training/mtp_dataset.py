@@ -77,6 +77,10 @@ class MtpDatasetConfig:
                                             #  samples without speech_tokens were skipped upstream
                                             #  because they exceeded this duration too)
     skip_dialect_prefix: bool = False      # for ablations
+    # Trunk LM next-token prediction needs the EOS target in the loss so the
+    # model learns to terminate. MTP heads predict K-step-ahead and should NOT
+    # try to predict past the last speech token, so they leave this False.
+    include_eos_in_speech_mask: bool = False
     text_field: str = "text"
     speech_tokens_field: str = "speech_tokens"
     lang_field: str = "lang"
@@ -250,8 +254,14 @@ class MtpDataset(Dataset):
         speech_start = (
             len(self._task_prefix_ids) + len(text_ids) + len(self._text_to_speech_ids)
         )
-        speech_end = speech_start + len(speech_tokens_llm)  # excludes EOS
-        speech_mask[speech_start:speech_end] = 1
+        speech_end = speech_start + len(speech_tokens_llm)  # last speech token (exclusive)
+        # Optionally extend by one to cover the semantic_token_end (speech EOS)
+        # position so trunk training can learn termination. With the shift
+        # done in compute_lm_loss (mask[:, 1:] aligns with targets[:, 1:]),
+        # mask[speech_end] = 1 means the loss includes predicting EOS from
+        # the last speech-token position.
+        mask_end = speech_end + (1 if self.config.include_eos_in_speech_mask else 0)
+        speech_mask[speech_start:mask_end] = 1
 
         return {
             "input_ids": input_ids,
