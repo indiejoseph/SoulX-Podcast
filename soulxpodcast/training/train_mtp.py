@@ -340,6 +340,13 @@ def build_model_and_mtp(cfg: TrainConfig, dtype: torch.dtype):
     decoder_layer_cls = base.model.layers[0].__class__
     mtp = SequentialMTP(mtp_config, decoder_layer_cls, bc)
 
+    # Warm-start every MTP layer from the trunk's LAST decoder layer + its
+    # final RMSNorm. This gives each head a competent starting point (instead
+    # of random init) and makes its `final_norm` match the trunk's post-norm
+    # distribution that `lm_head` was trained on.
+    mtp.init_from_trunk(base.model.layers[-1], base.model.norm)
+    log.info("warm-started MTP layers from base.model.layers[-1] + base.model.norm")
+
     # Move to GPU + dtype. Trainable params stay fp32 for the optimizer master copy.
     mtp = mtp.to(device="cuda", dtype=dtype)
 

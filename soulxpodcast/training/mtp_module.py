@@ -72,16 +72,37 @@ class MTPLayer(nn.Module):
         self.norm_e = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        # Transformer block — fresh-init instance of the trunk's decoder layer
-        # class, built with the trunk's HF config (so attention impl, RoPE,
-        # GQA, SwiGLU all match exactly). Random weights — trained from scratch.
+        # Transformer block — instance of the trunk's decoder layer class with
+        # the trunk's HF config. Weights default to fresh-init; call
+        # `init_from_trunk` after construction to warm-start from a trunk layer.
         self.transformer = decoder_layer_cls(base_hf_config, layer_idx=0)
+
+        # Final norm to match the trunk's post-last-layer RMSNorm. Without this
+        # the head output is fed to lm_head OUT-OF-DISTRIBUTION (lm_head was
+        # trained on post-norm activations) and the heads compensate by
+        # producing wildly inflated activations — degrades CE and acceptance.
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self._init_weights()
 
     def _init_weights(self):
         # Light init — matches Qwen3's default scheme.
         nn.init.normal_(self.proj.weight, mean=0.0, std=self.config.initializer_range)
+
+    def init_from_trunk(self, trunk_decoder_layer: nn.Module, trunk_final_norm: nn.Module):
+        """Warm-start the trainable submodules from the trunk's matching pieces.
+
+        Copies:
+          - transformer block weights from a chosen trunk decoder layer
+          - final_norm weight from the trunk's `base.model.norm`
+
+        This skips the proj / norm_h / norm_e mixing block (no trunk counterpart),
+        which keeps its fresh init. Mixing inputs are pre-normed so the proj
+        weights converge fast on top of an already-reasonable transformer block.
+        """
+        self.transformer.load_state_dict(trunk_decoder_layer.state_dict())
+        with torch.no_grad():
+            self.final_norm.weight.copy_(trunk_final_norm.weight)
 
     def forward(
         self,
@@ -103,6 +124,9 @@ class MTPLayer(nn.Module):
         )
         if isinstance(out, tuple):
             out = out[0]
+        # Bring output into the same distribution as the trunk's final hidden
+        # state (post-`base.model.norm`) so lm_head consumes it correctly.
+        out = self.final_norm(out)
         return out
 
 
@@ -126,6 +150,11 @@ class SequentialMTP(nn.Module):
             MTPLayer(config, decoder_layer_cls, base_hf_config)
             for _ in range(config.num_mtp_layers)
         ])
+
+    def init_from_trunk(self, trunk_decoder_layer: nn.Module, trunk_final_norm: nn.Module):
+        """Warm-start every MTP layer from the trunk's last decoder layer + norm."""
+        for layer in self.layers:
+            layer.init_from_trunk(trunk_decoder_layer, trunk_final_norm)
 
     def forward(
         self,
