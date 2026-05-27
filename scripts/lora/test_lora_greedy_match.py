@@ -13,11 +13,12 @@ If even THIS produces wrong tokens, there's a deeper bug — possibly in the
 LoRA merge path, weight tying, or how we're constructing the prefix.
 """
 
+from __future__ import annotations
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from __future__ import annotations
 
 from pathlib import Path
 

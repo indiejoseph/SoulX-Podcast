@@ -5,11 +5,12 @@ forward → loss → backward → step) without needing the real dataset to be
 saved first. Catches integration bugs before the H100 run.
 """
 
+from __future__ import annotations
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from __future__ import annotations
 
 import json
 import sys
@@ -21,7 +22,7 @@ from datasets import Dataset
 from soulxpodcast.training.train_mtp import TrainConfig, train
 
 
-MODEL_PATH = "pretrained_models/SoulX-Podcast-1.7B-dialect"
+MODEL_PATH = "pretrained_models/SoulX-Podcast-1.7B-dialect-avg"
 
 
 def make_fake_dataset(out_path: Path, n: int = 8):

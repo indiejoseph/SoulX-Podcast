@@ -3,11 +3,12 @@ then synthesize audio via flow + vocoder. If these sound right, the
 extraction script is correct and the dataset just needs re-extraction.
 """
 
+from __future__ import annotations
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from __future__ import annotations
 
 import io
 from pathlib import Path

@@ -12,11 +12,12 @@ inference on that same text should produce intelligible audio close to the
 expected duration. If even that's garbled, the pipeline has a remaining bug.
 """
 
+from __future__ import annotations
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from __future__ import annotations
 
 import time
 from pathlib import Path

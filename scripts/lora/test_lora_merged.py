@@ -8,11 +8,12 @@ Generates the same 3 test cases as mtp_audio_ab.py, but compares:
 No MTP — this isolates the LoRA style transfer.
 """
 
+from __future__ import annotations
+
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from __future__ import annotations
 
 import argparse
 import gc
