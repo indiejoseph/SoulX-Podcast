@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 pretrained_models/
 outputs/
+logs/
+*.log
 
 # API temporary files
 api/temp/

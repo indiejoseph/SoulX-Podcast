@@ -5,6 +5,10 @@ forward → loss → backward → step) without needing the real dataset to be
 saved first. Catches integration bugs before the H100 run.
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
 from __future__ import annotations
 
 import json

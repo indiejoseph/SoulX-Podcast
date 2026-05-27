@@ -13,6 +13,10 @@ This tells us whether the high CE we see during training is "expected" data
 divergence or a smoking-gun for a bug in the pipeline.
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
 from __future__ import annotations
 
 import sys
