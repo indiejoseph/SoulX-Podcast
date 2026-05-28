@@ -439,11 +439,7 @@ class SoulXPodcastService:
             f.write(payload)
             return Path(f.name)
 
-    def _resolve_prompt_audio(
-        self,
-        prompt_audio: str,
-        prompt_text: str,
-    ) -> Tuple[Path, bool, str]:
+    def _resolve_prompt_audio(self, prompt_audio: str, prompt_text: str) -> Dict[str, Any]:
         value = prompt_audio.strip()
         if not value:
             raise ValueError("prompt_audio must not be empty")
@@ -454,7 +450,10 @@ class SoulXPodcastService:
                 raise ValueError("prompt_audio file:// URI must reference a local file")
             path = Path(unquote(parsed.path))
             path = self._validate_prompt_audio_path(path, label="inline")
-            return path, False, self._prompt_file_cache_key(path, prompt_text)
+            return {
+                "prompt_audio": str(path),
+                "_cache_key": self._prompt_file_cache_key(path, prompt_text),
+            }
 
         if value.startswith("data:"):
             try:
@@ -470,7 +469,11 @@ class SoulXPodcastService:
             except binascii.Error as e:
                 raise ValueError("prompt_audio contains invalid base64 data") from e
             cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
-            return self._write_inline_prompt_audio(payload, suffix), True, cache_key
+            return {
+                "_cache_key": cache_key,
+                "_inline_audio_payload": payload,
+                "_inline_audio_suffix": suffix,
+            }
 
         try:
             payload = base64.b64decode(value, validate=True)
@@ -479,7 +482,11 @@ class SoulXPodcastService:
                 "prompt_audio must be a file:// URI, data:audio/*;base64 URI, or raw base64 audio"
             ) from e
         cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
-        return self._write_inline_prompt_audio(payload, ".wav"), True, cache_key
+        return {
+            "_cache_key": cache_key,
+            "_inline_audio_payload": payload,
+            "_inline_audio_suffix": ".wav",
+        }
 
     def _resolve_voice(self, voice: Any) -> Dict[str, str]:
         if isinstance(voice, str):
@@ -512,17 +519,15 @@ class SoulXPodcastService:
             if not request.prompt_text or not request.prompt_text.strip():
                 raise ValueError("prompt_text is required when prompt_audio is provided")
             prompt_text = request.prompt_text.strip()
-            audio_path, delete_after_prepare, cache_key = self._resolve_prompt_audio(
+            prompt = self._resolve_prompt_audio(
                 request.prompt_audio,
                 prompt_text,
             )
-            return {
+            prompt.update({
                 "id": "inline_prompt",
-                "prompt_audio": str(audio_path),
                 "prompt_text": prompt_text,
-                "_delete_after_prepare": delete_after_prepare,
-                "_cache_key": cache_key,
-            }
+            })
+            return prompt
         if request.prompt_text:
             raise ValueError("prompt_audio is required when prompt_text is provided")
         if request.voice is not None:
@@ -557,6 +562,8 @@ class SoulXPodcastService:
         return entry
 
     def _encode_target_text(self, text: str) -> List[int]:
+        # Keep this template in sync with PodcastInferHandler.__getitem__
+        # target-text preprocessing in soulxpodcast/utils/dataloader.py.
         normalized = normalize_text(text)
         token_text = f"{SPK_DICT[0]}{TEXT_START}{normalized}{TEXT_END}{AUDIO_START}"
         return self.dataset.text_tokenizer.encode(token_text)
@@ -567,8 +574,15 @@ class SoulXPodcastService:
         if cached is not None:
             return cached
 
-        prompt_audio_path = Path(voice["prompt_audio"])
-        temp_prompt_audio = prompt_audio_path if voice.get("_delete_after_prepare") else None
+        temp_prompt_audio = None
+        if "_inline_audio_payload" in voice:
+            temp_prompt_audio = self._write_inline_prompt_audio(
+                voice["_inline_audio_payload"],
+                voice.get("_inline_audio_suffix", ".wav"),
+            )
+            prompt_audio_path = temp_prompt_audio
+        else:
+            prompt_audio_path = Path(voice["prompt_audio"])
         try:
             prepared = process_single_input(
                 self.dataset,
@@ -612,7 +626,7 @@ class SoulXPodcastService:
             "prompt_mels_lens_for_llm": prepared["prompt_mels_lens_for_llm"],
             "prompt_text_tokens_for_llm": prepared["prompt_text_tokens_for_llm"],
             "prompt_mels_for_flow_ori": prepared["prompt_mels_for_flow_ori"],
-            "prompt_mels_lens_for_flow": prepared.get("prompt_mels_lens_for_flow"),
+            "prompt_mels_lens_for_flow": prepared["prompt_mels_lens_for_flow"],
             "spk_emb_for_flow": prepared["spk_emb_for_flow"],
             "prompt_prefix_ids": prompt_prefix_ids,
             "prompt_tokens": prompt_token_list,
