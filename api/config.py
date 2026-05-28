@@ -50,7 +50,8 @@ class APIConfig:
     fp16_flow: bool = os.getenv("FP16_FLOW", "false").lower() == "true"
 
     # API security
-    api_key: str = os.getenv("API_KEY", "").strip()
+    # SOULX_API_KEY is the legacy name; API_KEY takes precedence.
+    api_key: str = (os.getenv("API_KEY") or os.getenv("SOULX_API_KEY", "")).strip()
     require_api_key: bool = _env_bool("REQUIRE_API_KEY", True)
     cors_allowed_origins: tuple[str, ...] = _env_csv("CORS_ALLOWED_ORIGINS")
     cors_allow_credentials: bool = _env_bool("CORS_ALLOW_CREDENTIALS", False)
@@ -112,7 +113,12 @@ class APIConfig:
             raise ValueError("CORS_ALLOW_CREDENTIALS=true cannot be used with CORS_ALLOWED_ORIGINS=*")
 
     def validate_runtime_security(self):
-        """Validate settings that should fail server startup in production mode."""
+        """Validate settings that should fail server startup in production mode.
+
+        Called from the FastAPI lifespan, not __post_init__, so that scripts and
+        tests that import config without starting a server are not required to
+        set API_KEY.
+        """
         if not self.require_api_key:
             return
         if not self.api_key:

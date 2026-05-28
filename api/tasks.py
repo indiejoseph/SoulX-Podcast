@@ -197,6 +197,8 @@ class TaskManager:
     async def _next_task_id(self) -> tuple[Optional[str], bool]:
         redis = await get_async_redis_client()
         if redis is not None:
+            # timeout=1 keeps the loop responsive to CancelledError; each idle
+            # worker wakes at most once per second when the queue is empty.
             item = await redis.blpop(self.queue_key, timeout=1)
             if item is None:
                 return None, False

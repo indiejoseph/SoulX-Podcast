@@ -47,7 +47,7 @@ def save_upload_file(upload_file: UploadFile, task_id: str, index: int) -> Path:
                     )
                 buffer.write(chunk)
 
-        logger.info(f"Saved upload file to {file_path}")
+        logger.info("Saved upload file to %s", file_path)
         return file_path
 
     except HTTPException:
@@ -55,7 +55,7 @@ def save_upload_file(upload_file: UploadFile, task_id: str, index: int) -> Path:
     except Exception as e:
         if file_path is not None:
             file_path.unlink(missing_ok=True)
-        logger.error(f"Failed to save upload file: {e}")
+        logger.error("Failed to save upload file: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
     finally:
         upload_file.file.close()
@@ -128,12 +128,12 @@ def cleanup_old_files(directory: Path, minutes: int = 30) -> int:
                     try:
                         file_path.unlink()
                         cleaned_count += 1
-                        logger.info(f"Cleaned up old file: {file_path}")
+                        logger.info("Cleaned up old file: %s", file_path)
                     except Exception as e:
-                        logger.warning(f"Failed to delete {file_path}: {e}")
+                        logger.warning("Failed to delete %s: %s", file_path, e)
 
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.error("Error during cleanup: %s", e)
 
     return cleaned_count
 

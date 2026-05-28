@@ -60,11 +60,7 @@ async def close_async_redis_client() -> None:
     global _async_client
     if _async_client is None:
         return
-    close = getattr(_async_client, "aclose", None) or getattr(_async_client, "close", None)
-    if close is not None:
-        result = close()
-        if hasattr(result, "__await__"):
-            await result
+    await _async_client.aclose()
     _async_client = None
 
 
@@ -75,6 +71,18 @@ def ping_redis() -> bool | None:
         return None
     try:
         return bool(client.ping())
+    except Exception:
+        logger.exception("Redis health check failed")
+        return False
+
+
+async def async_ping_redis() -> bool | None:
+    """Return Redis availability without blocking the event loop."""
+    client = await get_async_redis_client()
+    if client is None:
+        return None
+    try:
+        return bool(await client.ping())
     except Exception:
         logger.exception("Redis health check failed")
         return False

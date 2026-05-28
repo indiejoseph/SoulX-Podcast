@@ -26,7 +26,7 @@ from api.models import (
 )
 from api.service import get_service
 from api.tasks import get_task_manager
-from api.redis_state import ping_redis
+from api.redis_state import async_ping_redis
 from api.utils import (
     generate_task_id,
     save_upload_file,
@@ -68,7 +68,7 @@ async def lifespan(app: FastAPI):
             count = cleanup_old_files(config.temp_dir, config.file_cleanup_minutes)
             count += cleanup_old_files(config.output_dir, config.file_cleanup_minutes)
             if count > 0:
-                logger.info(f"Cleaned up {count} old files")
+                logger.info("Cleaned up %d old files", count)
 
     cleanup_task_handle = asyncio.create_task(cleanup_task())
 
@@ -137,7 +137,7 @@ async def health_check():
     """Health check."""
     service = get_service()
     task_manager = get_task_manager()
-    redis_available = ping_redis()
+    redis_available = await async_ping_redis()
     model_loaded = service.is_loaded()
     gpu_available = torch.cuda.is_available()
     healthy = model_loaded and gpu_available and redis_available is not False
@@ -240,7 +240,7 @@ async def generate_sync(
             path = save_upload_file(file, task_id, i)
             audio_paths.append(str(path))
 
-        logger.info(f"Sync generation started: task_id={task_id}, speakers={len(audio_paths)}")
+        logger.info("Sync generation started: task_id=%s, speakers=%d", task_id, len(audio_paths))
 
         service = get_service()
         sample_rate, audio_array = service.generate(
@@ -258,7 +258,7 @@ async def generate_sync(
         output_path = config.output_dir / output_filename
         wavfile.write(str(output_path), sample_rate, audio_array)
 
-        logger.info(f"Sync generation completed: task_id={task_id}")
+        logger.info("Sync generation completed: task_id=%s", task_id)
 
         return FileResponse(
             path=str(output_path),
@@ -269,7 +269,7 @@ async def generate_sync(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Sync generation failed: {e}", exc_info=True)
+        logger.error("Sync generation failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -330,7 +330,7 @@ async def generate_async(
             repetition_penalty=repetition_penalty,
         )
 
-        logger.info(f"Async task created: task_id={task_id}")
+        logger.info("Async task created: task_id=%s", task_id)
 
         return TaskCreateResponse(
             task_id=task_id,
@@ -342,7 +342,7 @@ async def generate_async(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Task creation failed: {e}", exc_info=True)
+        logger.error("Task creation failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -395,7 +395,7 @@ async def download_file(filename: str, _: None = Depends(require_api_key)):
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error("Unhandled exception: %s", exc, exc_info=True)
     return JSONResponse(
         status_code=500,
         content=ErrorResponse(
