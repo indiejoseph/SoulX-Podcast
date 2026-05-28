@@ -25,6 +25,7 @@ services:
       TRT_ONNX: "${TRT_ONNX:-/app/exports/flow_runtime/flow.decoder.estimator.fp32.streaming.onnx}"
       TRT_PLAN: "${TRT_PLAN:-/app/exports/flow_runtime/flow.decoder.estimator.fp16.streaming.plan}"
       TRT_OPT_MEL_LEN: "${TRT_OPT_MEL_LEN:-256}"
+      PROMPT_AUDIO_ROOT: "${PROMPT_AUDIO_ROOT:-/app}"
       VOICE_REGISTRY_PATH: "/app/config/voices.example.json"
       DEFAULT_VOICE_ID: "female_mandarin"
       SOULX_API_KEY: "${SOULX_API_KEY:-local-dev-key}"

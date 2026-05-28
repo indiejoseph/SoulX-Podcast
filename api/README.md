@@ -29,7 +29,9 @@ curl http://localhost:8000/v1/audio/speech \
 - raw base64 audio bytes, assumed to be WAV
 
 `prompt_text` is required whenever `prompt_audio` is set. The path form is a
-server/container-local file URI, not a client filesystem path.
+server/container-local file URI, not a client filesystem path. Set
+`PROMPT_AUDIO_ROOT` to restrict accepted `file://` prompt paths; the compose
+default is `/app`.
 
 ## Docker Compose
 

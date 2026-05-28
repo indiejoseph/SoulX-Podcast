@@ -93,8 +93,9 @@ class SpeechRequest(BaseModel):
     prompt_audio: Optional[str] = Field(
         default=None,
         description=(
-            "Inline voice prompt audio as file:// URI, data:audio/*;base64 URI, "
-            "or raw base64 audio bytes. Requires prompt_text."
+            "Voice prompt audio as trusted server-local file:// URI, "
+            "data:audio/*;base64 URI, or raw base64 audio bytes. Requires prompt_text. "
+            "file:// paths may be restricted by PROMPT_AUDIO_ROOT."
         ),
     )
     prompt_text: Optional[str] = Field(
@@ -110,9 +111,15 @@ class SpeechRequest(BaseModel):
     )
     stream: bool = Field(
         default=True,
-        description="Stream audio chunks as they are synthesized. WAV streaming uses a placeholder-length header.",
+        description=(
+            "Stream audio chunks as they are synthesized. WAV streaming uses a "
+            "placeholder-length header; use format=pcm or stream=false for stricter clients."
+        ),
     )
-    seed: Optional[int] = Field(default=198964, description="Sampling seed")
+    seed: Optional[int] = Field(
+        default=None,
+        description="Optional sampling seed. If omitted, the service picks a random seed per request.",
+    )
     temperature: Optional[float] = Field(default=0.6, ge=0.1, le=2.0)
     top_k: Optional[int] = Field(default=100, ge=1, le=500)
     top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)

@@ -6,7 +6,7 @@ import binascii
 import json
 import re
 import logging
-import uuid
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple, Optional
 from urllib.parse import unquote, urlparse
@@ -384,6 +384,11 @@ class SoulXPodcastService:
     # ------------------------------------------------------------------ #
 
     def _validate_prompt_audio_path(self, audio_path: Path, *, label: str) -> Path:
+        if api_config.prompt_audio_root:
+            root = Path(api_config.prompt_audio_root).resolve()
+            resolved = audio_path.resolve()
+            if not resolved.is_relative_to(root):
+                raise ValueError(f"{label} prompt_audio must be under PROMPT_AUDIO_ROOT={root}")
         if not audio_path.exists():
             raise ValueError(f"{label} prompt_audio does not exist: {audio_path}")
         if audio_path.suffix.lower() not in ALLOWED_PROMPT_AUDIO_EXTENSIONS:
@@ -404,11 +409,16 @@ class SoulXPodcastService:
         if suffix.lower() not in ALLOWED_PROMPT_AUDIO_EXTENSIONS:
             suffix = ".wav"
         api_config.temp_dir.mkdir(parents=True, exist_ok=True)
-        path = api_config.temp_dir / f"speech_prompt_{uuid.uuid4().hex}{suffix}"
-        path.write_bytes(payload)
-        return path
+        with tempfile.NamedTemporaryFile(
+            prefix="speech_prompt_",
+            suffix=suffix,
+            dir=api_config.temp_dir,
+            delete=False,
+        ) as f:
+            f.write(payload)
+            return Path(f.name)
 
-    def _resolve_prompt_audio(self, prompt_audio: str) -> Path:
+    def _resolve_prompt_audio(self, prompt_audio: str) -> Tuple[Path, bool]:
         value = prompt_audio.strip()
         if not value:
             raise ValueError("prompt_audio must not be empty")
@@ -418,7 +428,7 @@ class SoulXPodcastService:
             if parsed.netloc not in ("", "localhost"):
                 raise ValueError("prompt_audio file:// URI must reference a local file")
             path = Path(unquote(parsed.path))
-            return self._validate_prompt_audio_path(path, label="inline")
+            return self._validate_prompt_audio_path(path, label="inline"), False
 
         if value.startswith("data:"):
             try:
@@ -433,7 +443,7 @@ class SoulXPodcastService:
                 payload = base64.b64decode(encoded, validate=True)
             except binascii.Error as e:
                 raise ValueError("prompt_audio contains invalid base64 data") from e
-            return self._write_inline_prompt_audio(payload, suffix)
+            return self._write_inline_prompt_audio(payload, suffix), True
 
         try:
             payload = base64.b64decode(value, validate=True)
@@ -441,7 +451,7 @@ class SoulXPodcastService:
             raise ValueError(
                 "prompt_audio must be a file:// URI, data:audio/*;base64 URI, or raw base64 audio"
             ) from e
-        return self._write_inline_prompt_audio(payload, ".wav")
+        return self._write_inline_prompt_audio(payload, ".wav"), True
 
     def _resolve_voice(self, voice: Any) -> Dict[str, str]:
         if isinstance(voice, str):
@@ -472,11 +482,12 @@ class SoulXPodcastService:
         if request.prompt_audio:
             if not request.prompt_text or not request.prompt_text.strip():
                 raise ValueError("prompt_text is required when prompt_audio is provided")
-            audio_path = self._resolve_prompt_audio(request.prompt_audio)
+            audio_path, delete_after_prepare = self._resolve_prompt_audio(request.prompt_audio)
             return {
                 "id": "inline_prompt",
                 "prompt_audio": str(audio_path),
                 "prompt_text": request.prompt_text.strip(),
+                "_delete_after_prepare": delete_after_prepare,
             }
         if request.prompt_text:
             raise ValueError("prompt_audio is required when prompt_text is provided")
@@ -495,24 +506,33 @@ class SoulXPodcastService:
     def _build_speech_prepared(self, request: SpeechRequest):
         voice = self._resolve_speech_prompt(request)
         text = self._apply_language_prefix(request.input.strip(), request.language)
+        prompt_audio_path = Path(voice["prompt_audio"])
+        temp_prompt_audio = prompt_audio_path if voice.get("_delete_after_prepare") else None
         data = {
             "speakers": {
                 "S1": {
-                    "prompt_audio": Path(voice["prompt_audio"]),
+                    "prompt_audio": prompt_audio_path,
                     "prompt_text": voice["prompt_text"],
                 }
             },
             "text": [["S1", text]],
         }
         inputs = podcast_format_parser(data)
-        prepared = process_single_input(
-            self.dataset,
-            inputs["text"],
-            inputs["prompt_wav"],
-            inputs["prompt_text"],
-            inputs["use_dialect_prompt"],
-            inputs["dialect_prompt_text"],
-        )
+        try:
+            prepared = process_single_input(
+                self.dataset,
+                inputs["text"],
+                inputs["prompt_wav"],
+                inputs["prompt_text"],
+                inputs["use_dialect_prompt"],
+                inputs["dialect_prompt_text"],
+            )
+        finally:
+            if temp_prompt_audio is not None:
+                try:
+                    temp_prompt_audio.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Failed to delete temporary prompt audio: %s", temp_prompt_audio)
         prepared["sampling_params"] = SamplingParams(
             temperature=request.temperature if request.temperature is not None else api_config.default_temperature,
             repetition_penalty=request.repetition_penalty if request.repetition_penalty is not None else 1.25,
@@ -523,6 +543,18 @@ class SoulXPodcastService:
             tau_r=0.2,
         )
         return prepared
+
+    def _resolve_seed(self, request: SpeechRequest) -> int:
+        if request.seed is not None:
+            return request.seed
+        if api_config.default_seed is not None:
+            return api_config.default_seed
+        return random.SystemRandom().randrange(0, 2**31)
+
+    def _seed_all(self, seed: int) -> None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
     @torch.inference_mode()
     def _build_first_turn_prompt(self, prepared):
@@ -621,7 +653,6 @@ class SoulXPodcastService:
                 except BaseException as e:
                     inner_self.exc = e
                     streamer.end()
-                    raise
 
         thread = _MTPThread()
         thread.start()
@@ -632,7 +663,7 @@ class SoulXPodcastService:
         flow_steps = request.flow_steps if request.flow_steps is not None else api_config.flow_steps
         chunk_size = request.chunk_size or api_config.stream_chunk_size
         first_chunk_size = request.first_chunk_size or api_config.stream_first_chunk_size
-        seed = request.seed if request.seed is not None else api_config.default_seed
+        seed = self._resolve_seed(request)
 
         if self.trt_streaming_mode is not None and flow_streaming != self.trt_streaming_mode:
             raise ValueError(
@@ -640,9 +671,7 @@ class SoulXPodcastService:
                 f"{self.trt_streaming_mode}; request used {flow_streaming}"
             )
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
+        self._seed_all(seed)
 
         prepared = self._build_speech_prepared(request)
         prompt_ids, eos_id, offset = self._build_first_turn_prompt(prepared)
@@ -673,11 +702,16 @@ class SoulXPodcastService:
                         streaming=flow_streaming,
                         flow_steps=flow_steps,
                     )
+                flow_stream.synchronize()
                 new_audio = wav_full[:, prev_audio_len:].detach().cpu()
                 prev_audio_len = wav_full.shape[-1]
                 chunk_bytes = tensor_to_pcm16_bytes(new_audio)
                 if chunk_bytes:
                     yield chunk_bytes
+
+            mtp_thread.join()
+            if mtp_thread.exc:
+                raise mtp_thread.exc
 
             with torch.cuda.stream(flow_stream):
                 wav_full = self._synthesize_chunk(
@@ -687,20 +721,18 @@ class SoulXPodcastService:
                     streaming=flow_streaming,
                     flow_steps=flow_steps,
                 )
+            flow_stream.synchronize()
             final_audio = wav_full[:, prev_audio_len:].detach().cpu()
             final_bytes = tensor_to_pcm16_bytes(final_audio)
             if final_bytes:
                 yield final_bytes
-
-            mtp_thread.join()
-            if mtp_thread.exc:
-                raise mtp_thread.exc
         finally:
             if mtp_thread.is_alive():
                 streamer.end()
                 mtp_thread.join(timeout=1.0)
 
     def _generate_speech_pcm_trunk(self, request: SpeechRequest) -> Iterator[bytes]:
+        self._seed_all(self._resolve_seed(request))
         prepared = self._build_speech_prepared(request)
         with torch.no_grad():
             results_dict = self.model.forward_longform(**prepared)

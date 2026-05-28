@@ -45,6 +45,7 @@ ENV MODEL_PATH=/app/runs/merged \
     FLOW_STEPS=8 \
     STREAM_CHUNK_SIZE=100 \
     STREAM_FIRST_CHUNK_SIZE=4 \
+    PROMPT_AUDIO_ROOT=/app \
     API_HOST=0.0.0.0 \
     API_PORT=8000
 

@@ -54,6 +54,7 @@ class APIConfig:
         "DEFAULT_VOICE_PROMPT_TEXT",
         "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。",
     )
+    prompt_audio_root: Optional[str] = os.getenv("PROMPT_AUDIO_ROOT")
     mtp_checkpoint: str = os.getenv("MTP_CHECKPOINT", "")
     enable_mtp: bool = os.getenv("ENABLE_MTP", "true").lower() == "true"
     stream_chunk_size: int = int(os.getenv("STREAM_CHUNK_SIZE", "100"))
@@ -80,7 +81,9 @@ class APIConfig:
     max_concurrent_tasks: int = int(os.getenv("MAX_CONCURRENT_TASKS", "2"))
 
     # 默认生成参数
-    default_seed: int = 1988
+    default_seed: Optional[int] = (
+        int(os.environ["DEFAULT_SEED"]) if os.getenv("DEFAULT_SEED") else None
+    )
     default_temperature: float = 0.6
     default_top_k: int = 100
     default_top_p: float = 0.9
