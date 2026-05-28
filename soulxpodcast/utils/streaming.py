@@ -39,6 +39,7 @@ class SpeechTokenStreamer(BaseStreamer):
         self.timeout = timeout
         self._q: "queue.Queue" = queue.Queue()
         self._closed = False
+        self._cancelled = False
         # HF's `model.generate()` calls `streamer.put(input_ids)` once at the
         # start with the full prompt tensor (any shape) before any sampling.
         # Skip that first call — we only want generated tokens, not the prompt.
@@ -76,6 +77,16 @@ class SpeechTokenStreamer(BaseStreamer):
         if not self._closed:
             self._closed = True
             self._q.put(_SENTINEL)
+
+    def cancel(self) -> None:
+        """Signal that the consumer is gone.
+
+        Sets _cancelled so that producers (e.g. VLLMEngine.generate) can detect
+        the abandoned stream and abort early, then calls end() to unblock any
+        iter_tokens() waiter.
+        """
+        self._cancelled = True
+        self.end()
 
     # ---- consumer side ---------------------------------------------------
 

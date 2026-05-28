@@ -305,53 +305,60 @@ class SoulXPodcast(torch.nn.Module):
             accumulated_speech_tokens = []
             prev_audio_len = 0
             chunk_idx = 0
-            for chunk in streamer.iter_chunks(
-                chunk_size=chunk_size,
-                first_chunk_size=first_chunk_size,
-            ):
-                cur_speech_tokens = [t - self.config.hf_config.speech_token_offset for t in chunk]
-                accumulated_speech_tokens.extend(cur_speech_tokens)
+            try:
+                for chunk in streamer.iter_chunks(
+                    chunk_size=chunk_size,
+                    first_chunk_size=first_chunk_size,
+                ):
+                    cur_speech_tokens = [t - self.config.hf_config.speech_token_offset for t in chunk]
+                    accumulated_speech_tokens.extend(cur_speech_tokens)
+                    with torch.cuda.stream(flow_stream):
+                        audio = self._stream_synth_chunk(
+                            spk_prompt_speech_tokens, accumulated_speech_tokens,
+                            spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
+                            finalize=False,
+                            streaming=flow_streaming,
+                            flow_steps=flow_steps,
+                        )
+                    # `.detach().cpu()` syncs flow_stream — gives us the wav.
+                    new_audio = audio[:, prev_audio_len:].detach().cpu()
+                    prev_audio_len = audio.shape[-1]
+                    yield {
+                        "turn": turn_i,
+                        "speaker": turn_spk,
+                        "chunk": chunk_idx,
+                        "audio": new_audio,
+                        "is_first_in_turn": chunk_idx == 0,
+                        "is_last_in_turn": False,
+                    }
+                    chunk_idx += 1
+
+                # Final finalize=True flush to emit audio for trailing lookahead.
                 with torch.cuda.stream(flow_stream):
                     audio = self._stream_synth_chunk(
                         spk_prompt_speech_tokens, accumulated_speech_tokens,
                         spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
-                        finalize=False,
+                        finalize=True,
                         streaming=flow_streaming,
                         flow_steps=flow_steps,
                     )
-                # `.detach().cpu()` syncs flow_stream — gives us the wav.
-                new_audio = audio[:, prev_audio_len:].detach().cpu()
-                prev_audio_len = audio.shape[-1]
+                final_audio = audio[:, prev_audio_len:].detach().cpu()
                 yield {
                     "turn": turn_i,
                     "speaker": turn_spk,
                     "chunk": chunk_idx,
-                    "audio": new_audio,
+                    "audio": final_audio,
                     "is_first_in_turn": chunk_idx == 0,
-                    "is_last_in_turn": False,
+                    "is_last_in_turn": True,
                 }
-                chunk_idx += 1
+            finally:
+                # Cancel the streamer so the LLM thread can detect abandonment
+                # (e.g. client disconnect) and call abort_request before exiting.
+                streamer.cancel()
+                llm_thread.join(timeout=2.0)
 
-            # Final finalize=True flush to emit audio for trailing lookahead.
-            with torch.cuda.stream(flow_stream):
-                audio = self._stream_synth_chunk(
-                    spk_prompt_speech_tokens, accumulated_speech_tokens,
-                    spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
-                    finalize=True,
-                    streaming=flow_streaming,
-                    flow_steps=flow_steps,
-                )
-            final_audio = audio[:, prev_audio_len:].detach().cpu()
-            yield {
-                "turn": turn_i,
-                "speaker": turn_spk,
-                "chunk": chunk_idx,
-                "audio": final_audio,
-                "is_first_in_turn": chunk_idx == 0,
-                "is_last_in_turn": True,
-            }
-
-            # Block until LLM done so we can update cache state for next turn.
+            # Block until LLM is fully done before reading results for next turn.
+            # join() on an already-finished thread returns immediately.
             llm_thread.join()
             if llm_thread.exc:
                 raise llm_thread.exc

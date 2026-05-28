@@ -28,6 +28,14 @@ except ImportError:
 from soulxpodcast.config import Config, SamplingParams
 from soulxpodcast.models.modules.sampler import _ras_sample_hf_engine
 
+# Fields accepted by stock vLLM 0.10.x SamplingParams.
+_VLLM_BASE_FIELDS = frozenset({
+    "temperature", "top_k", "top_p", "min_tokens", "max_tokens",
+    "repetition_penalty", "stop_token_ids",
+})
+# Extra fields from the Soul-AILab RAS patch (vllm@v0.10.1.1-soulxpodcast).
+_VLLM_RAS_FIELDS = frozenset({"use_ras", "win_size", "tau_r"})
+
 class HFLLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -149,9 +157,16 @@ class VLLMEngine:
         atexit.register(self.shutdown)
 
     def _make_sampling_params(self, sampling_param: SamplingParams) -> VllmSamplingParams:
-        params = asdict(sampling_param)
+        all_params = asdict(sampling_param)
+        params = {k: v for k, v in all_params.items()
+                  if k in _VLLM_BASE_FIELDS | _VLLM_RAS_FIELDS}
         params["stop_token_ids"] = [self.config.hf_config.eos_token_id]
-        return VllmSamplingParams(**params)
+        try:
+            return VllmSamplingParams(**params)
+        except TypeError:
+            # Soul-AILab RAS patch not installed — fall back to base fields.
+            params_base = {k: v for k, v in params.items() if k in _VLLM_BASE_FIELDS}
+            return VllmSamplingParams(**params_base)
 
     def _run_engine_loop(self):
         while True:
@@ -250,6 +265,12 @@ class VLLMEngine:
                     generated_ids.append(int(tok))
                     if streamer is not None:
                         streamer.put(torch.tensor([int(tok)], dtype=torch.long))
+
+                if streamer is not None and getattr(streamer, "_cancelled", False):
+                    # Consumer abandoned the stream (e.g. HTTP client disconnect).
+                    # finished_request stays False so the finally block aborts the
+                    # vLLM request and stops the engine from generating further.
+                    break
 
                 if finished:
                     # vLLM may omit special stop tokens from output token_ids.

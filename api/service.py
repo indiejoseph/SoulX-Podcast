@@ -1014,7 +1014,7 @@ class SoulXPodcastService:
                 yield final_bytes
         finally:
             if mtp_thread.is_alive():
-                streamer.end()
+                streamer.cancel()
                 mtp_thread.join(timeout=1.0)
 
     def _generate_speech_pcm_trunk(
@@ -1072,7 +1072,12 @@ class SoulXPodcastService:
         if not self.is_loaded():
             raise RuntimeError("Model is not loaded")
         with self._speech_lock:
-            if self.mtp is not None:
+            # MTP speculative sampling calls mtp_speculative_sample_cached with
+            # self.model.llm.model, which must be an nn.Module. VLLMEngine.model
+            # is an LLMEngine object, not an nn.Module, so MTP+vLLM is not yet
+            # supported. Fall back to trunk synthesis when vLLM is active.
+            use_mtp = self.mtp is not None and self.config.llm_engine == "hf"
+            if use_mtp:
                 yield from self._stream_speech_pcm_mtp(request, prepared)
             else:
                 yield from self._generate_speech_pcm_trunk(request, prepared)
