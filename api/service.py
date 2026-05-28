@@ -3,10 +3,12 @@ SoulXPodcast Model Service Layer
 """
 import base64
 import binascii
+import hashlib
 import json
 import re
 import logging
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple, Optional
 from urllib.parse import unquote, urlparse
@@ -18,10 +20,16 @@ import threading
 
 from soulxpodcast.models.soulxpodcast import SoulXPodcast
 from soulxpodcast.config import Config, SoulXPodcastLLMConfig, SamplingParams
-from soulxpodcast.utils.dataloader import PodcastInferHandler
+from soulxpodcast.utils.dataloader import (
+    AUDIO_START,
+    SPK_DICT,
+    TEXT_END,
+    TEXT_START,
+    PodcastInferHandler,
+)
 from soulxpodcast.utils.infer_utils import process_single_input
-from soulxpodcast.utils.parser import podcast_format_parser
 from soulxpodcast.utils.streaming import SpeechTokenStreamer
+from soulxpodcast.utils.text import normalize_text
 from soulxpodcast.training.mtp_inference import mtp_speculative_sample_cached
 from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 
@@ -71,6 +79,8 @@ class SoulXPodcastService:
                 cls._instance._initialized = False  # 实例属性
                 cls._instance._generation_lock = threading.Lock()  # 生成锁
                 cls._instance._speech_lock = threading.Lock()
+                cls._instance._prompt_cache_lock = threading.Lock()
+                cls._instance._prompt_cache = OrderedDict()
         return cls._instance
 
     def __init__(self):
@@ -398,6 +408,17 @@ class SoulXPodcastService:
             )
         return audio_path
 
+    def _prompt_file_cache_key(self, audio_path: Path, prompt_text: str) -> str:
+        resolved = audio_path.resolve()
+        stat = resolved.stat()
+        text_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        return f"file:{resolved}:{stat.st_size}:{stat.st_mtime_ns}:text:{text_hash}"
+
+    def _prompt_bytes_cache_key(self, payload: bytes, prompt_text: str) -> str:
+        audio_hash = hashlib.sha256(payload).hexdigest()
+        text_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        return f"bytes:{audio_hash}:text:{text_hash}"
+
     def _write_inline_prompt_audio(self, payload: bytes, suffix: str) -> Path:
         if not payload:
             raise ValueError("prompt_audio base64 decoded to empty bytes")
@@ -418,7 +439,11 @@ class SoulXPodcastService:
             f.write(payload)
             return Path(f.name)
 
-    def _resolve_prompt_audio(self, prompt_audio: str) -> Tuple[Path, bool]:
+    def _resolve_prompt_audio(
+        self,
+        prompt_audio: str,
+        prompt_text: str,
+    ) -> Tuple[Path, bool, str]:
         value = prompt_audio.strip()
         if not value:
             raise ValueError("prompt_audio must not be empty")
@@ -428,7 +453,8 @@ class SoulXPodcastService:
             if parsed.netloc not in ("", "localhost"):
                 raise ValueError("prompt_audio file:// URI must reference a local file")
             path = Path(unquote(parsed.path))
-            return self._validate_prompt_audio_path(path, label="inline"), False
+            path = self._validate_prompt_audio_path(path, label="inline")
+            return path, False, self._prompt_file_cache_key(path, prompt_text)
 
         if value.startswith("data:"):
             try:
@@ -443,7 +469,8 @@ class SoulXPodcastService:
                 payload = base64.b64decode(encoded, validate=True)
             except binascii.Error as e:
                 raise ValueError("prompt_audio contains invalid base64 data") from e
-            return self._write_inline_prompt_audio(payload, suffix), True
+            cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
+            return self._write_inline_prompt_audio(payload, suffix), True, cache_key
 
         try:
             payload = base64.b64decode(value, validate=True)
@@ -451,7 +478,8 @@ class SoulXPodcastService:
             raise ValueError(
                 "prompt_audio must be a file:// URI, data:audio/*;base64 URI, or raw base64 audio"
             ) from e
-        return self._write_inline_prompt_audio(payload, ".wav"), True
+        cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
+        return self._write_inline_prompt_audio(payload, ".wav"), True, cache_key
 
     def _resolve_voice(self, voice: Any) -> Dict[str, str]:
         if isinstance(voice, str):
@@ -476,18 +504,24 @@ class SoulXPodcastService:
         spec["id"] = voice_id
         spec["prompt_audio"] = str(audio_path)
         spec["prompt_text"] = str(spec["prompt_text"])
+        spec["_cache_key"] = self._prompt_file_cache_key(audio_path, spec["prompt_text"])
         return spec
 
     def _resolve_speech_prompt(self, request: SpeechRequest) -> Dict[str, str]:
         if request.prompt_audio:
             if not request.prompt_text or not request.prompt_text.strip():
                 raise ValueError("prompt_text is required when prompt_audio is provided")
-            audio_path, delete_after_prepare = self._resolve_prompt_audio(request.prompt_audio)
+            prompt_text = request.prompt_text.strip()
+            audio_path, delete_after_prepare, cache_key = self._resolve_prompt_audio(
+                request.prompt_audio,
+                prompt_text,
+            )
             return {
                 "id": "inline_prompt",
                 "prompt_audio": str(audio_path),
-                "prompt_text": request.prompt_text.strip(),
+                "prompt_text": prompt_text,
                 "_delete_after_prepare": delete_after_prepare,
+                "_cache_key": cache_key,
             }
         if request.prompt_text:
             raise ValueError("prompt_audio is required when prompt_text is provided")
@@ -503,29 +537,46 @@ class SoulXPodcastService:
             return f"{prefix}{text}"
         return text
 
-    def _build_speech_prepared(self, request: SpeechRequest):
-        voice = self._resolve_speech_prompt(request)
-        text = self._apply_language_prefix(request.input.strip(), request.language)
+    def _get_prompt_cache_entry(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        if api_config.prompt_cache_size <= 0:
+            return None
+        with self._prompt_cache_lock:
+            entry = self._prompt_cache.get(cache_key)
+            if entry is not None:
+                self._prompt_cache.move_to_end(cache_key)
+            return entry
+
+    def _store_prompt_cache_entry(self, cache_key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        if api_config.prompt_cache_size <= 0:
+            return entry
+        with self._prompt_cache_lock:
+            self._prompt_cache[cache_key] = entry
+            self._prompt_cache.move_to_end(cache_key)
+            while len(self._prompt_cache) > api_config.prompt_cache_size:
+                self._prompt_cache.popitem(last=False)
+        return entry
+
+    def _encode_target_text(self, text: str) -> List[int]:
+        normalized = normalize_text(text)
+        token_text = f"{SPK_DICT[0]}{TEXT_START}{normalized}{TEXT_END}{AUDIO_START}"
+        return self.dataset.text_tokenizer.encode(token_text)
+
+    def _build_prompt_cache_entry(self, voice: Dict[str, Any]) -> Dict[str, Any]:
+        cache_key = voice["_cache_key"]
+        cached = self._get_prompt_cache_entry(cache_key)
+        if cached is not None:
+            return cached
+
         prompt_audio_path = Path(voice["prompt_audio"])
         temp_prompt_audio = prompt_audio_path if voice.get("_delete_after_prepare") else None
-        data = {
-            "speakers": {
-                "S1": {
-                    "prompt_audio": prompt_audio_path,
-                    "prompt_text": voice["prompt_text"],
-                }
-            },
-            "text": [["S1", text]],
-        }
-        inputs = podcast_format_parser(data)
         try:
             prepared = process_single_input(
                 self.dataset,
-                inputs["text"],
-                inputs["prompt_wav"],
-                inputs["prompt_text"],
-                inputs["use_dialect_prompt"],
-                inputs["dialect_prompt_text"],
+                ["[S1]cache"],
+                [str(prompt_audio_path)],
+                [voice["prompt_text"]],
+                False,
+                [""],
             )
         finally:
             if temp_prompt_audio is not None:
@@ -533,6 +584,65 @@ class SoulXPodcastService:
                     temp_prompt_audio.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("Failed to delete temporary prompt audio: %s", temp_prompt_audio)
+
+        with torch.inference_mode():
+            prompt_speech_tokens, prompt_lens = self.model.audio_tokenizer.quantize(
+                prepared["prompt_mels_for_llm"].cuda(),
+                prepared["prompt_mels_lens_for_llm"].cuda(),
+            )
+        prompt_len = prompt_lens[0].item()
+        prompt_tokens = prompt_speech_tokens[0, :prompt_len].detach().cpu()
+        prompt_mel_ori = prepared["prompt_mels_for_flow_ori"][0]
+        prompt_mel_len = prompt_mel_ori.shape[0]
+        if prompt_len * 2 > prompt_mel_len:
+            prompt_len = int(prompt_mel_len / 2)
+            prompt_tokens = prompt_tokens[:prompt_len]
+            prompt_mel = prompt_mel_ori.detach().clone()
+        else:
+            prompt_mel = prompt_mel_ori[: prompt_len * 2].detach().clone()
+
+        speech_token_offset = self.model.config.hf_config.speech_token_offset
+        eos_id = self.model.config.hf_config.eos_token_id
+        prompt_token_list = prompt_tokens.tolist()
+        spk_tokens = [t + speech_token_offset for t in prompt_token_list] + [eos_id]
+        prompt_prefix_ids = prepared["prompt_text_tokens_for_llm"][0] + spk_tokens
+
+        entry = {
+            "prompt_mels_for_llm": prepared["prompt_mels_for_llm"],
+            "prompt_mels_lens_for_llm": prepared["prompt_mels_lens_for_llm"],
+            "prompt_text_tokens_for_llm": prepared["prompt_text_tokens_for_llm"],
+            "prompt_mels_for_flow_ori": prepared["prompt_mels_for_flow_ori"],
+            "prompt_mels_lens_for_flow": prepared.get("prompt_mels_lens_for_flow"),
+            "spk_emb_for_flow": prepared["spk_emb_for_flow"],
+            "prompt_prefix_ids": prompt_prefix_ids,
+            "prompt_tokens": prompt_token_list,
+            "prompt_mel": prompt_mel[None],
+            "prompt_mel_len": int(prompt_mel.shape[0]),
+            "spk_emb": prepared["spk_emb_for_flow"][0:1],
+            "speech_token_offset": speech_token_offset,
+            "eos_id": eos_id,
+            "info": prepared["infos"][0],
+        }
+        logger.info("Cached prompt audio entry %s", voice.get("id", "inline_prompt"))
+        return self._store_prompt_cache_entry(cache_key, entry)
+
+    def _build_speech_prepared(self, request: SpeechRequest):
+        voice = self._resolve_speech_prompt(request)
+        text = self._apply_language_prefix(request.input.strip(), request.language)
+        prompt_entry = self._build_prompt_cache_entry(voice)
+        prepared = {
+            "prompt_mels_for_llm": prompt_entry["prompt_mels_for_llm"],
+            "prompt_mels_lens_for_llm": prompt_entry["prompt_mels_lens_for_llm"],
+            "prompt_text_tokens_for_llm": prompt_entry["prompt_text_tokens_for_llm"],
+            "text_tokens_for_llm": [self._encode_target_text(text)],
+            "prompt_mels_for_flow_ori": prompt_entry["prompt_mels_for_flow_ori"],
+            "prompt_mels_lens_for_flow": prompt_entry["prompt_mels_lens_for_flow"],
+            "spk_emb_for_flow": prompt_entry["spk_emb_for_flow"],
+            "spk_ids": [0],
+            "infos": [prompt_entry["info"]],
+            "use_dialect_prompt": False,
+            "prompt_cache_entry": prompt_entry,
+        }
         prepared["sampling_params"] = SamplingParams(
             temperature=request.temperature if request.temperature is not None else api_config.default_temperature,
             repetition_penalty=request.repetition_penalty if request.repetition_penalty is not None else 1.25,
@@ -558,6 +668,14 @@ class SoulXPodcastService:
 
     @torch.inference_mode()
     def _build_first_turn_prompt(self, prepared):
+        prompt_entry = prepared.get("prompt_cache_entry")
+        if prompt_entry is not None:
+            return (
+                prompt_entry["prompt_prefix_ids"] + prepared["text_tokens_for_llm"][0],
+                prompt_entry["eos_id"],
+                prompt_entry["speech_token_offset"],
+            )
+
         prompt_mels = prepared["prompt_mels_for_llm"]
         prompt_mels_lens = prepared["prompt_mels_lens_for_llm"]
         prompt_text_tokens = prepared["prompt_text_tokens_for_llm"]
@@ -574,6 +692,18 @@ class SoulXPodcastService:
 
     @torch.inference_mode()
     def _prepare_synth_state(self, prepared):
+        prompt_entry = prepared.get("prompt_cache_entry")
+        if prompt_entry is not None:
+            return {
+                "prompt_tokens": list(prompt_entry["prompt_tokens"]),
+                "prompt_mel": prompt_entry["prompt_mel"].cuda(),
+                "prompt_mel_len": torch.tensor(
+                    [prompt_entry["prompt_mel_len"]],
+                    device="cuda",
+                ),
+                "spk_emb": prompt_entry["spk_emb"].cuda(),
+            }
+
         prompt_mels = prepared["prompt_mels_for_llm"]
         prompt_mels_lens = prepared["prompt_mels_lens_for_llm"]
         prompt_spk_tokens, prompt_lens = self.model.audio_tokenizer.quantize(
@@ -750,9 +880,6 @@ class SoulXPodcastService:
                 yield from self._stream_speech_pcm_mtp(request)
             else:
                 yield from self._generate_speech_pcm_trunk(request)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
 
     def stream_speech_bytes(self, request: SpeechRequest) -> Iterator[bytes]:
         if request.output_format == "wav":

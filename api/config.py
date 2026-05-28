@@ -55,6 +55,7 @@ class APIConfig:
         "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。",
     )
     prompt_audio_root: Optional[str] = os.getenv("PROMPT_AUDIO_ROOT")
+    prompt_cache_size: int = int(os.getenv("PROMPT_CACHE_SIZE", "16"))
     mtp_checkpoint: str = os.getenv("MTP_CHECKPOINT", "")
     enable_mtp: bool = os.getenv("ENABLE_MTP", "true").lower() == "true"
     stream_chunk_size: int = int(os.getenv("STREAM_CHUNK_SIZE", "100"))

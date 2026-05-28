@@ -61,6 +61,7 @@ Default production knobs in `docker-compose.yml`:
 - `STREAM_FIRST_CHUNK_SIZE=4`
 - `STREAM_CHUNK_SIZE=100`
 - `TRT_ESTIMATOR=true`
+- `PROMPT_CACHE_SIZE=16`
 
 MTP serving currently forces `LLM_ENGINE=hf` because the speculative sampler
 requires direct access to the Qwen trunk and KV cache. The image is still based
