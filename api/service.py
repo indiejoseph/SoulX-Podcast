@@ -3,8 +3,8 @@ SoulXPodcast Model Service Layer
 """
 import base64
 import binascii
+import copy
 import hashlib
-import json
 import re
 import logging
 import tempfile
@@ -66,46 +66,44 @@ PROMPT_AUDIO_MIME_EXTENSIONS = {
 
 
 class SoulXPodcastService:
-    """SoulXPodcast模型服务单例"""
+    """Singleton service for the SoulXPodcast model."""
 
     _instance: Optional['SoulXPodcastService'] = None
-    _lock = threading.Lock()  # 线程锁
+    _lock = threading.Lock()
 
     def __new__(cls):
-        with cls._lock:  # 确保线程安全
+        with cls._lock:
             if cls._instance is None:
                 logger.info("Creating new SoulXPodcastService instance")
                 cls._instance = super(SoulXPodcastService, cls).__new__(cls)
-                cls._instance._initialized = False  # 实例属性
-                cls._instance._generation_lock = threading.Lock()  # 生成锁
+                cls._instance._initialized = False
+                cls._instance._generation_lock = threading.Lock()
                 cls._instance._speech_lock = threading.Lock()
                 cls._instance._prompt_cache_lock = threading.Lock()
                 cls._instance._prompt_cache = OrderedDict()
+                cls._instance._prompt_cache_ids = OrderedDict()
         return cls._instance
 
     def __init__(self):
-        """初始化模型（单例模式，只初始化一次）"""
-        # 使用实例属性而不是类属性
+        """Initialize the singleton model once."""
         if not self._initialized:
             logger.info("Initializing SoulXPodcastService (first time)")
             self._load_model()
-            self._initialized = True  # 设置实例属性
+            self._initialized = True
         else:
             logger.info("SoulXPodcastService already initialized, skipping model load")
 
     def _load_model(self):
-        """加载模型"""
+        """Load model components."""
         try:
             logger.info(f"Loading SoulXPodcast model from {api_config.model_path}...")
             logger.info(f"Using LLM engine: {api_config.llm_engine}")
 
-            # 加载配置
             hf_config = SoulXPodcastLLMConfig.from_initial_and_json(
                 initial_values={"fp16_flow": api_config.fp16_flow},
                 json_file=f"{api_config.model_path}/soulxpodcast_config.json"
             )
 
-            # 创建Config对象
             model_config = Config(
                 model=api_config.model_path,
                 enforce_eager=True,
@@ -113,7 +111,6 @@ class SoulXPodcastService:
                 hf_config=hf_config
             )
 
-            # 初始化模型
             self.model = SoulXPodcast(model_config)
             self.dataset = PodcastInferHandler(
                 self.model.llm.tokenizer,
@@ -121,7 +118,6 @@ class SoulXPodcastService:
                 model_config
             )
             self.config = model_config
-            self.voice_registry = self._load_voice_registry()
             self.mtp = self._load_mtp()
             self.trt_streaming_mode = None
             if api_config.trt_estimator:
@@ -131,29 +127,7 @@ class SoulXPodcastService:
 
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
-            raise RuntimeError(f"模型加载失败: {str(e)}")
-
-    def _load_voice_registry(self) -> Dict[str, Dict[str, str]]:
-        registry = {
-            api_config.default_voice_id: {
-                "prompt_audio": api_config.default_voice_prompt_audio,
-                "prompt_text": api_config.default_voice_prompt_text,
-            }
-        }
-        if api_config.voice_registry_path:
-            path = Path(api_config.voice_registry_path)
-            if not path.exists():
-                raise RuntimeError(f"VOICE_REGISTRY_PATH does not exist: {path}")
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if not isinstance(loaded, dict):
-                raise RuntimeError("VOICE_REGISTRY_PATH must contain an object keyed by voice id")
-            for voice_id, spec in loaded.items():
-                if not isinstance(spec, dict):
-                    raise RuntimeError(f"voice {voice_id!r} must be an object")
-                registry[voice_id] = spec
-        logger.info("Loaded %d voice definitions", len(registry))
-        return registry
+            raise RuntimeError(f"Model load failed: {str(e)}")
 
     def _load_mtp(self):
         if not api_config.enable_mtp:
@@ -191,7 +165,7 @@ class SoulXPodcastService:
         logger.info("Installed TRT estimator for flow_streaming=%s", self.trt_streaming_mode)
 
     def is_loaded(self) -> bool:
-        """检查模型是否已加载"""
+        """Return whether the model has been loaded."""
         return hasattr(self, 'model') and self.model is not None
 
     def generate(
@@ -206,31 +180,29 @@ class SoulXPodcastService:
         repetition_penalty: float = 1.25,
     ) -> Tuple[int, np.ndarray]:
         """
-        生成语音
+        Generate speech.
 
         Args:
-            prompt_audio_paths: 参考音频路径列表
-            prompt_texts: 参考文本列表
-            dialogue_text: 对话文本
-            seed: 随机种子
-            temperature: 采样温度
-            top_k: Top-K采样
-            top_p: Top-P采样
-            repetition_penalty: 重复惩罚
+            prompt_audio_paths: Reference audio paths.
+            prompt_texts: Reference transcripts.
+            dialogue_text: Dialogue text.
+            seed: Random seed.
+            temperature: Sampling temperature.
+            top_k: Top-k sampling parameter.
+            top_p: Top-p sampling parameter.
+            repetition_penalty: Repetition penalty.
 
         Returns:
-            Tuple[int, np.ndarray]: (采样率, 音频数组)
+            Tuple[int, np.ndarray]: sample rate and audio array.
         """
         logger.info(f"Generate called - Instance ID: {id(self)}, Model loaded: {self.is_loaded()}")
 
         if not self.is_loaded():
-            raise RuntimeError("模型未加载")
+            raise RuntimeError("Model is not loaded")
 
-        # 使用锁确保同一时间只有一个生成任务
         with self._generation_lock:
             logger.info("Acquired generation lock")
             try:
-                # 设置随机种子
                 torch.manual_seed(seed)
                 np.random.seed(seed)
                 random.seed(seed)
@@ -238,11 +210,9 @@ class SoulXPodcastService:
                 num_speakers = len(prompt_audio_paths)
                 logger.info(f"Generating audio for {num_speakers} speaker(s)")
 
-                # 解析对话文本
                 target_text_list = parse_dialogue_text(dialogue_text, num_speakers)
                 logger.info(f"Parsed dialogue into {len(target_text_list)} segments")
 
-                # 提取说话人和文本
                 spks, texts = [], []
                 for target_text in target_text_list:
                     pattern = r'(\[S[1-9]\])(.+)'
@@ -252,9 +222,8 @@ class SoulXPodcastService:
                         spks.append(spk)
                         texts.append(text)
                     else:
-                        raise ValueError(f"无效的对话文本格式: {target_text}")
+                        raise ValueError(f"Invalid dialogue text format: {target_text}")
 
-                # 构建数据项
                 dataitem = {
                     "key": "api_001",
                     "prompt_text": prompt_texts,
@@ -263,13 +232,10 @@ class SoulXPodcastService:
                     "spk": spks,
                 }
 
-                # 更新数据源
                 self.dataset.update_datasource([dataitem])
 
-                # 获取处理后的数据
                 data = self.dataset[0]
 
-                # 准备模型输入
                 import s3tokenizer
                 prompt_mels_for_llm, prompt_mels_lens_for_llm = s3tokenizer.padding(data["log_mel"])
                 spk_emb_for_flow = torch.tensor(data["spk_emb"])
@@ -281,7 +247,6 @@ class SoulXPodcastService:
                 prompt_text_tokens_for_llm = data["prompt_text_tokens"]
                 spk_ids = data["spks_list"]
 
-                # 采样参数
                 sampling_params = SamplingParams(
                     temperature=temperature,
                     repetition_penalty=repetition_penalty,
@@ -307,46 +272,41 @@ class SoulXPodcastService:
                     "use_dialect_prompt": False,
                 }
 
-                # 模型推理
                 logger.info("Running model inference...")
 
-                # 清理之前可能累积的GPU缓存
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                # 使用超时机制执行推理
                 import concurrent.futures
                 import signal
 
                 def run_inference():
-                    """在独立线程中执行推理"""
+                    """Run model inference in a worker thread."""
                     with torch.no_grad():
                         return self.model.forward_longform(**processed_data)
 
-                # 设置超时时间（根据音频长度动态调整）
                 num_segments = len(texts)
-                timeout_seconds = max(1200, num_segments * 120)  # 每段至少120秒，最少20分钟(1200秒)
+                timeout_seconds = max(1200, num_segments * 120)
 
                 logger.info(f"Starting inference with timeout: {timeout_seconds}s for {num_segments} segments")
 
-                # 使用线程池执行推理
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(run_inference)
                     try:
                         results_dict = future.result(timeout=timeout_seconds)
                     except concurrent.futures.TimeoutError:
                         logger.error(f"Model inference timeout after {timeout_seconds} seconds")
-                        # 尝试取消任务
                         future.cancel()
-                        # 清理GPU内存
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        raise TimeoutError(f"模型推理超时（{timeout_seconds}秒）。可能是音频过长或GPU内存不足。")
+                        raise TimeoutError(
+                            f"Model inference timed out after {timeout_seconds}s. "
+                            "The audio may be too long or GPU memory may be insufficient."
+                        )
                     except Exception as e:
                         logger.error(f"Model inference failed: {e}")
-                        raise RuntimeError(f"模型推理失败: {str(e)}")
+                        raise RuntimeError(f"Model inference failed: {str(e)}")
 
-                # 拼接音频
                 target_audio = None
                 for i in range(len(results_dict['generated_wavs'])):
                     if target_audio is None:
@@ -356,26 +316,21 @@ class SoulXPodcastService:
                             [target_audio, results_dict['generated_wavs'][i]], axis=1
                         )
 
-                # 转换为numpy数组
                 audio_array = target_audio.cpu().squeeze(0).numpy()
                 sample_rate = 24000
 
-                # 清理GPU内存
                 del target_audio
                 del results_dict
                 if 'processed_data' in locals():
                     del processed_data
 
-                # 显式清理GPU缓存
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                # 强制垃圾回收
                 gc.collect()
 
                 logger.info(f"Audio generation completed. Duration: {len(audio_array) / sample_rate:.2f}s")
 
-                # 记录GPU内存使用情况
                 if torch.cuda.is_available():
                     allocated = torch.cuda.memory_allocated() / 1024**3  # GB
                     reserved = torch.cuda.memory_reserved() / 1024**3    # GB
@@ -385,7 +340,7 @@ class SoulXPodcastService:
 
             except Exception as e:
                 logger.error(f"Generation failed: {e}", exc_info=True)
-                raise RuntimeError(f"语音生成失败: {str(e)}")
+                raise RuntimeError(f"Speech generation failed: {str(e)}")
             finally:
                 logger.info("Released generation lock")
 
@@ -418,6 +373,9 @@ class SoulXPodcastService:
         audio_hash = hashlib.sha256(payload).hexdigest()
         text_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
         return f"bytes:{audio_hash}:text:{text_hash}"
+
+    def _prompt_cache_id_from_key(self, cache_key: str) -> str:
+        return f"pc_{hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:32]}"
 
     def _write_inline_prompt_audio(self, payload: bytes, suffix: str) -> Path:
         if not payload:
@@ -457,9 +415,11 @@ class SoulXPodcastService:
                 raise ValueError("prompt_audio file:// URI must reference a local file")
             path = Path(unquote(parsed.path))
             path = self._validate_prompt_audio_path(path, label="inline")
+            cache_key = self._prompt_file_cache_key(path, prompt_text)
             return {
                 "prompt_audio": str(path),
-                "_cache_key": self._prompt_file_cache_key(path, prompt_text),
+                "_cache_key": cache_key,
+                "_cache_id": self._prompt_cache_id_from_key(cache_key),
             }
 
         if value.startswith("data:"):
@@ -478,6 +438,7 @@ class SoulXPodcastService:
             cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
             return {
                 "_cache_key": cache_key,
+                "_cache_id": self._prompt_cache_id_from_key(cache_key),
                 "_inline_audio_payload": payload,
                 "_inline_audio_suffix": suffix,
             }
@@ -491,37 +452,21 @@ class SoulXPodcastService:
         cache_key = self._prompt_bytes_cache_key(payload, prompt_text)
         return {
             "_cache_key": cache_key,
+            "_cache_id": self._prompt_cache_id_from_key(cache_key),
             "_inline_audio_payload": payload,
             "_inline_audio_suffix": ".wav",
         }
 
-    def _resolve_voice(self, voice: Any) -> Dict[str, str]:
-        if isinstance(voice, str):
-            voice_id = voice
-            prompt_audio = None
-            prompt_text = None
-        else:
-            voice_id = voice.id
-            prompt_audio = voice.prompt_audio
-            prompt_text = voice.prompt_text
-
-        spec = dict(self.voice_registry.get(voice_id, {}))
-        if prompt_audio:
-            spec["prompt_audio"] = prompt_audio
-        if prompt_text:
-            spec["prompt_text"] = prompt_text
-        if "prompt_audio" not in spec or "prompt_text" not in spec:
-            raise ValueError(f"Unknown voice id {voice_id!r}; provide a registered voice or prompt override")
-
-        audio_path = Path(spec["prompt_audio"])
-        self._validate_prompt_audio_path(audio_path, label=f"Voice {voice_id!r}")
-        spec["id"] = voice_id
-        spec["prompt_audio"] = str(audio_path)
-        spec["prompt_text"] = str(spec["prompt_text"])
-        spec["_cache_key"] = self._prompt_file_cache_key(audio_path, spec["prompt_text"])
-        return spec
-
-    def _resolve_speech_prompt(self, request: SpeechRequest) -> Dict[str, str]:
+    def _resolve_speech_prompt(self, request: SpeechRequest) -> Dict[str, Any]:
+        if request.prompt_cache_id:
+            if request.prompt_audio or request.prompt_text:
+                raise ValueError("prompt_cache_id cannot be combined with prompt_audio or prompt_text")
+            if not request.prompt_cache_id.startswith("pc_"):
+                raise ValueError("prompt_cache_id must be an opaque id returned by Prompt-Cache-Id")
+            return {
+                "id": "cached_prompt",
+                "_cache_id": request.prompt_cache_id,
+            }
         if request.prompt_audio:
             if not request.prompt_text or not request.prompt_text.strip():
                 raise ValueError("prompt_text is required when prompt_audio is provided")
@@ -537,9 +482,7 @@ class SoulXPodcastService:
             return prompt
         if request.prompt_text:
             raise ValueError("prompt_audio is required when prompt_text is provided")
-        if request.voice is not None:
-            return self._resolve_voice(request.voice)
-        return self._resolve_voice(api_config.default_voice_id)
+        raise ValueError("prompt_audio and prompt_text are required unless prompt_cache_id is provided")
 
     def _apply_language_prefix(self, text: str, language: Optional[str]) -> str:
         if not language:
@@ -549,23 +492,48 @@ class SoulXPodcastService:
             return f"{prefix}{text}"
         return text
 
-    def _get_prompt_cache_entry(self, cache_key: str) -> Optional[Dict[str, Any]]:
+    def _get_prompt_cache_entry(
+        self,
+        *,
+        cache_key: Optional[str] = None,
+        cache_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if api_config.prompt_cache_size <= 0:
             return None
         with self._prompt_cache_lock:
+            if cache_key is None and cache_id is not None:
+                cache_key = self._prompt_cache_ids.get(cache_id)
+            if cache_key is None:
+                return None
             entry = self._prompt_cache.get(cache_key)
             if entry is not None:
                 self._prompt_cache.move_to_end(cache_key)
+                prompt_cache_id = entry.get("prompt_cache_id")
+                if prompt_cache_id is not None:
+                    self._prompt_cache_ids[prompt_cache_id] = cache_key
+                    self._prompt_cache_ids.move_to_end(prompt_cache_id)
             return entry
 
-    def _store_prompt_cache_entry(self, cache_key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+    def _store_prompt_cache_entry(
+        self,
+        cache_key: str,
+        cache_id: str,
+        entry: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        entry["prompt_cache_id"] = cache_id
+        entry["prompt_cache_key"] = cache_key
         if api_config.prompt_cache_size <= 0:
             return entry
         with self._prompt_cache_lock:
             self._prompt_cache[cache_key] = entry
             self._prompt_cache.move_to_end(cache_key)
+            self._prompt_cache_ids[cache_id] = cache_key
+            self._prompt_cache_ids.move_to_end(cache_id)
             while len(self._prompt_cache) > api_config.prompt_cache_size:
-                self._prompt_cache.popitem(last=False)
+                _, evicted = self._prompt_cache.popitem(last=False)
+                evicted_id = evicted.get("prompt_cache_id")
+                if evicted_id is not None:
+                    self._prompt_cache_ids.pop(evicted_id, None)
         return entry
 
     def _encode_target_text(self, text: str) -> List[int]:
@@ -575,27 +543,48 @@ class SoulXPodcastService:
         token_text = f"{SPK_DICT[0]}{TEXT_START}{normalized}{TEXT_END}{AUDIO_START}"
         return self.dataset.text_tokenizer.encode(token_text)
 
-    def _build_prompt_cache_entry(self, voice: Dict[str, Any]) -> Dict[str, Any]:
-        cache_key = voice["_cache_key"]
-        cached = self._get_prompt_cache_entry(cache_key)
+    def _fork_dynamic_cache(self, cache):
+        """Copy cache containers while sharing immutable prefix KV tensors."""
+        forked = copy.copy(cache)
+        if hasattr(cache, "layers"):
+            forked.layers = [copy.copy(layer) for layer in cache.layers]
+        return forked
+
+    @torch.inference_mode()
+    def _build_prompt_prefix_kv(self, prompt_prefix_ids: List[int]) -> Tuple[Any, torch.Tensor]:
+        input_ids = torch.tensor([prompt_prefix_ids], dtype=torch.long, device="cuda")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = self.model.llm.model(
+                input_ids=input_ids,
+                use_cache=True,
+                return_dict=True,
+            )
+        return out.past_key_values, out.last_hidden_state.detach()
+
+    def _build_prompt_cache_entry(self, prompt: Dict[str, Any]) -> Dict[str, Any]:
+        cache_id = prompt["_cache_id"]
+        cache_key = prompt.get("_cache_key")
+        cached = self._get_prompt_cache_entry(cache_key=cache_key, cache_id=cache_id)
         if cached is not None:
             return cached
+        if cache_key is None:
+            raise ValueError(f"Unknown or expired prompt_cache_id: {cache_id}")
 
         temp_prompt_audio = None
-        if "_inline_audio_payload" in voice:
+        if "_inline_audio_payload" in prompt:
             temp_prompt_audio = self._write_inline_prompt_audio(
-                voice["_inline_audio_payload"],
-                voice.get("_inline_audio_suffix", ".wav"),
+                prompt["_inline_audio_payload"],
+                prompt.get("_inline_audio_suffix", ".wav"),
             )
             prompt_audio_path = temp_prompt_audio
         else:
-            prompt_audio_path = Path(voice["prompt_audio"])
+            prompt_audio_path = Path(prompt["prompt_audio"])
         try:
             prepared = process_single_input(
                 self.dataset,
                 ["[S1]cache"],
                 [str(prompt_audio_path)],
-                [voice["prompt_text"]],
+                [prompt["prompt_text"]],
                 False,
                 [""],
             )
@@ -643,14 +632,21 @@ class SoulXPodcastService:
             "speech_token_offset": speech_token_offset,
             "eos_id": eos_id,
             "info": prepared["infos"][0],
+            "prompt_prefix_cache": None,
+            "prompt_prefix_hidden": None,
+            "prompt_prefix_len": len(prompt_prefix_ids),
         }
-        logger.info("Cached prompt audio entry %s", voice.get("id", "inline_prompt"))
-        return self._store_prompt_cache_entry(cache_key, entry)
+        if self.mtp is not None and self.config.llm_engine == "hf":
+            prefix_cache, prefix_hidden = self._build_prompt_prefix_kv(prompt_prefix_ids)
+            entry["prompt_prefix_cache"] = prefix_cache
+            entry["prompt_prefix_hidden"] = prefix_hidden
+        logger.info("Cached prompt audio entry %s", prompt.get("id", "inline_prompt"))
+        return self._store_prompt_cache_entry(cache_key, cache_id, entry)
 
     def _build_speech_prepared(self, request: SpeechRequest):
-        voice = self._resolve_speech_prompt(request)
+        prompt = self._resolve_speech_prompt(request)
         text = self._apply_language_prefix(request.input.strip(), request.language)
-        prompt_entry = self._build_prompt_cache_entry(voice)
+        prompt_entry = self._build_prompt_cache_entry(prompt)
         prepared = {
             "prompt_mels_for_llm": prompt_entry["prompt_mels_for_llm"],
             "prompt_mels_lens_for_llm": prompt_entry["prompt_mels_lens_for_llm"],
@@ -674,6 +670,14 @@ class SoulXPodcastService:
             tau_r=0.2,
         )
         return prepared
+
+    def prepare_speech_context(self, request: SpeechRequest) -> Dict[str, Any]:
+        prepared = self._build_speech_prepared(request)
+        prompt_entry = prepared["prompt_cache_entry"]
+        return {
+            "prepared": prepared,
+            "prompt_cache_id": prompt_entry["prompt_cache_id"],
+        }
 
     def _resolve_seed(self, request: SpeechRequest) -> int:
         if request.seed is not None:
@@ -773,7 +777,19 @@ class SoulXPodcastService:
         wav, _ = self.model.hift(speech_feat=mel)
         return wav
 
-    def _run_mtp_in_thread(self, input_ids, sampling_params, eos_id, streamer, cuda_stream, seed: int):
+    def _run_mtp_in_thread(
+        self,
+        input_ids,
+        sampling_params,
+        eos_id,
+        streamer,
+        cuda_stream,
+        seed: int,
+        *,
+        prefix_cache=None,
+        prefix_hidden=None,
+        prefix_len: int = 0,
+    ):
         class _MTPThread(threading.Thread):
             def __init__(inner_self):
                 super().__init__(daemon=True)
@@ -800,6 +816,9 @@ class SoulXPodcastService:
                             allow_eos_from_drafts=False,
                             seed=seed,
                             streamer=streamer,
+                            prefix_cache=prefix_cache,
+                            prefix_hidden=prefix_hidden,
+                            prefix_len=prefix_len,
                         )
                 except BaseException as e:
                     inner_self.exc = e
@@ -809,7 +828,11 @@ class SoulXPodcastService:
         thread.start()
         return thread
 
-    def _stream_speech_pcm_mtp(self, request: SpeechRequest) -> Iterator[bytes]:
+    def _stream_speech_pcm_mtp(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
         flow_streaming = request.flow_streaming if request.flow_streaming is not None else api_config.flow_streaming
         flow_steps = request.flow_steps if request.flow_steps is not None else api_config.flow_steps
         chunk_size = request.chunk_size or api_config.stream_chunk_size
@@ -824,17 +847,31 @@ class SoulXPodcastService:
 
         self._seed_all(seed)
 
-        prepared = self._build_speech_prepared(request)
+        prepared = prepared or self._build_speech_prepared(request)
         prompt_ids, eos_id, offset = self._build_first_turn_prompt(prepared)
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
         synth_state = self._prepare_synth_state(prepared)
         sampling_params = prepared["sampling_params"]
+        prompt_entry = prepared["prompt_cache_entry"]
+        prefix_cache = prompt_entry.get("prompt_prefix_cache")
+        prefix_hidden = prompt_entry.get("prompt_prefix_hidden")
+        prefix_len = prompt_entry.get("prompt_prefix_len", 0)
+        if prefix_cache is not None:
+            prefix_cache = self._fork_dynamic_cache(prefix_cache)
 
         streamer = SpeechTokenStreamer(eos_token_id=eos_id)
         mtp_stream = torch.cuda.Stream()
         flow_stream = torch.cuda.Stream()
         mtp_thread = self._run_mtp_in_thread(
-            input_ids, sampling_params, eos_id, streamer, mtp_stream, seed
+            input_ids,
+            sampling_params,
+            eos_id,
+            streamer,
+            mtp_stream,
+            seed,
+            prefix_cache=prefix_cache,
+            prefix_hidden=prefix_hidden,
+            prefix_len=prefix_len,
         )
 
         accumulated_speech_tokens: List[int] = []
@@ -882,9 +919,13 @@ class SoulXPodcastService:
                 streamer.end()
                 mtp_thread.join(timeout=1.0)
 
-    def _generate_speech_pcm_trunk(self, request: SpeechRequest) -> Iterator[bytes]:
+    def _generate_speech_pcm_trunk(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
         self._seed_all(self._resolve_seed(request))
-        prepared = self._build_speech_prepared(request)
+        prepared = prepared or self._build_speech_prepared(request)
         with torch.no_grad():
             results_dict = self.model.forward_longform(**prepared)
         target_audio = None
@@ -893,36 +934,47 @@ class SoulXPodcastService:
         if target_audio is not None:
             yield tensor_to_pcm16_bytes(target_audio)
 
-    def stream_speech_pcm(self, request: SpeechRequest) -> Iterator[bytes]:
+    def stream_speech_pcm(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
         if not self.is_loaded():
-            raise RuntimeError("模型未加载")
+            raise RuntimeError("Model is not loaded")
         with self._speech_lock:
             if self.mtp is not None:
-                yield from self._stream_speech_pcm_mtp(request)
+                yield from self._stream_speech_pcm_mtp(request, prepared)
             else:
-                yield from self._generate_speech_pcm_trunk(request)
+                yield from self._generate_speech_pcm_trunk(request, prepared)
 
-    def stream_speech_bytes(self, request: SpeechRequest) -> Iterator[bytes]:
+    def stream_speech_bytes(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
         if request.output_format == "wav":
             yield wav_header(None)
         elif request.output_format != "pcm":
             raise ValueError(f"Unsupported format: {request.output_format}")
-        for pcm in self.stream_speech_pcm(request):
+        for pcm in self.stream_speech_pcm(request, prepared):
             yield pcm
 
-    def generate_speech_bytes(self, request: SpeechRequest) -> bytes:
-        pcm = b"".join(self.stream_speech_pcm(request))
+    def generate_speech_bytes(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        pcm = b"".join(self.stream_speech_pcm(request, prepared))
         if request.output_format == "pcm":
             return pcm
         return wav_bytes_from_pcm(pcm)
 
 
-# 全局服务实例
 _service: Optional[SoulXPodcastService] = None
 
 
 def get_service() -> SoulXPodcastService:
-    """获取全局服务实例"""
+    """Get the global service instance."""
     global _service
     if _service is None:
         _service = SoulXPodcastService()

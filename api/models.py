@@ -2,13 +2,13 @@
 Pydantic Data Models for API
 """
 from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Literal, Union
+from typing import Optional, List, Literal
 from datetime import datetime
 from enum import Enum
 
 
 class TaskStatus(str, Enum):
-    """任务状态枚举"""
+    """Task status."""
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -16,84 +16,69 @@ class TaskStatus(str, Enum):
 
 
 class GenerateRequest(BaseModel):
-    """生成请求模型（用于JSON body，配合文件上传使用）"""
+    """Generation request model for JSON bodies used with file uploads."""
     prompt_texts: List[str] = Field(
         ...,
-        description="参考文本列表，长度应与上传的音频文件数量一致",
+        description="Reference transcripts. Must match the number of uploaded prompt audio files.",
         min_items=1,
         max_items=4
     )
     dialogue_text: str = Field(
         ...,
-        description="要生成的对话文本。单说话人直接输入文本，多说话人使用[S1][S2]标记",
+        description="Dialogue text to synthesize. Single-speaker text may be plain; multi-speaker text uses [S1], [S2], etc.",
         min_length=1
     )
     seed: Optional[int] = Field(
         default=1988,
-        description="随机种子，用于复现结果"
+        description="Random seed for reproducible generation."
     )
     temperature: Optional[float] = Field(
         default=0.6,
         ge=0.1,
         le=2.0,
-        description="采样温度"
+        description="Sampling temperature."
     )
     top_k: Optional[int] = Field(
         default=100,
         ge=1,
         le=500,
-        description="Top-K采样参数"
+        description="Top-k sampling parameter."
     )
     top_p: Optional[float] = Field(
         default=0.9,
         ge=0.0,
         le=1.0,
-        description="Top-P采样参数"
+        description="Top-p sampling parameter."
     )
     repetition_penalty: Optional[float] = Field(
         default=1.25,
         ge=1.0,
         le=2.0,
-        description="重复惩罚系数"
+        description="Repetition penalty."
     )
 
     @validator('dialogue_text')
     def validate_dialogue_text(cls, v):
-        """验证对话文本格式"""
+        """Validate dialogue text."""
         if not v.strip():
-            raise ValueError("dialogue_text不能为空")
+            raise ValueError("dialogue_text must not be empty")
         return v.strip()
-
-
-class SpeechVoice(BaseModel):
-    """OpenAI-style voice selector.
-
-    `id` resolves through the local voice registry. `prompt_audio` and
-    `prompt_text` can override the registry for trusted internal deployments
-    where request bodies may reference files mounted in the container.
-    """
-    id: str = Field(..., description="Voice id from the local registry")
-    prompt_audio: Optional[str] = Field(
-        default=None,
-        description="Optional server-local prompt audio path override",
-    )
-    prompt_text: Optional[str] = Field(
-        default=None,
-        description="Optional prompt transcript override",
-    )
 
 
 class SpeechRequest(BaseModel):
     """OpenAI-compatible `/v1/audio/speech` request body."""
     model: str = Field(..., description="Model name. Accepted for API compatibility.")
-    voice: Optional[Union[str, SpeechVoice]] = Field(
+    prompt_cache_id: Optional[str] = Field(
         default=None,
-        description="Optional voice id or voice object from the local registry",
+        description=(
+            "Opaque prompt cache id returned in the Prompt-Cache-Id response header. "
+            "When set, omit prompt_audio and prompt_text."
+        ),
     )
     prompt_audio: Optional[str] = Field(
         default=None,
         description=(
-            "Voice prompt audio as trusted server-local file:// URI, "
+            "Prompt audio as trusted server-local file:// URI, "
             "data:audio/*;base64 URI, or raw base64 audio bytes. Requires prompt_text. "
             "file:// paths may be restricted by PROMPT_AUDIO_ROOT."
         ),
@@ -135,23 +120,23 @@ class SpeechRequest(BaseModel):
 
 
 class TaskCreateResponse(BaseModel):
-    """异步任务创建响应"""
-    task_id: str = Field(..., description="任务唯一标识符")
-    status: TaskStatus = Field(default=TaskStatus.PENDING, description="任务状态")
-    created_at: datetime = Field(..., description="任务创建时间")
-    message: str = Field(default="任务已创建", description="提示信息")
+    """Async task creation response."""
+    task_id: str = Field(..., description="Unique task identifier.")
+    status: TaskStatus = Field(default=TaskStatus.PENDING, description="Task status.")
+    created_at: datetime = Field(..., description="Task creation timestamp.")
+    message: str = Field(default="Task created", description="Human-readable status message.")
 
 
 class TaskStatusResponse(BaseModel):
-    """任务状态查询响应"""
-    task_id: str = Field(..., description="任务唯一标识符")
-    status: TaskStatus = Field(..., description="任务状态")
-    progress: Optional[int] = Field(None, ge=0, le=100, description="进度百分比")
-    result_url: Optional[str] = Field(None, description="结果文件下载链接")
-    error: Optional[str] = Field(None, description="错误信息")
-    created_at: datetime = Field(..., description="任务创建时间")
-    started_at: Optional[datetime] = Field(None, description="任务开始时间")
-    completed_at: Optional[datetime] = Field(None, description="任务完成时间")
+    """Task status response."""
+    task_id: str = Field(..., description="Unique task identifier.")
+    status: TaskStatus = Field(..., description="Task status.")
+    progress: Optional[int] = Field(None, ge=0, le=100, description="Progress percentage.")
+    result_url: Optional[str] = Field(None, description="Download URL for the generated result.")
+    error: Optional[str] = Field(None, description="Error message, if the task failed.")
+    created_at: datetime = Field(..., description="Task creation timestamp.")
+    started_at: Optional[datetime] = Field(None, description="Task start timestamp.")
+    completed_at: Optional[datetime] = Field(None, description="Task completion timestamp.")
 
     class Config:
         json_schema_extra = {
@@ -169,18 +154,18 @@ class TaskStatusResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """健康检查响应"""
-    status: str = Field(default="healthy", description="服务状态")
-    model_loaded: bool = Field(..., description="模型是否已加载")
-    gpu_available: bool = Field(..., description="GPU是否可用")
-    llm_engine: str = Field(..., description="当前使用的LLM引擎 (hf/vllm)")
-    active_tasks: int = Field(default=0, description="正在处理的任务数")
-    version: str = Field(default="1.0.0", description="API版本")
+    """Health check response."""
+    status: str = Field(default="healthy", description="Service status.")
+    model_loaded: bool = Field(..., description="Whether the model is loaded.")
+    gpu_available: bool = Field(..., description="Whether CUDA/GPU is available.")
+    llm_engine: str = Field(..., description="Active LLM engine: hf or vllm.")
+    active_tasks: int = Field(default=0, description="Number of active async tasks.")
+    version: str = Field(default="1.0.0", description="API version.")
 
 
 class ErrorResponse(BaseModel):
-    """错误响应"""
-    error: str = Field(..., description="错误类型")
-    message: str = Field(..., description="错误详细信息")
-    task_id: Optional[str] = Field(None, description="相关任务ID")
-    timestamp: datetime = Field(default_factory=datetime.now, description="错误发生时间")
+    """Error response."""
+    error: str = Field(..., description="Error type.")
+    message: str = Field(..., description="Detailed error message.")
+    task_id: Optional[str] = Field(None, description="Related task id, when available.")
+    timestamp: datetime = Field(default_factory=datetime.now, description="Error timestamp.")

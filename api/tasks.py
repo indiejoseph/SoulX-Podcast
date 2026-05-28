@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Task:
-    """任务数据类"""
+    """Async generation task."""
     task_id: str
     prompt_audio_paths: List[str]
     prompt_texts: List[str]
@@ -40,7 +40,7 @@ class Task:
 
 
 class TaskManager:
-    """任务管理器（单例）"""
+    """Singleton async task manager."""
 
     _instance: Optional['TaskManager'] = None
 
@@ -60,7 +60,7 @@ class TaskManager:
             logger.info(f"TaskManager initialized with {config.max_concurrent_tasks} concurrent tasks")
 
     def start_workers(self, num_workers: int = None):
-        """启动后台工作线程"""
+        """Start background workers."""
         if num_workers is None:
             num_workers = config.max_concurrent_tasks
 
@@ -70,12 +70,11 @@ class TaskManager:
             logger.info(f"Started worker-{i}")
 
     async def _worker(self, worker_name: str):
-        """后台工作线程"""
+        """Background worker loop."""
         logger.info(f"{worker_name} started")
 
         while True:
             try:
-                # 从队列获取任务
                 task_id = await self.queue.get()
 
                 if task_id not in self.tasks:
@@ -85,7 +84,6 @@ class TaskManager:
 
                 task = self.tasks[task_id]
 
-                # 获取信号量（限制并发数）
                 async with self.semaphore:
                     logger.info(f"{worker_name}: Processing task {task_id}")
                     await self._process_task(task)
@@ -100,21 +98,18 @@ class TaskManager:
                 self.queue.task_done()
 
     async def _process_task(self, task: Task):
-        """处理单个任务"""
+        """Process a single task."""
         try:
-            # 更新状态为处理中
             task.status = TaskStatus.PROCESSING
             task.started_at = datetime.now()
             task.progress = 10
             logger.info(f"Task {task.task_id} started processing")
 
-            # 在线程池中运行模型推理（避免阻塞事件循环）
             loop = asyncio.get_event_loop()
             service = get_service()
 
             task.progress = 20
 
-            # 执行生成
             sample_rate, audio_array = await loop.run_in_executor(
                 None,
                 service.generate,
@@ -131,7 +126,6 @@ class TaskManager:
             task.progress = 80
             logger.info(f"Task {task.task_id} generation completed")
 
-            # 保存结果
             output_filename = f"{task.task_id}.wav"
             output_path = config.output_dir / output_filename
             wavfile.write(str(output_path), sample_rate, audio_array)
@@ -162,7 +156,7 @@ class TaskManager:
         top_p: float = 0.9,
         repetition_penalty: float = 1.25,
     ) -> Task:
-        """创建并加入队列"""
+        """Create a task and enqueue it."""
         task = Task(
             task_id=task_id,
             prompt_audio_paths=prompt_audio_paths,
@@ -182,38 +176,34 @@ class TaskManager:
         return task
 
     def get_task(self, task_id: str) -> Optional[Task]:
-        """获取任务信息"""
+        """Get task metadata."""
         return self.tasks.get(task_id)
 
     def get_active_task_count(self) -> int:
-        """获取活跃任务数量"""
+        """Get the number of active tasks."""
         return sum(
             1 for task in self.tasks.values()
             if task.status in [TaskStatus.PENDING, TaskStatus.PROCESSING]
         )
 
     async def shutdown(self):
-        """关闭任务管理器"""
+        """Shut down the task manager."""
         logger.info("Shutting down TaskManager...")
 
-        # 等待队列清空
         await self.queue.join()
 
-        # 取消所有工作线程
         for worker in self.workers:
             worker.cancel()
 
-        # 等待工作线程结束
         await asyncio.gather(*self.workers, return_exceptions=True)
         logger.info("TaskManager shutdown completed")
 
 
-# 全局任务管理器实例
 _task_manager: Optional[TaskManager] = None
 
 
 def get_task_manager() -> TaskManager:
-    """获取全局任务管理器实例"""
+    """Get the global task manager instance."""
     global _task_manager
     if _task_manager is None:
         _task_manager = TaskManager()

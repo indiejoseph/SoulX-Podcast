@@ -31,7 +31,25 @@ curl http://localhost:8000/v1/audio/speech \
 `prompt_text` is required whenever `prompt_audio` is set. The path form is a
 server/container-local file URI, not a client filesystem path. Set
 `PROMPT_AUDIO_ROOT` to restrict accepted `file://` prompt paths; the compose
-default is `/app`.
+default is `/app`. Send `prompt_audio` + `prompt_text` on the first request,
+then reuse `prompt_cache_id` when appropriate.
+
+Every successful `/v1/audio/speech` response includes a `Prompt-Cache-Id`
+header. A follow-up request can omit `prompt_audio` and `prompt_text` and reuse
+the prepared prompt state:
+
+```json
+{
+  "model": "soulx-podcast-mtp",
+  "prompt_cache_id": "pc_...",
+  "input": "The next sentence to synthesize.",
+  "format": "pcm",
+  "stream": true
+}
+```
+
+Cache ids are in-memory and local to one API process. They are invalid after
+restart or LRU eviction.
 
 ## Docker Compose
 
@@ -69,21 +87,26 @@ on the patched vLLM runtime so the container remains compatible with vLLM
 fallback/baseline experiments. For those experiments, set `ENABLE_MTP=false`
 and `LLM_ENGINE=vllm`.
 
-## Voice Registry
+## TTFA Measurement
 
-Voice ids are still supported as a convenience for stable production voices.
-If `prompt_audio` is omitted, the service resolves `voice.id` through the local
-registry. The default registry is
-`config/voices.example.json`:
+Use streamed PCM for latency measurements. Streamed WAV responses send the WAV
+header before generated audio, so first-byte timing does not equal TTFA.
 
-```json
-{
-  "female_mandarin": {
-    "prompt_audio": "example/audios/female_mandarin.wav",
-    "prompt_text": "..."
-  }
-}
+```bash
+SOULX_API_KEY=local-dev-key \
+python scripts/api/measure_ttfa.py \
+  --url http://localhost:8000/v1/audio/speech \
+  --prompt-audio file:///app/example/audios/female_mandarin.wav \
+  --prompt-text "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。" \
+  --first-chunk-size 4 \
+  --chunk-size 100 \
+  --flow-steps 8 \
+  --flow-streaming \
+  --format pcm
 ```
 
-Use `VOICE_REGISTRY_PATH=/app/config/voices.json` to mount a production
-registry.
+Restart the API process immediately before running this script if you need a
+true cold-cache number. Run 2 reuses the `Prompt-Cache-Id` returned by run 1 by
+default. The script prints client-visible TTFA and total wall time; internal
+first-LLM-token and first-flow-call fields are reported as `n/a` unless the
+server exposes timing headers.

@@ -52,6 +52,7 @@ is the obvious next optimization once acceptance behavior is validated.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -122,6 +123,20 @@ def _build_causal_mask(L: int, dtype: torch.dtype, device: torch.device) -> torc
     mask = torch.full((L, L), min_val, dtype=dtype, device=device)
     mask = torch.triu(mask, diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _fork_dynamic_cache(cache):
+    """Copy cache containers while sharing read-only prefix KV tensors.
+
+    Transformers DynamicCache mutates layer containers by assigning concatenated
+    key/value tensors. Copying the containers keeps the cached prefix tensors
+    shared, while preventing per-request crop/append operations from modifying
+    the prompt-cache entry.
+    """
+    forked = copy.copy(cache)
+    if hasattr(cache, "layers"):
+        forked.layers = [copy.copy(layer) for layer in cache.layers]
+    return forked
 
 
 @torch.inference_mode()
@@ -660,6 +675,9 @@ def mtp_speculative_sample_cached(
     allow_eos_from_drafts: bool = False,
     seed: Optional[int] = None,
     streamer=None,
+    prefix_cache=None,
+    prefix_hidden: Optional[torch.Tensor] = None,
+    prefix_len: int = 0,
 ) -> SpecDecodeResult:
     """KV-cached MTP speculative decoding with sampling-aware validation.
 
@@ -761,10 +779,34 @@ def mtp_speculative_sample_cached(
         # SpeechTokenStreamer discards it before consuming generated tokens.
         streamer.put(input_ids.detach().cpu())
 
-    # Initial trunk forward → cache + full hidden states.
-    out_init = base.model(input_ids=full_ids, use_cache=True, return_dict=True)
-    cache = out_init.past_key_values
-    trunk_hidden_full = out_init.last_hidden_state  # [1, T_prompt, H]
+    # Initial trunk forward → cache + full hidden states. When a prompt-cache
+    # entry provides prefix KV + hidden states, only prefill the per-request
+    # target text tail here.
+    if prefix_cache is not None:
+        if prefix_hidden is None or prefix_len <= 0:
+            raise ValueError("prefix_cache requires prefix_hidden and prefix_len")
+        if prefix_len > full_ids.shape[1]:
+            raise ValueError("prefix_len exceeds input length")
+        cache = _fork_dynamic_cache(prefix_cache)
+        target_ids = full_ids[:, prefix_len:]
+        if target_ids.numel() > 0:
+            out_init = base.model(
+                input_ids=target_ids,
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            cache = out_init.past_key_values
+            trunk_hidden_full = torch.cat(
+                [prefix_hidden.to(out_init.last_hidden_state.device), out_init.last_hidden_state],
+                dim=1,
+            )
+        else:
+            trunk_hidden_full = prefix_hidden
+    else:
+        out_init = base.model(input_ids=full_ids, use_cache=True, return_dict=True)
+        cache = out_init.past_key_values
+        trunk_hidden_full = out_init.last_hidden_state  # [1, T_prompt, H]
 
     while full_ids.shape[1] - prompt_len < max_new_tokens:
         T = full_ids.shape[1]
