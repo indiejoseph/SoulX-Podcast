@@ -47,7 +47,23 @@ def resolve_model_path(ckpt, cli_base: str | None) -> str:
             )
         return cli_base
     if train_base:
+        if not Path(train_base).is_dir():
+            fallback = Path("runs/merged")
+            if fallback.is_dir():
+                print(
+                    f"[warn] checkpoint model_path {train_base!r} does not exist; "
+                    f"using local {str(fallback)!r}"
+                )
+                return str(fallback)
+            print(
+                f"[warn] checkpoint model_path {train_base!r} does not exist locally; "
+                "pass --base to override"
+            )
         return train_base
+    fallback = Path("runs/merged")
+    if fallback.is_dir():
+        print("[warn] checkpoint has no train_config.model_path; using local 'runs/merged'")
+        return str(fallback)
     print(f"[warn] checkpoint has no train_config.model_path; using {DEFAULT_BASE!r}")
     return DEFAULT_BASE
 
@@ -120,6 +136,37 @@ def run_mtp_in_thread(model, mtp, input_ids, sampling_params, eos_id, streamer, 
     return thread
 
 
+@torch.inference_mode()
+def warmup(model, mtp, input_ids, sampling_params, eos_id, synth_state):
+    print("[warmup] running short MTP decode + first flow/HiFT call")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        spec = mtp_speculative_sample_cached(
+            model.llm.model,
+            mtp,
+            input_ids,
+            max_new_tokens=16,
+            min_new_tokens=min(sampling_params.min_tokens, 8),
+            eos_token_id=eos_id,
+            temperature=sampling_params.temperature,
+            top_k=sampling_params.top_k,
+            top_p=sampling_params.top_p,
+            repetition_penalty=sampling_params.repetition_penalty,
+            use_ras=sampling_params.use_ras,
+            ras_win_size=sampling_params.win_size,
+            ras_tau_r=sampling_params.tau_r,
+            allow_eos_from_drafts=False,
+            seed=198964,
+        )
+    warm_tokens = spec.generated_tokens[0].tolist()
+    if warm_tokens and warm_tokens[-1] == eos_id:
+        warm_tokens = warm_tokens[:-1]
+    offset = model.config.hf_config.speech_token_offset
+    warm_speech = [t - offset for t in warm_tokens[:8]]
+    if warm_speech:
+        _ = synthesize_chunk(model, synth_state, warm_speech, finalize=False)
+    torch.cuda.synchronize()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
@@ -127,6 +174,8 @@ def main():
     ap.add_argument("first_chunk_size", nargs="?", type=int, default=12)
     ap.add_argument("--base", default=None)
     ap.add_argument("--output_dir", default="")
+    ap.add_argument("--no_warmup", action="store_true",
+                    help="Report cold TTFA including first CUDA/kernel overhead.")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -162,6 +211,9 @@ def main():
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
     synth_state = prepare_synth_state(model, prepared)
     sampling_params = prepared["sampling_params"]
+
+    if not args.no_warmup:
+        warmup(model, mtp, input_ids, sampling_params, eos_id, synth_state)
 
     streamer = SpeechTokenStreamer(eos_token_id=eos_id)
     mtp_stream = torch.cuda.Stream()

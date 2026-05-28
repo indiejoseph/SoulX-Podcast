@@ -50,28 +50,27 @@ class SpeechTokenStreamer(BaseStreamer):
         """Receive newly-generated tokens from the generation loop.
 
         First call: full prompt tensor — discarded.
-        Subsequent calls: shape [batch] (one new token per beam). batch=1 only.
+        Subsequent calls: usually shape [batch] with batch=1 from HF generate.
+        MTP streaming may pass a 1-D tensor containing multiple already-
+        verified committed tokens; those are enqueued in order.
         """
         if not self._got_prompt:
             self._got_prompt = True
             return
         if value.ndim == 0:
-            tok = int(value.item())
+            toks = [int(value.item())]
         elif value.ndim == 1:
-            if value.shape[0] != 1:
-                raise ValueError(
-                    f"SpeechTokenStreamer only supports batch_size=1, got {value.shape[0]}"
-                )
-            tok = int(value[0].item())
+            toks = [int(tok.item()) for tok in value]
         else:
             # Shouldn't happen with HF's standard generate loop, but be defensive.
             raise ValueError(
                 f"SpeechTokenStreamer expected scalar or 1-D tensor, got shape {tuple(value.shape)}"
             )
         # Drop EOS — consumers don't need it in the chunk stream; .end() signals stop.
-        if self.eos_token_id is not None and tok == self.eos_token_id:
-            return
-        self._q.put(tok)
+        for tok in toks:
+            if self.eos_token_id is not None and tok == self.eos_token_id:
+                continue
+            self._q.put(tok)
 
     def end(self) -> None:
         if not self._closed:
@@ -105,7 +104,7 @@ class SpeechTokenStreamer(BaseStreamer):
         """
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
-        first_target = first_chunk_size or chunk_size
+        first_target = first_chunk_size if first_chunk_size is not None else chunk_size
         if first_target <= 0:
             raise ValueError(f"first_chunk_size must be > 0, got {first_target}")
         buf: List[int] = []

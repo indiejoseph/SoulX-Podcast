@@ -918,8 +918,7 @@ def mtp_speculative_sample_cached(
                 full_ids = full_ids[:, :-extra]
 
         if streamer is not None:
-            for tok in stream_committed[0].detach().cpu():
-                streamer.put(tok.view(1))
+            streamer.put(stream_committed[0].detach().cpu())
 
         if eos_hit:
             break

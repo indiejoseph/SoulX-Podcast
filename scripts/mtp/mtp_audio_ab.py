@@ -81,7 +81,23 @@ def resolve_model_path(ckpt, cli_base: str | None) -> str:
             )
         return cli_base
     if train_base:
+        if not Path(train_base).is_dir():
+            fallback = Path("runs/merged")
+            if fallback.is_dir():
+                print(
+                    f"[warn] checkpoint model_path {train_base!r} does not exist; "
+                    f"using local {str(fallback)!r}"
+                )
+                return str(fallback)
+            print(
+                f"[warn] checkpoint model_path {train_base!r} does not exist locally; "
+                "pass --base to override"
+            )
         return train_base
+    fallback = Path("runs/merged")
+    if fallback.is_dir():
+        print("[warn] checkpoint has no train_config.model_path; using local 'runs/merged'")
+        return str(fallback)
     print(
         f"[warn] checkpoint has no train_config.model_path; falling back to {MODEL_PATH!r}"
     )
