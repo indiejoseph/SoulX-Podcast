@@ -192,6 +192,7 @@ class SoulXPodcast(torch.nn.Module):
         dialect_prompt_text_tokens_for_llm: list[list[int]] = None,
         dialect_prefix: list[list[int]] = None,
         chunk_size: int = 50,
+        first_chunk_size: int | None = None,
         **kwargs,
     ):
         """Generator yielding audio chunks across turns.
@@ -298,7 +299,10 @@ class SoulXPodcast(torch.nn.Module):
             accumulated_speech_tokens = []
             prev_audio_len = 0
             chunk_idx = 0
-            for chunk in streamer.iter_chunks(chunk_size=chunk_size):
+            for chunk in streamer.iter_chunks(
+                chunk_size=chunk_size,
+                first_chunk_size=first_chunk_size,
+            ):
                 cur_speech_tokens = [t - self.config.hf_config.speech_token_offset for t in chunk]
                 accumulated_speech_tokens.extend(cur_speech_tokens)
                 with torch.cuda.stream(flow_stream):
@@ -351,8 +355,12 @@ class SoulXPodcast(torch.nn.Module):
                              prompt_mel, prompt_mel_len_t, spk_emb, finalize: bool):
         """Run flow+HiFT on (prompt_speech_tokens + generated_speech_tokens).
         Returns the full waveform; caller slices off already-emitted portion."""
-        flow_input = torch.tensor([prompt_speech_tokens + generated_speech_tokens])
-        flow_input_len = torch.tensor([flow_input.shape[1]])
+        device = prompt_mel.device
+        flow_input = torch.tensor(
+            [prompt_speech_tokens + generated_speech_tokens],
+            device=device,
+        )
+        flow_input_len = torch.tensor([flow_input.shape[1]], device=device)
         with torch.amp.autocast("cuda",
                 dtype=torch.float16 if self.config.hf_config.fp16_flow else torch.float32):
             mels, mels_lens = self.flow(

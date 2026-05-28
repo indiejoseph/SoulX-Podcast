@@ -11,7 +11,7 @@ so far) and slices out the new audio portion. This is O(N^2) on flow compute
 but flow is only ~12% of total time so the redundancy is acceptable for now.
 
 Usage:
-    python bistream_test.py [chunk_size=50]
+    python bistream_test.py [chunk_size=100] [first_chunk_size=12]
 """
 
 import sys as _sys
@@ -31,44 +31,62 @@ from soulxpodcast.utils.streaming import SpeechTokenStreamer, run_llm_in_thread
 from streaming_hook_test import build_first_turn_prompt
 
 
-def synthesize_chunk(model, prepared, all_speech_tokens, finalize):
-    """Run flow+HiFT on (prompt_speech_tokens + all_speech_tokens). Returns full waveform.
+def prepare_synth_state(model, prepared):
+    """Precompute prompt-side state once.
 
-    Caller slices off the audio portion already emitted on prior calls.
+    The old benchmark quantized the prompt audio inside every chunk synthesis,
+    which inflated per-chunk flow timing and TTFA. Production streaming does
+    this once in `forward_longform_streaming`; this helper matches that scope.
     """
     prompt_mels = prepared["prompt_mels_for_llm"]
     prompt_mels_lens = prepared["prompt_mels_lens_for_llm"]
     prompt_spk_tokens, prompt_lens = model.audio_tokenizer.quantize(
         prompt_mels.cuda(), prompt_mels_lens.cuda()
     )
-    spk0_prompt_tokens = prompt_spk_tokens[0, : prompt_lens[0].item()].tolist()
-
-    flow_input = torch.tensor([spk0_prompt_tokens + all_speech_tokens])
-    flow_input_len = torch.tensor([flow_input.shape[1]])
-
+    prompt_len = prompt_lens[0].item()
     prompt_mel = prepared["prompt_mels_for_flow_ori"][0]
-    prompt_mel = prompt_mel[: prompt_lens[0].item() * 2].cuda()
-    prompt_mel_len = torch.tensor([prompt_mel.shape[0]]).cuda()
-    spk_emb = prepared["spk_emb_for_flow"][0:1].cuda()
+    prompt_mel = prompt_mel[: prompt_len * 2].cuda()
+    return {
+        "prompt_tokens": prompt_spk_tokens[0, :prompt_len].tolist(),
+        "prompt_mel": prompt_mel[None],
+        "prompt_mel_len": torch.tensor([prompt_mel.shape[0]], device="cuda"),
+        "spk_emb": prepared["spk_emb_for_flow"][0:1].cuda(),
+    }
+
+
+def synthesize_chunk(model, synth_state, all_speech_tokens, finalize):
+    """Run flow+HiFT on (prompt_speech_tokens + all_speech_tokens). Returns full waveform.
+
+    Caller slices off the audio portion already emitted on prior calls.
+    """
+    flow_input = torch.tensor(
+        [synth_state["prompt_tokens"] + all_speech_tokens],
+        device="cuda",
+    )
+    flow_input_len = torch.tensor([flow_input.shape[1]], device="cuda")
 
     with torch.amp.autocast("cuda",
             dtype=torch.float16 if model.config.hf_config.fp16_flow else torch.float32):
         mels, mels_lens = model.flow(
-            flow_input.cuda(), flow_input_len.cuda(),
-            prompt_mel[None], prompt_mel_len, spk_emb,
+            flow_input, flow_input_len,
+            synth_state["prompt_mel"],
+            synth_state["prompt_mel_len"],
+            synth_state["spk_emb"],
             streaming=False, finalize=finalize,
         )
     # Drop the prompt-mel prefix (matches forward_longform).
-    mel = mels[:, :, prompt_mel_len[0].item(): mels_lens[0].item()]
+    mel = mels[:, :, synth_state["prompt_mel_len"][0].item(): mels_lens[0].item()]
     wav, _ = model.hift(speech_feat=mel)
     return wav  # [1, T]
 
 
 def main():
     model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
-    chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    first_chunk_size = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 
-    print(f"[init] loading model (hf engine, chunk_size={chunk_size})")
+    print(f"[init] loading model (hf engine, chunk_size={chunk_size}, "
+          f"first_chunk_size={first_chunk_size})")
     t0 = time.perf_counter()
     model, dataset = initiate_model(seed=198964, model_path=model_path,
                                      llm_engine="hf", fp16_flow=True)
@@ -93,12 +111,13 @@ def main():
         inputs["use_dialect_prompt"], inputs["dialect_prompt_text"],
     )
     prompt_ids, eos_id, offset = build_first_turn_prompt(model, prepared)
+    synth_state = prepare_synth_state(model, prepared)
 
     sp = prepared["sampling_params"]
     if isinstance(sp, list):
         sp = sp[0]
 
-    out_dir = Path("outputs/bistream") / f"chunk{chunk_size}"
+    out_dir = Path("outputs/bistream") / f"first{first_chunk_size}_chunk{chunk_size}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     streamer = SpeechTokenStreamer(eos_token_id=eos_id)
@@ -126,13 +145,18 @@ def main():
     # finalize=False (last 3 tokens act as lookahead context per the flow's
     # streaming convention). After the LLM thread finishes, do one final pass
     # with finalize=True to flush the trailing lookahead tokens.
-    for chunk_idx, cur_chunk in enumerate(streamer.iter_chunks(chunk_size=chunk_size)):
+    for chunk_idx, cur_chunk in enumerate(
+        streamer.iter_chunks(
+            chunk_size=chunk_size,
+            first_chunk_size=first_chunk_size,
+        )
+    ):
         cur_speech_tokens = [t - offset for t in cur_chunk]
         accumulated_speech_tokens.extend(cur_speech_tokens)
 
         t_chunk_start = time.perf_counter()
         with torch.cuda.stream(flow_stream):
-            wav_full = synthesize_chunk(model, prepared,
+            wav_full = synthesize_chunk(model, synth_state,
                                         accumulated_speech_tokens, finalize=False)
         new_audio = wav_full[:, prev_audio_len:].detach().cpu()
         flow_chunk_times.append(time.perf_counter() - t_chunk_start)
@@ -155,7 +179,7 @@ def main():
     # the trailing tokens the intermediate calls treated as lookahead context.
     t_final = time.perf_counter()
     with torch.cuda.stream(flow_stream):
-        wav_full = synthesize_chunk(model, prepared,
+        wav_full = synthesize_chunk(model, synth_state,
                                     accumulated_speech_tokens, finalize=True)
     final_audio = wav_full[:, prev_audio_len:].detach().cpu()
     flow_chunk_times.append(time.perf_counter() - t_final)

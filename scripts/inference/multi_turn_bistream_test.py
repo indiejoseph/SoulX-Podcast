@@ -30,9 +30,11 @@ from soulxpodcast.utils.parser import podcast_format_parser
 
 def main():
     model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
-    chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+    first_chunk_size = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 
-    print(f"[init] loading model (hf engine, chunk_size={chunk_size})")
+    print(f"[init] loading model (hf engine, chunk_size={chunk_size}, "
+          f"first_chunk_size={first_chunk_size})")
     t0 = time.perf_counter()
     model, dataset = initiate_model(seed=198964, model_path=model_path,
                                      llm_engine="hf", fp16_flow=True)
@@ -67,7 +69,7 @@ def main():
         inputs["use_dialect_prompt"], inputs["dialect_prompt_text"],
     )
 
-    out_dir = Path("outputs/bistream_multiturn") / f"chunk{chunk_size}"
+    out_dir = Path("outputs/bistream_multiturn") / f"first{first_chunk_size}_chunk{chunk_size}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-turn state for TTFA measurement and per-turn wav assembly.
@@ -82,7 +84,11 @@ def main():
     t_start = time.perf_counter()
 
     print(f"\n[bistream] starting multi-turn streaming")
-    for event in model.forward_longform_streaming(chunk_size=chunk_size, **prepared):
+    for event in model.forward_longform_streaming(
+        chunk_size=chunk_size,
+        first_chunk_size=first_chunk_size,
+        **prepared,
+    ):
         turn = event["turn"]
         speaker = event["speaker"]
         chunk_idx = event["chunk"]

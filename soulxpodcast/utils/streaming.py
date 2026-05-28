@@ -88,20 +88,37 @@ class SpeechTokenStreamer(BaseStreamer):
                 return
             yield item
 
-    def iter_chunks(self, chunk_size: int, final_partial: bool = True) -> Iterator[List[int]]:
-        """Yield speech tokens in fixed-size chunks.
+    def iter_chunks(
+        self,
+        chunk_size: int,
+        final_partial: bool = True,
+        first_chunk_size: Optional[int] = None,
+    ) -> Iterator[List[int]]:
+        """Yield speech tokens in chunks.
 
         Args:
-            chunk_size: how many tokens per chunk.
+            chunk_size: how many tokens per chunk after the first chunk.
             final_partial: if True, yield a final shorter chunk when generation
                 ends mid-chunk. If False, drop the trailing partial chunk.
+            first_chunk_size: optional smaller first chunk. This reduces TTFA
+                without forcing every later chunk to pay high flow overhead.
         """
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+        first_target = first_chunk_size or chunk_size
+        if first_target <= 0:
+            raise ValueError(f"first_chunk_size must be > 0, got {first_target}")
         buf: List[int] = []
+        target = first_target
+        yielded_first = False
         for tok in self.iter_tokens():
             buf.append(tok)
-            if len(buf) >= chunk_size:
+            if len(buf) >= target:
                 yield buf
                 buf = []
+                if not yielded_first:
+                    yielded_first = True
+                    target = chunk_size
         if buf and final_partial:
             yield buf
 

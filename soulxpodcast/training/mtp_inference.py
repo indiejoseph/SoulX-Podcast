@@ -659,6 +659,7 @@ def mtp_speculative_sample_cached(
     ras_tau_r: float = 0.2,
     allow_eos_from_drafts: bool = False,
     seed: Optional[int] = None,
+    streamer=None,
 ) -> SpecDecodeResult:
     """KV-cached MTP speculative decoding with sampling-aware validation.
 
@@ -755,6 +756,10 @@ def mtp_speculative_sample_cached(
     accept_lengths: List[int] = []
     eos_hit = False
     n_steps = 0
+    if streamer is not None:
+        # Match HF generate() streamer behavior: first put is the prompt and
+        # SpeechTokenStreamer discards it before consuming generated tokens.
+        streamer.put(input_ids.detach().cpu())
 
     # Initial trunk forward → cache + full hidden states.
     out_init = base.model(input_ids=full_ids, use_cache=True, return_dict=True)
@@ -901,17 +906,27 @@ def mtp_speculative_sample_cached(
         accept_lengths.append(n_accept)
         n_steps += 1
 
+        stream_committed = committed
         if eos_token_id is not None and (committed == eos_token_id).any().item():
             eos_hit = True
             committed_list = committed[0].tolist()
             eos_pos = committed_list.index(eos_token_id)
             keep_n = eos_pos + 1
+            stream_committed = committed[:, :keep_n]
             extra = committed.shape[1] - keep_n
             if extra > 0:
                 full_ids = full_ids[:, :-extra]
+
+        if streamer is not None:
+            for tok in stream_committed[0].detach().cpu():
+                streamer.put(tok.view(1))
+
+        if eos_hit:
             break
 
     generated_tokens = full_ids[:, prompt_len:]
+    if streamer is not None:
+        streamer.end()
     return SpecDecodeResult(
         tokens=full_ids,
         generated_tokens=generated_tokens,
