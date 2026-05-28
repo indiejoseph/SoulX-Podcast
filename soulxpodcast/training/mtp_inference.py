@@ -642,6 +642,7 @@ def mtp_speculative_sample_cached(
     input_ids: torch.LongTensor,          # [1, T_prompt]
     *,
     max_new_tokens: int = 500,
+    min_new_tokens: int = 0,
     eos_token_id: Optional[int] = None,
     K: Optional[int] = None,              # 1 primary + (K-1) MTP drafts
     temperature: float = 1.0,
@@ -656,6 +657,7 @@ def mtp_speculative_sample_cached(
     use_ras: bool = False,
     ras_win_size: int = 25,
     ras_tau_r: float = 0.2,
+    allow_eos_from_drafts: bool = False,
     seed: Optional[int] = None,
 ) -> SpecDecodeResult:
     """KV-cached MTP speculative decoding with sampling-aware validation.
@@ -715,8 +717,11 @@ def mtp_speculative_sample_cached(
         )
 
     def _ras_sample(raw_1d: torch.Tensor,
-                    context_ids: torch.LongTensor) -> tuple:
+                    context_ids: torch.LongTensor,
+                    *,
+                    allow_eos: bool = True) -> tuple:
         """Sample with processors + RAS. Returns (token, log_prob_effective)."""
+        raw_1d = _mask_eos_if_needed(raw_1d, context_ids, allow_eos=allow_eos)
         return _sample_with_ras(
             raw_1d, context_ids,
             temperature=temperature, top_k=top_k, top_p=top_p,
@@ -724,6 +729,26 @@ def mtp_speculative_sample_cached(
             use_ras=use_ras, win_size=ras_win_size, tau_r=ras_tau_r,
             generator=gen,
         )
+
+    def _mask_eos_if_needed(logits: torch.Tensor,
+                            context_ids: torch.LongTensor,
+                            *,
+                            allow_eos: bool = True) -> torch.Tensor:
+        """Block EOS before min_new_tokens, and optionally for MTP drafts.
+
+        HF `generate(min_new_tokens=N)` masks EOS while fewer than N tokens have
+        already been generated. `allow_eos_from_drafts=False` additionally keeps
+        termination in the trunk path: MTP heads draft speech tokens, while the
+        trunk primary/replacement/bonus token decides when to stop.
+        """
+        if eos_token_id is None:
+            return logits
+        generated_so_far = context_ids.shape[1] - prompt_len
+        if allow_eos and generated_so_far >= min_new_tokens:
+            return logits
+        masked = logits.clone()
+        masked[..., eos_token_id] = -float("inf")
+        return masked
 
     full_ids = input_ids.clone()
     prompt_len = input_ids.shape[1]
@@ -766,7 +791,9 @@ def mtp_speculative_sample_cached(
             # committed + drafts[0..k-1]. (drafts[k] is what we're sampling.)
             ctx_k = torch.cat([full_ids] + drafts[:k], dim=1)
             qk_raw = lm_head(out_k[:, -1])                       # [1, V]
-            d_k, qk_logp_at_d = _ras_sample(qk_raw, ctx_k)
+            d_k, qk_logp_at_d = _ras_sample(
+                qk_raw, ctx_k, allow_eos=allow_eos_from_drafts
+            )
             q_log_probs_at_d.append(qk_logp_at_d)               # [1, 1]
             drafts.append(d_k)
             prev_h = out_k
@@ -795,6 +822,7 @@ def mtp_speculative_sample_cached(
             # RAS-aware p_k(d_k): if d_k would trigger RAS at this position,
             # the effective sampling distribution is the raw one. Otherwise
             # use filtered. This makes the acceptance ratio comparable to q.
+            pk_raw = _mask_eos_if_needed(pk_raw, ctx_k, allow_eos=True)
             if use_ras:
                 window = ctx_k[:, -ras_win_size:] if ctx_k.size(1) > ras_win_size else ctx_k
                 rep_count = (window == drafts[k]).sum().item() + 1
@@ -902,6 +930,7 @@ def baseline_sample_decode_cached(
     input_ids: torch.LongTensor,
     *,
     max_new_tokens: int = 500,
+    min_new_tokens: int = 0,
     eos_token_id: Optional[int] = None,
     temperature: float = 1.0,
     top_k: int = 0,
@@ -932,6 +961,12 @@ def baseline_sample_decode_cached(
     n_steps = 0
     while full_ids.shape[1] - prompt_len < max_new_tokens:
         raw = lm_head(last_hidden)[:, 0]  # [1, V]
+        if (
+            eos_token_id is not None
+            and full_ids.shape[1] - prompt_len < min_new_tokens
+        ):
+            raw = raw.clone()
+            raw[..., eos_token_id] = -float("inf")
         next_id, _ = _sample_with_ras(
             raw, full_ids,
             temperature=temperature,

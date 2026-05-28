@@ -44,6 +44,7 @@ DEFAULT_CKPT = "/notebooks/projects/SoulX-Podcast/runs/hpc/mtp_v2/mtp_final.pt"
 
 # Production sampling params from soulxpodcast/config.py:SamplingParams.
 SAMPLING = dict(
+    min_new_tokens=8,
     temperature=0.6,
     top_k=100,
     top_p=0.9,

@@ -107,10 +107,13 @@ def load_mtp(ckpt, base):
     return mtp
 
 
-def make_data(name, target_text, prompt_dict, dataset_handler):
+def make_data(name, target_text, prompt_dict, dataset_handler, *, disable_dialect_prompt=False):
     """Build the input data dict that forward_longform expects."""
+    prompt_payload = dict(prompt_dict)
+    if disable_dialect_prompt:
+        prompt_payload.pop("dialect_prompt", None)
     speakers = {
-        "S1": {**prompt_dict, "prompt_audio": Path(prompt_dict["prompt_audio"])}
+        "S1": {**prompt_payload, "prompt_audio": Path(prompt_payload["prompt_audio"])}
     }
     data = {
         "speakers": speakers,
@@ -159,6 +162,7 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     """Replicate forward_longform's first turn, but route LLM through MTP."""
     from itertools import chain
 
+    t_total_start = time.perf_counter()
     cfg_off = model.config.hf_config.speech_token_offset
     eos_id = model.config.hf_config.eos_token_id
 
@@ -170,6 +174,9 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     spk_ids = prepared["spk_ids"]
     prompt_mels_for_flow_ori = prepared["prompt_mels_for_flow_ori"]
     spk_emb_for_flow = prepared["spk_emb_for_flow"]
+    use_dialect_prompt = prepared.get("use_dialect_prompt", False)
+    dialect_prompt_text_tokens = prepared.get("dialect_prompt_text_tokens_for_llm")
+    dialect_prefix = prepared.get("dialect_prefix")
 
     prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = (
         model.audio_tokenizer.quantize(
@@ -195,10 +202,41 @@ def generate_mtp(model, mtp, prepared, sampling_params):
         prompt_mels_for_flow.append(pmel)
         prompt_mels_lens_for_flow.append(pmel_len_t)
 
-    # Build LLM prompt for speaker 0 (single turn).
-    speech_tokens_0 = [t + cfg_off for t in prompt_speech_tokens[0].tolist()] + [eos_id]
-    prompt_input = prompt_text_tokens[0] + speech_tokens_0
-    inputs = list(prompt_input) + list(text_tokens[0])
+    # Build prompt_inputs exactly like forward_longform. For dialect prompts,
+    # this includes the extra trunk LLM call that synthesizes the dialect prompt
+    # continuation; skipping it made Cantonese A/B timings apples-to-oranges.
+    prompt_inputs = []
+    t_prompt_llm = 0.0
+    for prompt_index in range(prompt_size):
+        speech_tokens_i = [
+            token + cfg_off for token in prompt_speech_tokens[prompt_index].tolist()
+        ] + [eos_id]
+        if (
+            use_dialect_prompt
+            and dialect_prompt_text_tokens is not None
+            and len(dialect_prompt_text_tokens[prompt_index]) > 0
+        ):
+            dialect_prompt_input = (
+                prompt_text_tokens[prompt_index]
+                + speech_tokens_i
+                + dialect_prompt_text_tokens[prompt_index]
+            )
+            if prompt_index > 0:
+                dialect_prompt_input = dialect_prefix[0] + dialect_prompt_input
+            t0 = time.perf_counter()
+            dialect_output = model.llm.generate(
+                dialect_prompt_input, sampling_params, past_key_values=None
+            )["token_ids"]
+            t_prompt_llm += time.perf_counter() - t0
+            prompt_inputs.append(
+                dialect_prefix[prompt_index + 1]
+                + dialect_prompt_text_tokens[prompt_index]
+                + dialect_output
+            )
+        else:
+            prompt_inputs.append(prompt_text_tokens[prompt_index] + speech_tokens_i)
+
+    inputs = list(chain.from_iterable(prompt_inputs)) + list(text_tokens[0])
     input_ids = torch.tensor([inputs], dtype=torch.long, device="cuda")
 
     # --- MTP spec decode (sampling-aware, with RAS to match baseline) ---
@@ -209,6 +247,7 @@ def generate_mtp(model, mtp, prepared, sampling_params):
             mtp,
             input_ids,
             max_new_tokens=sampling_params.max_tokens,
+            min_new_tokens=sampling_params.min_tokens,
             eos_token_id=eos_id,
             temperature=sampling_params.temperature,
             top_k=sampling_params.top_k,
@@ -217,6 +256,7 @@ def generate_mtp(model, mtp, prepared, sampling_params):
             use_ras=sampling_params.use_ras,
             ras_win_size=sampling_params.win_size,
             ras_tau_r=sampling_params.tau_r,
+            allow_eos_from_drafts=False,
             seed=42,
         )
     t_llm = time.perf_counter() - t0
@@ -259,7 +299,8 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
 
-    return wav.cpu(), t_llm, t_synth, result, n_tokens_mtp, eos_hit_mtp
+    t_total = time.perf_counter() - t_total_start
+    return wav.cpu(), t_total, t_prompt_llm, t_llm, t_synth, result, n_tokens_mtp, eos_hit_mtp
 
 
 def main():
@@ -275,6 +316,11 @@ def main():
         "--no_warmup",
         action="store_true",
         help="Skip one untimed warmup pass before measurements.",
+    )
+    ap.add_argument(
+        "--disable_dialect_prompt",
+        action="store_true",
+        help="Remove dialect_prompt from both baseline and MTP paths for fair production timing without dialect warmup.",
     )
     args = ap.parse_args()
 
@@ -311,7 +357,11 @@ def main():
         case_name, target_text, prompt_dict = TEST_CASES[0]
         print(f"[init] warmup on {case_name}")
         _, warm_prepared = make_data(
-            case_name, target_text, prompt_dict, dataset_handler
+            case_name,
+            target_text,
+            prompt_dict,
+            dataset_handler,
+            disable_dialect_prompt=args.disable_dialect_prompt,
         )
         try:
             _ = generate_baseline(model, warm_prepared)
@@ -326,7 +376,11 @@ def main():
         print(f"{'=' * 60}")
 
         parsed, prepared = make_data(
-            case_name, target_text, prompt_dict, dataset_handler
+            case_name,
+            target_text,
+            prompt_dict,
+            dataset_handler,
+            disable_dialect_prompt=args.disable_dialect_prompt,
         )
 
         # --- Baseline ---
@@ -349,7 +403,16 @@ def main():
         # --- MTP ---
         print("  [mtp_spec] running spec decode (sampling)...")
         try:
-            wav_mtp, t_llm_mtp, t_synth_mtp, spec_result, n_tok_mtp, eos_mtp = (
+            (
+                wav_mtp,
+                t_total_mtp,
+                t_prompt_llm_mtp,
+                t_target_llm_mtp,
+                t_synth_mtp,
+                spec_result,
+                n_tok_mtp,
+                eos_mtp,
+            ) = (
                 generate_mtp(
                     model,
                     mtp,
@@ -358,14 +421,14 @@ def main():
                 )
             )
             audio_sec_mtp = wav_mtp.shape[-1] / 24000
-            t_total_mtp = t_llm_mtp + t_synth_mtp
             mtp_path = out_dir / f"{case_name}_mtp_spec.wav"
             torchaudio.save(str(mtp_path), wav_mtp, 24000)
             print(
-                f"  [mtp_spec] LLM={t_llm_mtp:.2f}s ({spec_result.n_steps} steps, "
+                f"  [mtp_spec] prompt_llm={t_prompt_llm_mtp:.2f}s  "
+                f"target_llm={t_target_llm_mtp:.2f}s ({spec_result.n_steps} steps, "
                 f"mean accept={spec_result.mean_accept_length:.2f}, "
                 f"tok/step={spec_result.tokens_per_step:.2f}, "
-                f"tokens={spec_result.n_committed}, eos={spec_result.eos_hit})  "
+                f"tokens={n_tok_mtp}, eos={eos_mtp})  "
                 f"synth={t_synth_mtp:.2f}s  "
                 f"total={t_total_mtp:.2f}s  "
                 f"audio={audio_sec_mtp:.2f}s  RTF={t_total_mtp/audio_sec_mtp:.3f}"
@@ -384,7 +447,8 @@ def main():
                 f"  [report] tok_ratio={tok_ratio:.2f}  audio_ratio={audio_ratio:.2f}{warn}"
             )
 
-            # Speedup summary (LLM stage only — flow+HiFT is identical).
+            # Speedup summary over the same scope as baseline forward_longform:
+            # prompt quantization + optional dialect prompt + target decode + flow/HiFT.
             speedup = t_base / t_total_mtp
             from collections import Counter
 
@@ -397,7 +461,7 @@ def main():
                 f"{case_name:>20s}  base={t_base:5.2f}s  mtp={t_total_mtp:5.2f}s  "
                 f"speedup={speedup:.2f}x  mean_accept={spec_result.mean_accept_length:.2f}  "
                 f"base_audio={audio_sec_base:.2f}s  mtp_audio={audio_sec_mtp:.2f}s  "
-                f"tokens={spec_result.n_committed}  eos={spec_result.eos_hit}"
+                f"tokens={n_tok_mtp}  eos={eos_mtp}"
             )
         except Exception as e:
             import traceback
