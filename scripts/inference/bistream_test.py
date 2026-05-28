@@ -11,7 +11,7 @@ so far) and slices out the new audio portion. This is O(N^2) on flow compute
 but flow is only ~12% of total time so the redundancy is acceptable for now.
 
 Usage:
-    python bistream_test.py [chunk_size=100] [first_chunk_size=12]
+    python bistream_test.py [chunk_size=100] [first_chunk_size=12] [flow_streaming=1] [flow_steps=15]
 """
 
 import sys as _sys
@@ -54,7 +54,14 @@ def prepare_synth_state(model, prepared):
     }
 
 
-def synthesize_chunk(model, synth_state, all_speech_tokens, finalize):
+def synthesize_chunk(
+    model,
+    synth_state,
+    all_speech_tokens,
+    finalize,
+    streaming=False,
+    flow_steps=15,
+):
     """Run flow+HiFT on (prompt_speech_tokens + all_speech_tokens). Returns full waveform.
 
     Caller slices off the audio portion already emitted on prior calls.
@@ -72,7 +79,8 @@ def synthesize_chunk(model, synth_state, all_speech_tokens, finalize):
             synth_state["prompt_mel"],
             synth_state["prompt_mel_len"],
             synth_state["spk_emb"],
-            streaming=False, finalize=finalize,
+            streaming=streaming, finalize=finalize,
+            n_timesteps=flow_steps,
         )
     # Drop the prompt-mel prefix (matches forward_longform).
     mel = mels[:, :, synth_state["prompt_mel_len"][0].item(): mels_lens[0].item()]
@@ -84,9 +92,12 @@ def main():
     model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
     chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 100
     first_chunk_size = int(sys.argv[2]) if len(sys.argv) > 2 else 12
+    flow_streaming = bool(int(sys.argv[3])) if len(sys.argv) > 3 else True
+    flow_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 15
 
     print(f"[init] loading model (hf engine, chunk_size={chunk_size}, "
-          f"first_chunk_size={first_chunk_size})")
+          f"first_chunk_size={first_chunk_size}, flow_streaming={flow_streaming}, "
+          f"flow_steps={flow_steps})")
     t0 = time.perf_counter()
     model, dataset = initiate_model(seed=198964, model_path=model_path,
                                      llm_engine="hf", fp16_flow=True)
@@ -157,7 +168,10 @@ def main():
         t_chunk_start = time.perf_counter()
         with torch.cuda.stream(flow_stream):
             wav_full = synthesize_chunk(model, synth_state,
-                                        accumulated_speech_tokens, finalize=False)
+                                        accumulated_speech_tokens,
+                                        finalize=False,
+                                        streaming=flow_streaming,
+                                        flow_steps=flow_steps)
         new_audio = wav_full[:, prev_audio_len:].detach().cpu()
         flow_chunk_times.append(time.perf_counter() - t_chunk_start)
 
@@ -180,7 +194,10 @@ def main():
     t_final = time.perf_counter()
     with torch.cuda.stream(flow_stream):
         wav_full = synthesize_chunk(model, synth_state,
-                                    accumulated_speech_tokens, finalize=True)
+                                    accumulated_speech_tokens,
+                                    finalize=True,
+                                    streaming=flow_streaming,
+                                    flow_steps=flow_steps)
     final_audio = wav_full[:, prev_audio_len:].detach().cpu()
     flow_chunk_times.append(time.perf_counter() - t_final)
     if final_audio.shape[-1] > 0:

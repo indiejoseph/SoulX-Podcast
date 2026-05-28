@@ -137,7 +137,16 @@ def run_mtp_in_thread(model, mtp, input_ids, sampling_params, eos_id, streamer, 
 
 
 @torch.inference_mode()
-def warmup(model, mtp, input_ids, sampling_params, eos_id, synth_state):
+def warmup(
+    model,
+    mtp,
+    input_ids,
+    sampling_params,
+    eos_id,
+    synth_state,
+    flow_streaming,
+    flow_steps,
+):
     print("[warmup] running short MTP decode + first flow/HiFT call")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         spec = mtp_speculative_sample_cached(
@@ -163,7 +172,14 @@ def warmup(model, mtp, input_ids, sampling_params, eos_id, synth_state):
     offset = model.config.hf_config.speech_token_offset
     warm_speech = [t - offset for t in warm_tokens[:8]]
     if warm_speech:
-        _ = synthesize_chunk(model, synth_state, warm_speech, finalize=False)
+        _ = synthesize_chunk(
+            model,
+            synth_state,
+            warm_speech,
+            finalize=False,
+            streaming=flow_streaming,
+            flow_steps=flow_steps,
+        )
     torch.cuda.synchronize()
 
 
@@ -176,6 +192,10 @@ def main():
     ap.add_argument("--output_dir", default="")
     ap.add_argument("--no_warmup", action="store_true",
                     help="Report cold TTFA including first CUDA/kernel overhead.")
+    ap.add_argument("--no_flow_streaming", action="store_true",
+                    help="Use full-context flow attention for chunks instead of chunk-masked streaming flow.")
+    ap.add_argument("--flow_steps", type=int, default=15,
+                    help="Diffusion Euler steps for chunk synthesis. Default keeps the trained baseline.")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -188,7 +208,8 @@ def main():
 
     print(
         f"[init] model={model_path}  ckpt={args.ckpt}  "
-        f"chunk_size={args.chunk_size}  first_chunk_size={args.first_chunk_size}"
+        f"chunk_size={args.chunk_size}  first_chunk_size={args.first_chunk_size}  "
+        f"flow_streaming={not args.no_flow_streaming}  flow_steps={args.flow_steps}"
     )
     model, dataset = initiate_model(
         seed=198964,
@@ -213,7 +234,16 @@ def main():
     sampling_params = prepared["sampling_params"]
 
     if not args.no_warmup:
-        warmup(model, mtp, input_ids, sampling_params, eos_id, synth_state)
+        warmup(
+            model,
+            mtp,
+            input_ids,
+            sampling_params,
+            eos_id,
+            synth_state,
+            flow_streaming=not args.no_flow_streaming,
+            flow_steps=args.flow_steps,
+        )
 
     streamer = SpeechTokenStreamer(eos_token_id=eos_id)
     mtp_stream = torch.cuda.Stream()
@@ -240,7 +270,12 @@ def main():
         t_flow = time.perf_counter()
         with torch.cuda.stream(flow_stream):
             wav_full = synthesize_chunk(
-                model, synth_state, accumulated_speech_tokens, finalize=False
+                model,
+                synth_state,
+                accumulated_speech_tokens,
+                finalize=False,
+                streaming=not args.no_flow_streaming,
+                flow_steps=args.flow_steps,
             )
         new_audio = wav_full[:, prev_audio_len:].detach().cpu()
         flow_chunk_times.append(time.perf_counter() - t_flow)
@@ -262,7 +297,12 @@ def main():
     t_flow = time.perf_counter()
     with torch.cuda.stream(flow_stream):
         wav_full = synthesize_chunk(
-            model, synth_state, accumulated_speech_tokens, finalize=True
+            model,
+            synth_state,
+            accumulated_speech_tokens,
+            finalize=True,
+            streaming=not args.no_flow_streaming,
+            flow_steps=args.flow_steps,
         )
     final_audio = wav_full[:, prev_audio_len:].detach().cpu()
     flow_chunk_times.append(time.perf_counter() - t_flow)

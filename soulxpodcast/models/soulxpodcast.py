@@ -193,6 +193,8 @@ class SoulXPodcast(torch.nn.Module):
         dialect_prefix: list[list[int]] = None,
         chunk_size: int = 50,
         first_chunk_size: int | None = None,
+        flow_streaming: bool = True,
+        flow_steps: int = 15,
         **kwargs,
     ):
         """Generator yielding audio chunks across turns.
@@ -310,6 +312,8 @@ class SoulXPodcast(torch.nn.Module):
                         spk_prompt_speech_tokens, accumulated_speech_tokens,
                         spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
                         finalize=False,
+                        streaming=flow_streaming,
+                        flow_steps=flow_steps,
                     )
                 # `.detach().cpu()` syncs flow_stream — gives us the wav.
                 new_audio = audio[:, prev_audio_len:].detach().cpu()
@@ -330,6 +334,8 @@ class SoulXPodcast(torch.nn.Module):
                     spk_prompt_speech_tokens, accumulated_speech_tokens,
                     spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
                     finalize=True,
+                    streaming=flow_streaming,
+                    flow_steps=flow_steps,
                 )
             final_audio = audio[:, prev_audio_len:].detach().cpu()
             yield {
@@ -352,7 +358,8 @@ class SoulXPodcast(torch.nn.Module):
             history_inputs.append(text_tokens_for_llm[turn_i][:-1])
 
     def _stream_synth_chunk(self, prompt_speech_tokens, generated_speech_tokens,
-                             prompt_mel, prompt_mel_len_t, spk_emb, finalize: bool):
+                             prompt_mel, prompt_mel_len_t, spk_emb, finalize: bool,
+                             streaming: bool, flow_steps: int):
         """Run flow+HiFT on (prompt_speech_tokens + generated_speech_tokens).
         Returns the full waveform; caller slices off already-emitted portion."""
         device = prompt_mel.device
@@ -364,9 +371,10 @@ class SoulXPodcast(torch.nn.Module):
         with torch.amp.autocast("cuda",
                 dtype=torch.float16 if self.config.hf_config.fp16_flow else torch.float32):
             mels, mels_lens = self.flow(
-                flow_input.cuda(), flow_input_len.cuda(),
+                flow_input, flow_input_len,
                 prompt_mel, prompt_mel_len_t, spk_emb,
-                streaming=False, finalize=finalize,
+                streaming=streaming, finalize=finalize,
+                n_timesteps=flow_steps,
             )
         mel = mels[:, :, prompt_mel_len_t[0].item(): mels_lens[0].item()]
         wav, _ = self.hift(speech_feat=mel)

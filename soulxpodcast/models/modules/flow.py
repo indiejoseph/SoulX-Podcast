@@ -161,7 +161,11 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                 prompt_feat_len,
                 embedding,
                 streaming,
-                finalize):
+                finalize,
+                n_timesteps: int = 15):
+        if n_timesteps <= 0:
+            raise ValueError(f"n_timesteps must be positive, got {n_timesteps}")
+
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
@@ -191,7 +195,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=15,
+            n_timesteps=n_timesteps,
             streaming=streaming
         )  # [B, num_mels, T]
         return feat.float(), h_lengths
