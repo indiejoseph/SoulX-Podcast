@@ -17,42 +17,44 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="pretrained_models/SoulX-Podcast-1.7B",
+        default=os.getenv("MODEL_PATH", "pretrained_models/SoulX-Podcast-1.7B"),
         help="模型路径（默认: pretrained_models/SoulX-Podcast-1.7B）"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
+        default=int(os.getenv("API_PORT", "8000")),
         help="API端口（默认: 8000）"
     )
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
+        default=os.getenv("API_HOST", "0.0.0.0"),
         help="API主机地址（默认: 0.0.0.0）"
     )
     parser.add_argument(
         "--engine",
         type=str,
         choices=["hf", "vllm"],
-        default="hf",
+        default=os.getenv("LLM_ENGINE", "hf"),
         help="LLM引擎（默认: hf）"
     )
     parser.add_argument(
         "--fp16-flow",
         action="store_true",
+        default=os.getenv("FP16_FLOW", "false").lower() == "true",
         help="使用FP16精度的Flow模型（更快但略降质量）"
     )
     parser.add_argument(
         "--max-tasks",
         type=int,
-        default=2,
+        default=int(os.getenv("MAX_CONCURRENT_TASKS", "2")),
         help="最大并发任务数（默认: 2）"
     )
     parser.add_argument(
         "--reload",
         action="store_true",
+        default=os.getenv("API_RELOAD", "false").lower() == "true",
         help="启用热重载（开发模式）"
     )
 

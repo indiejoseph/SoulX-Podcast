@@ -20,6 +20,11 @@ class APIConfig:
 
     def validate_llm_engine(self):
         """验证LLM引擎配置"""
+        if self.enable_mtp and self.mtp_checkpoint and self.llm_engine != "hf":
+            import logging
+            logging.warning("MTP serving requires direct HF trunk access; forcing LLM_ENGINE=hf")
+            self.llm_engine = "hf"
+
         if self.llm_engine not in ["hf", "vllm"]:
             raise ValueError(f"Invalid llm_engine: {self.llm_engine}. Must be 'hf' or 'vllm'")
 
@@ -32,6 +37,33 @@ class APIConfig:
                 logging.warning("vLLM not installed, falling back to HuggingFace engine")
                 self.llm_engine = "hf"
     fp16_flow: bool = os.getenv("FP16_FLOW", "false").lower() == "true"
+
+    # OpenAI-compatible speech endpoint
+    api_key: str = os.getenv("SOULX_API_KEY", "")
+    require_api_key: bool = os.getenv(
+        "REQUIRE_API_KEY",
+        "true" if os.getenv("SOULX_API_KEY") else "false",
+    ).lower() == "true"
+    voice_registry_path: Optional[str] = os.getenv("VOICE_REGISTRY_PATH")
+    default_voice_id: str = os.getenv("DEFAULT_VOICE_ID", "female_mandarin")
+    default_voice_prompt_audio: str = os.getenv(
+        "DEFAULT_VOICE_PROMPT_AUDIO",
+        "example/audios/female_mandarin.wav",
+    )
+    default_voice_prompt_text: str = os.getenv(
+        "DEFAULT_VOICE_PROMPT_TEXT",
+        "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。",
+    )
+    mtp_checkpoint: str = os.getenv("MTP_CHECKPOINT", "")
+    enable_mtp: bool = os.getenv("ENABLE_MTP", "true").lower() == "true"
+    stream_chunk_size: int = int(os.getenv("STREAM_CHUNK_SIZE", "100"))
+    stream_first_chunk_size: int = int(os.getenv("STREAM_FIRST_CHUNK_SIZE", "4"))
+    flow_streaming: bool = os.getenv("FLOW_STREAMING", "true").lower() == "true"
+    flow_steps: int = int(os.getenv("FLOW_STEPS", "8"))
+    trt_estimator: bool = os.getenv("TRT_ESTIMATOR", "false").lower() == "true"
+    trt_onnx: str = os.getenv("TRT_ONNX", "")
+    trt_plan: str = os.getenv("TRT_PLAN", "")
+    trt_opt_mel_len: int = int(os.getenv("TRT_OPT_MEL_LEN", "256"))
 
     # 服务配置
     host: str = os.getenv("API_HOST", "0.0.0.0")

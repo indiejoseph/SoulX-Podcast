@@ -1,0 +1,53 @@
+FROM vllm/vllm-openai:v0.10.1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+ARG INSTALL_TRT=true
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# SoulX-Podcast uses patched vLLM sampling for RAS compatibility. The MTP
+# serving path still uses the HF trunk directly, but this keeps the image
+# compatible with the repo's vLLM baseline and fallback modes.
+RUN git clone https://github.com/Soul-AILab/vllm.git /tmp/soulx-vllm && \
+    cd /tmp/soulx-vllm && \
+    git checkout v0.10.1.1-soulxpodcast && \
+    VLLM_PATH=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") && \
+    cp /tmp/soulx-vllm/vllm/model_executor/layers/sampler.py "${VLLM_PATH}/model_executor/layers/sampler.py" && \
+    cp /tmp/soulx-vllm/vllm/model_executor/layers/utils.py "${VLLM_PATH}/model_executor/layers/utils.py" && \
+    cp /tmp/soulx-vllm/vllm/model_executor/sampling_metadata.py "${VLLM_PATH}/model_executor/sampling_metadata.py" && \
+    cp /tmp/soulx-vllm/vllm/sampling_params.py "${VLLM_PATH}/sampling_params.py" && \
+    rm -rf /tmp/soulx-vllm
+
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+COPY api/requirements.txt /tmp/api-requirements.txt
+
+RUN pip3 install -r /tmp/requirements.txt -r /tmp/api-requirements.txt && \
+    if [ "${INSTALL_TRT}" = "true" ]; then \
+        pip3 install --extra-index-url https://pypi.nvidia.com tensorrt; \
+    fi
+
+COPY . /app
+
+ENV MODEL_PATH=/app/runs/merged \
+    LLM_ENGINE=hf \
+    FP16_FLOW=true \
+    ENABLE_MTP=true \
+    FLOW_STREAMING=true \
+    FLOW_STEPS=8 \
+    STREAM_CHUNK_SIZE=100 \
+    STREAM_FIRST_CHUNK_SIZE=4 \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000
+
+EXPOSE 8000
+
+CMD ["python", "run_api.py"]

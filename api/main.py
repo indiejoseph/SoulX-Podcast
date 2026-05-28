@@ -8,8 +8,8 @@ from typing import List
 import json
 import threading
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends, Header
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import scipy.io.wavfile as wavfile
@@ -21,6 +21,7 @@ from api.models import (
     HealthResponse,
     ErrorResponse,
     TaskStatus,
+    SpeechRequest,
 )
 from api.service import get_service
 from api.tasks import get_task_manager
@@ -111,6 +112,17 @@ app.add_middleware(
 )
 
 
+def require_api_key(authorization: str | None = Header(default=None)) -> None:
+    """Optional local bearer-token guard for OpenAI-compatible clients."""
+    if not config.require_api_key:
+        return
+    if not config.api_key:
+        raise HTTPException(status_code=500, detail="SOULX_API_KEY is required but not configured")
+    expected = f"Bearer {config.api_key}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 @app.get("/", tags=["Health"])
 async def root():
     """根路径"""
@@ -136,6 +148,42 @@ async def health_check():
         active_tasks=task_manager.get_active_task_count(),
         version="1.0.0"
     )
+
+
+@app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
+async def openai_audio_speech(
+    request: SpeechRequest,
+    _: None = Depends(require_api_key),
+):
+    """OpenAI-compatible TTS endpoint.
+
+    Request shape follows the `/v1/audio/speech` convention: JSON in, audio
+    bytes out. `stream=true` returns chunked transfer from the MTP bi-stream
+    path when `MTP_CHECKPOINT` is configured.
+    """
+    try:
+        service = get_service()
+        media_type = "audio/wav" if request.output_format == "wav" else "audio/pcm"
+        headers = {
+            "Content-Disposition": f'attachment; filename="speech.{request.output_format}"',
+            "X-SoulX-Model": request.model,
+        }
+        if request.stream:
+            return StreamingResponse(
+                service.stream_speech_bytes(request),
+                media_type=media_type,
+                headers=headers,
+            )
+        return Response(
+            content=service.generate_speech_bytes(request),
+            media_type=media_type,
+            headers=headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("OpenAI-compatible speech request failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/generate", tags=["Generation"])

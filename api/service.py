@@ -1,10 +1,15 @@
 """
 SoulXPodcast Model Service Layer
 """
+import base64
+import binascii
+import json
 import re
 import logging
+import uuid
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Any, Dict, Iterator, List, Tuple, Optional
+from urllib.parse import unquote, urlparse
 import torch
 import numpy as np
 import random
@@ -14,11 +19,42 @@ import threading
 from soulxpodcast.models.soulxpodcast import SoulXPodcast
 from soulxpodcast.config import Config, SoulXPodcastLLMConfig, SamplingParams
 from soulxpodcast.utils.dataloader import PodcastInferHandler
+from soulxpodcast.utils.infer_utils import process_single_input
+from soulxpodcast.utils.parser import podcast_format_parser
+from soulxpodcast.utils.streaming import SpeechTokenStreamer
+from soulxpodcast.training.mtp_inference import mtp_speculative_sample_cached
+from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 
+from api.audio import tensor_to_pcm16_bytes, wav_bytes_from_pcm, wav_header
 from api.config import config as api_config
+from api.models import SpeechRequest
 from api.utils import parse_dialogue_text
 
 logger = logging.getLogger(__name__)
+
+
+LANGUAGE_PREFIX = {
+    "yue": "<|Yue|>",
+    "zh-yue": "<|Yue|>",
+    "cantonese": "<|Yue|>",
+    "sichuan": "<|Sichuan|>",
+    "sichuanese": "<|Sichuan|>",
+    "henan": "<|Henan|>",
+    "henanese": "<|Henan|>",
+}
+
+ALLOWED_PROMPT_AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a"}
+PROMPT_AUDIO_MIME_EXTENSIONS = {
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+}
 
 
 class SoulXPodcastService:
@@ -34,6 +70,7 @@ class SoulXPodcastService:
                 cls._instance = super(SoulXPodcastService, cls).__new__(cls)
                 cls._instance._initialized = False  # 实例属性
                 cls._instance._generation_lock = threading.Lock()  # 生成锁
+                cls._instance._speech_lock = threading.Lock()
         return cls._instance
 
     def __init__(self):
@@ -74,12 +111,74 @@ class SoulXPodcastService:
                 model_config
             )
             self.config = model_config
+            self.voice_registry = self._load_voice_registry()
+            self.mtp = self._load_mtp()
+            self.trt_streaming_mode = None
+            if api_config.trt_estimator:
+                self._install_trt_estimator()
 
             logger.info(f"Model loaded successfully with {api_config.llm_engine} engine!")
 
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise RuntimeError(f"模型加载失败: {str(e)}")
+
+    def _load_voice_registry(self) -> Dict[str, Dict[str, str]]:
+        registry = {
+            api_config.default_voice_id: {
+                "prompt_audio": api_config.default_voice_prompt_audio,
+                "prompt_text": api_config.default_voice_prompt_text,
+            }
+        }
+        if api_config.voice_registry_path:
+            path = Path(api_config.voice_registry_path)
+            if not path.exists():
+                raise RuntimeError(f"VOICE_REGISTRY_PATH does not exist: {path}")
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise RuntimeError("VOICE_REGISTRY_PATH must contain an object keyed by voice id")
+            for voice_id, spec in loaded.items():
+                if not isinstance(spec, dict):
+                    raise RuntimeError(f"voice {voice_id!r} must be an object")
+                registry[voice_id] = spec
+        logger.info("Loaded %d voice definitions", len(registry))
+        return registry
+
+    def _load_mtp(self):
+        if not api_config.enable_mtp:
+            logger.info("MTP disabled by ENABLE_MTP=false")
+            return None
+        if not api_config.mtp_checkpoint:
+            logger.warning("MTP_CHECKPOINT not set; /v1/audio/speech will fall back to trunk-only synthesis")
+            return None
+        ckpt_path = Path(api_config.mtp_checkpoint)
+        if not ckpt_path.exists():
+            raise RuntimeError(f"MTP_CHECKPOINT does not exist: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        mtp_config = MtpConfig(**ckpt["mtp_config"])
+        base = self.model.llm.model
+        decoder_layer_cls = base.model.layers[0].__class__
+        mtp = SequentialMTP(mtp_config, decoder_layer_cls, base.config)
+        mtp.load_state_dict(ckpt["mtp_state"])
+        mtp = mtp.to(device="cuda").eval()
+        logger.info("Loaded MTP checkpoint %s with %d layers", ckpt_path, len(mtp.layers))
+        return mtp
+
+    def _install_trt_estimator(self) -> None:
+        from soulxpodcast.models.modules.flow_components.estimator_trt import install_trt_estimator
+
+        mode = "streaming" if api_config.flow_streaming else "full"
+        onnx_path = api_config.trt_onnx or f"exports/flow_runtime/flow.decoder.estimator.fp32.{mode}.onnx"
+        plan_path = api_config.trt_plan or f"exports/flow_runtime/flow.decoder.estimator.fp16.{mode}.plan"
+        install_trt_estimator(
+            self.model,
+            onnx_path=Path(onnx_path),
+            plan_path=Path(plan_path),
+            opt_mel_len=api_config.trt_opt_mel_len,
+        )
+        self.trt_streaming_mode = api_config.flow_streaming
+        logger.info("Installed TRT estimator for flow_streaming=%s", self.trt_streaming_mode)
 
     def is_loaded(self) -> bool:
         """检查模型是否已加载"""
@@ -279,6 +378,363 @@ class SoulXPodcastService:
                 raise RuntimeError(f"语音生成失败: {str(e)}")
             finally:
                 logger.info("Released generation lock")
+
+    # ------------------------------------------------------------------ #
+    # OpenAI-compatible `/v1/audio/speech` path.
+    # ------------------------------------------------------------------ #
+
+    def _validate_prompt_audio_path(self, audio_path: Path, *, label: str) -> Path:
+        if not audio_path.exists():
+            raise ValueError(f"{label} prompt_audio does not exist: {audio_path}")
+        if audio_path.suffix.lower() not in ALLOWED_PROMPT_AUDIO_EXTENSIONS:
+            raise ValueError(
+                f"{label} prompt_audio format is unsupported: {audio_path.suffix}. "
+                f"Supported: {', '.join(sorted(ALLOWED_PROMPT_AUDIO_EXTENSIONS))}"
+            )
+        return audio_path
+
+    def _write_inline_prompt_audio(self, payload: bytes, suffix: str) -> Path:
+        if not payload:
+            raise ValueError("prompt_audio base64 decoded to empty bytes")
+        if len(payload) > api_config.max_upload_size:
+            raise ValueError(
+                f"prompt_audio exceeds max size "
+                f"({api_config.max_upload_size / 1024 / 1024:.0f}MB)"
+            )
+        if suffix.lower() not in ALLOWED_PROMPT_AUDIO_EXTENSIONS:
+            suffix = ".wav"
+        api_config.temp_dir.mkdir(parents=True, exist_ok=True)
+        path = api_config.temp_dir / f"speech_prompt_{uuid.uuid4().hex}{suffix}"
+        path.write_bytes(payload)
+        return path
+
+    def _resolve_prompt_audio(self, prompt_audio: str) -> Path:
+        value = prompt_audio.strip()
+        if not value:
+            raise ValueError("prompt_audio must not be empty")
+
+        if value.startswith("file://"):
+            parsed = urlparse(value)
+            if parsed.netloc not in ("", "localhost"):
+                raise ValueError("prompt_audio file:// URI must reference a local file")
+            path = Path(unquote(parsed.path))
+            return self._validate_prompt_audio_path(path, label="inline")
+
+        if value.startswith("data:"):
+            try:
+                header, encoded = value.split(",", 1)
+            except ValueError as e:
+                raise ValueError("prompt_audio data URI must contain a comma separator") from e
+            if ";base64" not in header.lower():
+                raise ValueError("prompt_audio data URI must be base64 encoded")
+            mime = header[5:].split(";", 1)[0].lower()
+            suffix = PROMPT_AUDIO_MIME_EXTENSIONS.get(mime, ".wav")
+            try:
+                payload = base64.b64decode(encoded, validate=True)
+            except binascii.Error as e:
+                raise ValueError("prompt_audio contains invalid base64 data") from e
+            return self._write_inline_prompt_audio(payload, suffix)
+
+        try:
+            payload = base64.b64decode(value, validate=True)
+        except binascii.Error as e:
+            raise ValueError(
+                "prompt_audio must be a file:// URI, data:audio/*;base64 URI, or raw base64 audio"
+            ) from e
+        return self._write_inline_prompt_audio(payload, ".wav")
+
+    def _resolve_voice(self, voice: Any) -> Dict[str, str]:
+        if isinstance(voice, str):
+            voice_id = voice
+            prompt_audio = None
+            prompt_text = None
+        else:
+            voice_id = voice.id
+            prompt_audio = voice.prompt_audio
+            prompt_text = voice.prompt_text
+
+        spec = dict(self.voice_registry.get(voice_id, {}))
+        if prompt_audio:
+            spec["prompt_audio"] = prompt_audio
+        if prompt_text:
+            spec["prompt_text"] = prompt_text
+        if "prompt_audio" not in spec or "prompt_text" not in spec:
+            raise ValueError(f"Unknown voice id {voice_id!r}; provide a registered voice or prompt override")
+
+        audio_path = Path(spec["prompt_audio"])
+        self._validate_prompt_audio_path(audio_path, label=f"Voice {voice_id!r}")
+        spec["id"] = voice_id
+        spec["prompt_audio"] = str(audio_path)
+        spec["prompt_text"] = str(spec["prompt_text"])
+        return spec
+
+    def _resolve_speech_prompt(self, request: SpeechRequest) -> Dict[str, str]:
+        if request.prompt_audio:
+            if not request.prompt_text or not request.prompt_text.strip():
+                raise ValueError("prompt_text is required when prompt_audio is provided")
+            audio_path = self._resolve_prompt_audio(request.prompt_audio)
+            return {
+                "id": "inline_prompt",
+                "prompt_audio": str(audio_path),
+                "prompt_text": request.prompt_text.strip(),
+            }
+        if request.prompt_text:
+            raise ValueError("prompt_audio is required when prompt_text is provided")
+        if request.voice is not None:
+            return self._resolve_voice(request.voice)
+        return self._resolve_voice(api_config.default_voice_id)
+
+    def _apply_language_prefix(self, text: str, language: Optional[str]) -> str:
+        if not language:
+            return text
+        prefix = LANGUAGE_PREFIX.get(language.lower())
+        if prefix and not text.lstrip().startswith(prefix):
+            return f"{prefix}{text}"
+        return text
+
+    def _build_speech_prepared(self, request: SpeechRequest):
+        voice = self._resolve_speech_prompt(request)
+        text = self._apply_language_prefix(request.input.strip(), request.language)
+        data = {
+            "speakers": {
+                "S1": {
+                    "prompt_audio": Path(voice["prompt_audio"]),
+                    "prompt_text": voice["prompt_text"],
+                }
+            },
+            "text": [["S1", text]],
+        }
+        inputs = podcast_format_parser(data)
+        prepared = process_single_input(
+            self.dataset,
+            inputs["text"],
+            inputs["prompt_wav"],
+            inputs["prompt_text"],
+            inputs["use_dialect_prompt"],
+            inputs["dialect_prompt_text"],
+        )
+        prepared["sampling_params"] = SamplingParams(
+            temperature=request.temperature if request.temperature is not None else api_config.default_temperature,
+            repetition_penalty=request.repetition_penalty if request.repetition_penalty is not None else 1.25,
+            top_k=request.top_k if request.top_k is not None else api_config.default_top_k,
+            top_p=request.top_p if request.top_p is not None else api_config.default_top_p,
+            use_ras=True,
+            win_size=25,
+            tau_r=0.2,
+        )
+        return prepared
+
+    @torch.inference_mode()
+    def _build_first_turn_prompt(self, prepared):
+        prompt_mels = prepared["prompt_mels_for_llm"]
+        prompt_mels_lens = prepared["prompt_mels_lens_for_llm"]
+        prompt_text_tokens = prepared["prompt_text_tokens_for_llm"]
+        text_tokens = prepared["text_tokens_for_llm"]
+
+        speech_token_offset = self.model.config.hf_config.speech_token_offset
+        eos_id = self.model.config.hf_config.eos_token_id
+        prompt_speech_tokens, prompt_lens = self.model.audio_tokenizer.quantize(
+            prompt_mels.cuda(), prompt_mels_lens.cuda()
+        )
+        spk_tokens = prompt_speech_tokens[0, : prompt_lens[0].item()].tolist()
+        spk_tokens = [t + speech_token_offset for t in spk_tokens] + [eos_id]
+        return prompt_text_tokens[0] + spk_tokens + text_tokens[0], eos_id, speech_token_offset
+
+    @torch.inference_mode()
+    def _prepare_synth_state(self, prepared):
+        prompt_mels = prepared["prompt_mels_for_llm"]
+        prompt_mels_lens = prepared["prompt_mels_lens_for_llm"]
+        prompt_spk_tokens, prompt_lens = self.model.audio_tokenizer.quantize(
+            prompt_mels.cuda(), prompt_mels_lens.cuda()
+        )
+        prompt_len = prompt_lens[0].item()
+        prompt_mel = prepared["prompt_mels_for_flow_ori"][0]
+        prompt_mel = prompt_mel[: prompt_len * 2].cuda()
+        return {
+            "prompt_tokens": prompt_spk_tokens[0, :prompt_len].tolist(),
+            "prompt_mel": prompt_mel[None],
+            "prompt_mel_len": torch.tensor([prompt_mel.shape[0]], device="cuda"),
+            "spk_emb": prepared["spk_emb_for_flow"][0:1].cuda(),
+        }
+
+    @torch.inference_mode()
+    def _synthesize_chunk(
+        self,
+        synth_state: Dict[str, Any],
+        all_speech_tokens: List[int],
+        *,
+        finalize: bool,
+        streaming: bool,
+        flow_steps: int,
+    ) -> torch.Tensor:
+        flow_input = torch.tensor(
+            [synth_state["prompt_tokens"] + all_speech_tokens],
+            device="cuda",
+        )
+        flow_input_len = torch.tensor([flow_input.shape[1]], device="cuda")
+        with torch.amp.autocast(
+            "cuda",
+            dtype=torch.float16 if self.model.config.hf_config.fp16_flow else torch.float32,
+        ):
+            mels, mels_lens = self.model.flow(
+                flow_input,
+                flow_input_len,
+                synth_state["prompt_mel"],
+                synth_state["prompt_mel_len"],
+                synth_state["spk_emb"],
+                streaming=streaming,
+                finalize=finalize,
+                n_timesteps=flow_steps,
+            )
+        mel = mels[:, :, synth_state["prompt_mel_len"][0].item(): mels_lens[0].item()]
+        wav, _ = self.model.hift(speech_feat=mel)
+        return wav
+
+    def _run_mtp_in_thread(self, input_ids, sampling_params, eos_id, streamer, cuda_stream, seed: int):
+        class _MTPThread(threading.Thread):
+            def __init__(inner_self):
+                super().__init__(daemon=True)
+                inner_self.result = None
+                inner_self.exc = None
+
+            def run(inner_self):
+                try:
+                    with torch.cuda.stream(cuda_stream), torch.autocast("cuda", dtype=torch.bfloat16):
+                        inner_self.result = mtp_speculative_sample_cached(
+                            self.model.llm.model,
+                            self.mtp,
+                            input_ids,
+                            max_new_tokens=sampling_params.max_tokens,
+                            min_new_tokens=sampling_params.min_tokens,
+                            eos_token_id=eos_id,
+                            temperature=sampling_params.temperature,
+                            top_k=sampling_params.top_k,
+                            top_p=sampling_params.top_p,
+                            repetition_penalty=sampling_params.repetition_penalty,
+                            use_ras=sampling_params.use_ras,
+                            ras_win_size=sampling_params.win_size,
+                            ras_tau_r=sampling_params.tau_r,
+                            allow_eos_from_drafts=False,
+                            seed=seed,
+                            streamer=streamer,
+                        )
+                except BaseException as e:
+                    inner_self.exc = e
+                    streamer.end()
+                    raise
+
+        thread = _MTPThread()
+        thread.start()
+        return thread
+
+    def _stream_speech_pcm_mtp(self, request: SpeechRequest) -> Iterator[bytes]:
+        flow_streaming = request.flow_streaming if request.flow_streaming is not None else api_config.flow_streaming
+        flow_steps = request.flow_steps if request.flow_steps is not None else api_config.flow_steps
+        chunk_size = request.chunk_size or api_config.stream_chunk_size
+        first_chunk_size = request.first_chunk_size or api_config.stream_first_chunk_size
+        seed = request.seed if request.seed is not None else api_config.default_seed
+
+        if self.trt_streaming_mode is not None and flow_streaming != self.trt_streaming_mode:
+            raise ValueError(
+                "TRT estimator was built for flow_streaming="
+                f"{self.trt_streaming_mode}; request used {flow_streaming}"
+            )
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        prepared = self._build_speech_prepared(request)
+        prompt_ids, eos_id, offset = self._build_first_turn_prompt(prepared)
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device="cuda")
+        synth_state = self._prepare_synth_state(prepared)
+        sampling_params = prepared["sampling_params"]
+
+        streamer = SpeechTokenStreamer(eos_token_id=eos_id)
+        mtp_stream = torch.cuda.Stream()
+        flow_stream = torch.cuda.Stream()
+        mtp_thread = self._run_mtp_in_thread(
+            input_ids, sampling_params, eos_id, streamer, mtp_stream, seed
+        )
+
+        accumulated_speech_tokens: List[int] = []
+        prev_audio_len = 0
+        try:
+            for cur_chunk in streamer.iter_chunks(
+                chunk_size=chunk_size,
+                first_chunk_size=first_chunk_size,
+            ):
+                accumulated_speech_tokens.extend([t - offset for t in cur_chunk])
+                with torch.cuda.stream(flow_stream):
+                    wav_full = self._synthesize_chunk(
+                        synth_state,
+                        accumulated_speech_tokens,
+                        finalize=False,
+                        streaming=flow_streaming,
+                        flow_steps=flow_steps,
+                    )
+                new_audio = wav_full[:, prev_audio_len:].detach().cpu()
+                prev_audio_len = wav_full.shape[-1]
+                chunk_bytes = tensor_to_pcm16_bytes(new_audio)
+                if chunk_bytes:
+                    yield chunk_bytes
+
+            with torch.cuda.stream(flow_stream):
+                wav_full = self._synthesize_chunk(
+                    synth_state,
+                    accumulated_speech_tokens,
+                    finalize=True,
+                    streaming=flow_streaming,
+                    flow_steps=flow_steps,
+                )
+            final_audio = wav_full[:, prev_audio_len:].detach().cpu()
+            final_bytes = tensor_to_pcm16_bytes(final_audio)
+            if final_bytes:
+                yield final_bytes
+
+            mtp_thread.join()
+            if mtp_thread.exc:
+                raise mtp_thread.exc
+        finally:
+            if mtp_thread.is_alive():
+                streamer.end()
+                mtp_thread.join(timeout=1.0)
+
+    def _generate_speech_pcm_trunk(self, request: SpeechRequest) -> Iterator[bytes]:
+        prepared = self._build_speech_prepared(request)
+        with torch.no_grad():
+            results_dict = self.model.forward_longform(**prepared)
+        target_audio = None
+        for wav in results_dict["generated_wavs"]:
+            target_audio = wav if target_audio is None else torch.concat([target_audio, wav], axis=1)
+        if target_audio is not None:
+            yield tensor_to_pcm16_bytes(target_audio)
+
+    def stream_speech_pcm(self, request: SpeechRequest) -> Iterator[bytes]:
+        if not self.is_loaded():
+            raise RuntimeError("模型未加载")
+        with self._speech_lock:
+            if self.mtp is not None:
+                yield from self._stream_speech_pcm_mtp(request)
+            else:
+                yield from self._generate_speech_pcm_trunk(request)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    def stream_speech_bytes(self, request: SpeechRequest) -> Iterator[bytes]:
+        if request.output_format == "wav":
+            yield wav_header(None)
+        elif request.output_format != "pcm":
+            raise ValueError(f"Unsupported format: {request.output_format}")
+        for pcm in self.stream_speech_pcm(request):
+            yield pcm
+
+    def generate_speech_bytes(self, request: SpeechRequest) -> bytes:
+        pcm = b"".join(self.stream_speech_pcm(request))
+        if request.output_format == "pcm":
+            return pcm
+        return wav_bytes_from_pcm(pcm)
 
 
 # 全局服务实例

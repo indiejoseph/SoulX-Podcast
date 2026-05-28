@@ -2,7 +2,7 @@
 Pydantic Data Models for API
 """
 from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Union
 from datetime import datetime
 from enum import Enum
 
@@ -63,6 +63,68 @@ class GenerateRequest(BaseModel):
         if not v.strip():
             raise ValueError("dialogue_text不能为空")
         return v.strip()
+
+
+class SpeechVoice(BaseModel):
+    """OpenAI-style voice selector.
+
+    `id` resolves through the local voice registry. `prompt_audio` and
+    `prompt_text` can override the registry for trusted internal deployments
+    where request bodies may reference files mounted in the container.
+    """
+    id: str = Field(..., description="Voice id from the local registry")
+    prompt_audio: Optional[str] = Field(
+        default=None,
+        description="Optional server-local prompt audio path override",
+    )
+    prompt_text: Optional[str] = Field(
+        default=None,
+        description="Optional prompt transcript override",
+    )
+
+
+class SpeechRequest(BaseModel):
+    """OpenAI-compatible `/v1/audio/speech` request body."""
+    model: str = Field(..., description="Model name. Accepted for API compatibility.")
+    voice: Optional[Union[str, SpeechVoice]] = Field(
+        default=None,
+        description="Optional voice id or voice object from the local registry",
+    )
+    prompt_audio: Optional[str] = Field(
+        default=None,
+        description=(
+            "Inline voice prompt audio as file:// URI, data:audio/*;base64 URI, "
+            "or raw base64 audio bytes. Requires prompt_text."
+        ),
+    )
+    prompt_text: Optional[str] = Field(
+        default=None,
+        description="Transcript for prompt_audio. Required when prompt_audio is set.",
+    )
+    input: str = Field(..., min_length=1, description="Text to synthesize")
+    language: Optional[str] = Field(default=None, description="Optional BCP-47 language code")
+    format: Literal["wav", "pcm"] = Field(default="wav", description="Output audio format")
+    response_format: Optional[Literal["wav", "pcm"]] = Field(
+        default=None,
+        description="OpenAI-compatible alias. Overrides `format` when set.",
+    )
+    stream: bool = Field(
+        default=True,
+        description="Stream audio chunks as they are synthesized. WAV streaming uses a placeholder-length header.",
+    )
+    seed: Optional[int] = Field(default=198964, description="Sampling seed")
+    temperature: Optional[float] = Field(default=0.6, ge=0.1, le=2.0)
+    top_k: Optional[int] = Field(default=100, ge=1, le=500)
+    top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0)
+    repetition_penalty: Optional[float] = Field(default=1.25, ge=1.0, le=2.0)
+    chunk_size: Optional[int] = Field(default=None, ge=1)
+    first_chunk_size: Optional[int] = Field(default=None, ge=1)
+    flow_streaming: Optional[bool] = Field(default=None)
+    flow_steps: Optional[int] = Field(default=None, ge=1)
+
+    @property
+    def output_format(self) -> str:
+        return self.response_format or self.format
 
 
 class TaskCreateResponse(BaseModel):

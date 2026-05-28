@@ -1,0 +1,45 @@
+services:
+  soulx-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile.serve
+      args:
+        INSTALL_TRT: "${INSTALL_TRT:-true}"
+    image: soulxpodcast-tts:latest
+    gpus: all
+    shm_size: "16gb"
+    ipc: host
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      MODEL_PATH: "${MODEL_PATH:-/app/runs/merged}"
+      LLM_ENGINE: "${LLM_ENGINE:-hf}"
+      FP16_FLOW: "${FP16_FLOW:-true}"
+      ENABLE_MTP: "${ENABLE_MTP:-true}"
+      MTP_CHECKPOINT: "${MTP_CHECKPOINT:-/app/runs/mtp_h100_v3_kl_refresh_from22000/mtp_step2000.pt}"
+      FLOW_STREAMING: "${FLOW_STREAMING:-true}"
+      FLOW_STEPS: "${FLOW_STEPS:-8}"
+      STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-100}"
+      STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"
+      TRT_ESTIMATOR: "${TRT_ESTIMATOR:-true}"
+      TRT_ONNX: "${TRT_ONNX:-/app/exports/flow_runtime/flow.decoder.estimator.fp32.streaming.onnx}"
+      TRT_PLAN: "${TRT_PLAN:-/app/exports/flow_runtime/flow.decoder.estimator.fp16.streaming.plan}"
+      TRT_OPT_MEL_LEN: "${TRT_OPT_MEL_LEN:-256}"
+      VOICE_REGISTRY_PATH: "/app/config/voices.example.json"
+      DEFAULT_VOICE_ID: "female_mandarin"
+      SOULX_API_KEY: "${SOULX_API_KEY:-local-dev-key}"
+      REQUIRE_API_KEY: "${REQUIRE_API_KEY:-true}"
+    volumes:
+      - ./pretrained_models:/app/pretrained_models:ro
+      - ./runs:/app/runs:ro
+      - ./exports:/app/exports
+      - ./example:/app/example:ro
+      - ./config:/app/config:ro
+      - ./api/outputs:/app/api/outputs
+      - ./api/temp:/app/api/temp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
