@@ -430,14 +430,21 @@ class SoulXPodcastService:
         if suffix.lower() not in ALLOWED_PROMPT_AUDIO_EXTENSIONS:
             suffix = ".wav"
         api_config.temp_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            prefix="speech_prompt_",
-            suffix=suffix,
-            dir=api_config.temp_dir,
-            delete=False,
-        ) as f:
-            f.write(payload)
-            return Path(f.name)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="speech_prompt_",
+                suffix=suffix,
+                dir=api_config.temp_dir,
+                delete=False,
+            ) as f:
+                temp_path = Path(f.name)
+                f.write(payload)
+                return temp_path
+        except Exception:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise
 
     def _resolve_prompt_audio(self, prompt_audio: str, prompt_text: str) -> Dict[str, Any]:
         value = prompt_audio.strip()
