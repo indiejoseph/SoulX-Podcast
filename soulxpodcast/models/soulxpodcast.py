@@ -199,6 +199,10 @@ class SoulXPodcast(torch.nn.Module):
     ):
         """Generator yielding audio chunks across turns.
 
+        Defaults keep full-context flow attention and 15 CFM steps, matching
+        historical bi-stream behavior. For low-TTFA sweeps, opt into
+        flow_streaming=True and lower flow_steps only after audio A/B checks.
+
         Yields dicts:
             {"turn": int, "speaker": int, "chunk": int, "audio": Tensor[1, T],
              "is_first_in_turn": bool, "is_last_in_turn": bool}

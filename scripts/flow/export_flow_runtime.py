@@ -13,7 +13,7 @@ Example:
     python scripts/flow/export_flow_runtime.py \
         --model_path runs/merged \
         --output_dir exports/flow_runtime \
-        --fp16
+        --encoder_fp16
 """
 
 from __future__ import annotations
@@ -118,17 +118,26 @@ def export_encoder(
     token = torch.randn(1, token_len, flow.input_size, device=device, dtype=dtype)
     token_lens = torch.tensor([token_len], device=device, dtype=torch.long)
     context = torch.randn(1, context_len, flow.input_size, device=device, dtype=dtype)
-    check_len = max(token_len + 17, 8)
-    check_context_len = max(context_len, 1)
-    check_token = torch.randn(1, check_len, flow.input_size, device=device, dtype=dtype)
-    check_lens = torch.tensor([check_len], device=device, dtype=torch.long)
-    check_context = torch.randn(
-        1,
-        check_context_len,
-        flow.input_size,
-        device=device,
-        dtype=dtype,
-    )
+    check_lengths = sorted({
+        max(token_len // 2 + 5, 8),
+        max(token_len + 17, 8),
+        max(((token_len + 32) // 32) * 32, 8),
+    })
+    final_check_inputs = []
+    chunk_check_inputs = []
+    for idx, check_len in enumerate(check_lengths):
+        check_context_len = max(context_len + idx, 1)
+        check_token = torch.randn(1, check_len, flow.input_size, device=device, dtype=dtype)
+        check_lens = torch.tensor([check_len], device=device, dtype=torch.long)
+        check_context = torch.randn(
+            1,
+            check_context_len,
+            flow.input_size,
+            device=device,
+            dtype=dtype,
+        )
+        final_check_inputs.append((check_token, check_lens))
+        chunk_check_inputs.append((check_token, check_lens, check_context))
     check_tolerance = 1e-2 if fp16 else 1e-5
 
     encoder = copy.deepcopy(flow.encoder).to(device=device, dtype=dtype)
@@ -140,7 +149,7 @@ def export_encoder(
         (token, token_lens),
         strict=True,
         check_trace=not skip_trace_check,
-        check_inputs=[] if skip_trace_check else [(check_token, check_lens)],
+        check_inputs=[] if skip_trace_check else final_check_inputs,
         check_tolerance=check_tolerance,
     )
     chunk_ts = torch.jit.trace(
@@ -148,7 +157,7 @@ def export_encoder(
         (token, token_lens, context),
         strict=True,
         check_trace=not skip_trace_check,
-        check_inputs=[] if skip_trace_check else [(check_token, check_lens, check_context)],
+        check_inputs=[] if skip_trace_check else chunk_check_inputs,
         check_tolerance=check_tolerance,
     )
 
@@ -161,7 +170,10 @@ def export_encoder(
     if skip_trace_check:
         print("[warn] skipped JIT trace validation")
     else:
-        print(f"[check] encoder trace matched eager on alternate shape, tol={check_tolerance:g}")
+        print(
+            f"[check] encoder trace matched eager on alternate lengths "
+            f"{check_lengths}, tol={check_tolerance:g}"
+        )
 
 
 def export_estimator(
@@ -235,7 +247,8 @@ def main() -> None:
     parser.add_argument("--model_path", default="runs/merged")
     parser.add_argument("--output_dir", default="exports/flow_runtime")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--fp16", action="store_true",
+    parser.add_argument("--encoder_fp16", "--fp16", dest="encoder_fp16",
+                        action="store_true",
                         help="Export encoder JIT in fp16 and print a TensorRT fp16 build command.")
     parser.add_argument("--onnx_fp16", action="store_true",
                         help="Export estimator ONNX in fp16. Default is fp32; use TRT --fp16 for runtime precision.")
@@ -250,7 +263,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    encoder_dtype = torch.float16 if args.fp16 else torch.float32
+    encoder_dtype = torch.float16 if args.encoder_fp16 else torch.float32
     estimator_dtype = torch.float16 if args.onnx_fp16 else torch.float32
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -263,7 +276,7 @@ def main() -> None:
         device=device,
         token_len=args.token_len,
         context_len=args.context_len,
-        fp16=args.fp16,
+        fp16=args.encoder_fp16,
         streaming=args.streaming,
         skip_trace_check=args.skip_trace_check,
     )
@@ -280,7 +293,7 @@ def main() -> None:
     print_trtexec_hint(
         output_dir,
         onnx_fp16=args.onnx_fp16,
-        trt_fp16=args.fp16,
+        trt_fp16=args.encoder_fp16,
         streaming=args.streaming,
         mel_len=args.mel_len,
     )
