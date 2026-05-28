@@ -387,8 +387,13 @@ def build_model_and_mtp(cfg: TrainConfig, dtype: torch.dtype):
     mtp.init_from_trunk(base.model.layers[-1], base.model.norm)
     log.info("warm-started MTP layers from base.model.layers[-1] + base.model.norm")
 
-    # Move to GPU + dtype. Trainable params stay fp32 for the optimizer master copy.
-    mtp = mtp.to(device="cuda", dtype=dtype)
+    # Keep MTP params in fp32 (optimizer master copy). Compute runs in `dtype`
+    # via `torch.autocast` in the train loop. Storing params directly in bf16
+    # made small AdamW updates (~1e-5) round to zero, leaving norm weights
+    # (norm_h, norm_e, q_norm, k_norm, layernorms, final_norm) stuck at init —
+    # confirmed by inspecting runs/mtp_h100_v5_trunkargmax/mtp_step8000.pt where
+    # all norm params were bit-identical across the 3 MTP layers.
+    mtp = mtp.to(device="cuda")
 
     # Sanity log on param counts.
     trainable = sum(p.numel() for p in mtp.parameters() if p.requires_grad)
@@ -528,38 +533,42 @@ def train(cfg: TrainConfig):
             attention_mask = batch["attention_mask"].cuda(non_blocking=True)
             speech_mask = batch["speech_mask"].cuda(non_blocking=True)
 
-            # 1) Trunk forward (frozen). Don't materialize trunk_logits here —
-            # the chunked loss applies lm_head() on the fly per chunk to avoid
-            # the [B, T, 159K] tensor that would OOM at production batch sizes.
-            with torch.no_grad():
-                out = base.model(
-                    input_ids=input_ids, attention_mask=attention_mask,
-                    use_cache=False, return_dict=True,
+            # Forward in autocast(bf16): fp32 master params (mtp + accumulators)
+            # with bf16 compute. lm_head is called inside mtp_loss so it must
+            # also be under autocast — keep the whole forward block inside.
+            with torch.autocast("cuda", dtype=dtype):
+                # 1) Trunk forward (frozen). Don't materialize trunk_logits here —
+                # the chunked loss applies lm_head() on the fly per chunk to avoid
+                # the [B, T, 159K] tensor that would OOM at production batch sizes.
+                with torch.no_grad():
+                    out = base.model(
+                        input_ids=input_ids, attention_mask=attention_mask,
+                        use_cache=False, return_dict=True,
+                    )
+                    trunk_hidden = out.last_hidden_state
+
+                # 2) MTP forward (trainable).
+                causal_4d = build_causal_mask_4d(attention_mask, dtype=dtype)
+                mtp_hiddens = mtp(
+                    trunk_hidden=trunk_hidden,
+                    input_ids=input_ids,
+                    embed_tokens=embed_tokens,
+                    rotary_emb=base.model.rotary_emb,
+                    causal_mask_4d=causal_4d,
                 )
-                trunk_hidden = out.last_hidden_state
 
-            # 2) MTP forward (trainable).
-            causal_4d = build_causal_mask_4d(attention_mask, dtype=dtype)
-            mtp_hiddens = mtp(
-                trunk_hidden=trunk_hidden,
-                input_ids=input_ids,
-                embed_tokens=embed_tokens,
-                rotary_emb=base.model.rotary_emb,
-                causal_mask_4d=causal_4d,
-            )
-
-            # 3) Loss (chunked: lm_head applied per sequence chunk).
-            raw_loss, per_head = mtp_loss(
-                mtp_hiddens_list=mtp_hiddens,
-                trunk_hidden=trunk_hidden,
-                lm_head=lm_head,
-                input_ids=input_ids,
-                speech_mask=speech_mask,
-                ce_weight=cfg.ce_weight, kl_weight=cfg.kl_weight,
-                kl_temperature=cfg.kl_temperature, kl_top_k=cfg.kl_top_k,
-                depth_decay=cfg.depth_decay,
-                ce_target=cfg.ce_target,
-            )
+                # 3) Loss (chunked: lm_head applied per sequence chunk).
+                raw_loss, per_head = mtp_loss(
+                    mtp_hiddens_list=mtp_hiddens,
+                    trunk_hidden=trunk_hidden,
+                    lm_head=lm_head,
+                    input_ids=input_ids,
+                    speech_mask=speech_mask,
+                    ce_weight=cfg.ce_weight, kl_weight=cfg.kl_weight,
+                    kl_temperature=cfg.kl_temperature, kl_top_k=cfg.kl_top_k,
+                    depth_decay=cfg.depth_decay,
+                    ce_target=cfg.ce_target,
+                )
             loss = raw_loss / cfg.grad_accum_steps
 
             # 4) Backprop.
