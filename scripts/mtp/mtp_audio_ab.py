@@ -9,13 +9,10 @@ LLM decoding paths:
                         mtp_speculative_sample_cached (Leviathan-Kalman
                         rejection sampling against trunk's distribution).
 
-Listen to pairs side-by-side. The output distributions are *provably*
-equivalent under proper speculative sampling, so any audible difference
-indicates either (a) a bug in the spec decoder, (b) the approximation in our
-residual-resample (we sample from p instead of max(0, p-q) on reject — see
-mtp_inference.py notes), or (c) a difference between the production sampler
-(RAS) and the spec sampler (no RAS). (a) and (b) are the things to watch
-for; (c) is expected.
+Listen to pairs side-by-side. The baseline and MTP path both use production
+RAS. Audible differences are worth investigating as either a spec-decoder bug
+or the known rejection-path approximation where we resample from p instead of
+max(0, p-q) on reject.
 
 Usage:
     python mtp_audio_ab.py <path/to/mtp_final.pt> [output_dir]
@@ -25,10 +22,11 @@ from __future__ import annotations
 
 import sys as _sys
 from pathlib import Path as _Path
+
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 
-import sys
+import argparse
 import time
 from pathlib import Path
 
@@ -74,25 +72,46 @@ TEST_CASES = [
 ]
 
 
-def load_mtp(ckpt_path: str, base):
+def resolve_model_path(ckpt, cli_base: str | None) -> str:
+    train_base = ckpt.get("train_config", {}).get("model_path")
+    if cli_base:
+        if train_base and cli_base != train_base:
+            print(
+                f"[warn] --base {cli_base!r} differs from checkpoint train_config model_path {train_base!r}"
+            )
+        return cli_base
+    if train_base:
+        return train_base
+    print(
+        f"[warn] checkpoint has no train_config.model_path; falling back to {MODEL_PATH!r}"
+    )
+    return MODEL_PATH
+
+
+def load_mtp(ckpt, base):
     """Reconstruct SequentialMTP from a saved checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    train_cfg = ckpt.get("train_config", {})
     mtp_config = MtpConfig(**ckpt["mtp_config"])
     decoder_layer_cls = base.model.layers[0].__class__
     mtp = SequentialMTP(mtp_config, decoder_layer_cls, base.config)
     mtp.load_state_dict(ckpt["mtp_state"])
-    mtp = mtp.to(device="cuda", dtype=torch.bfloat16).eval()
-    print(f"  loaded MTP: {ckpt['train_config'].get('num_mtp_layers', '?')} layers, "
-          f"step={ckpt['step']}, "
-          f"kl_top_k={ckpt['train_config'].get('kl_top_k', '?')}, "
-          f"kl_temp={ckpt['train_config'].get('kl_temperature', '?')}, "
-          f"ce_weight={ckpt['train_config'].get('ce_weight', '?')}")
+    mtp = mtp.to(device="cuda").eval()
+    print(
+        f"  loaded MTP: {train_cfg.get('num_mtp_layers', '?')} layers, "
+        f"step={ckpt.get('step', '?')}, "
+        f"model_path={train_cfg.get('model_path', '?')}, "
+        f"kl_top_k={train_cfg.get('kl_top_k', '?')}, "
+        f"kl_temp={train_cfg.get('kl_temperature', '?')}, "
+        f"ce_weight={train_cfg.get('ce_weight', '?')}"
+    )
     return mtp
 
 
 def make_data(name, target_text, prompt_dict, dataset_handler):
     """Build the input data dict that forward_longform expects."""
-    speakers = {"S1": {**prompt_dict, "prompt_audio": Path(prompt_dict["prompt_audio"])}}
+    speakers = {
+        "S1": {**prompt_dict, "prompt_audio": Path(prompt_dict["prompt_audio"])}
+    }
     data = {
         "speakers": speakers,
         "text": [["S1", target_text]],
@@ -111,6 +130,7 @@ def make_data(name, target_text, prompt_dict, dataset_handler):
 
 # --- Baseline path: standard forward_longform -------------------------------
 
+
 @torch.inference_mode()
 def generate_baseline(model, prepared):
     t0 = time.perf_counter()
@@ -122,12 +142,17 @@ def generate_baseline(model, prepared):
     # forward_longform strips trailing EOS before appending to per_turn_speech_tokens,
     # so EOS-hit is inferred by: did we stop before max_tokens-1?
     n_tokens = len(result["generated_speech_tokens"][0])
-    max_tok = prepared["sampling_params"].max_tokens if "sampling_params" in prepared else 3000
+    max_tok = (
+        prepared["sampling_params"].max_tokens
+        if "sampling_params" in prepared
+        else 3000
+    )
     eos_hit = n_tokens < max_tok - 1
     return wav, t, n_tokens, eos_hit
 
 
 # --- MTP path: spec decode + flow + HiFT ------------------------------------
+
 
 @torch.inference_mode()
 def generate_mtp(model, mtp, prepared, sampling_params):
@@ -146,8 +171,10 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     prompt_mels_for_flow_ori = prepared["prompt_mels_for_flow_ori"]
     spk_emb_for_flow = prepared["spk_emb_for_flow"]
 
-    prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = model.audio_tokenizer.quantize(
-        prompt_mels_for_llm.cuda(), prompt_mels_lens_for_llm.cuda()
+    prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = (
+        model.audio_tokenizer.quantize(
+            prompt_mels_for_llm.cuda(), prompt_mels_lens_for_llm.cuda()
+        )
     )
 
     # Align speech tokens with mel (matches forward_longform exactly).
@@ -176,19 +203,22 @@ def generate_mtp(model, mtp, prepared, sampling_params):
 
     # --- MTP spec decode (sampling-aware, with RAS to match baseline) ---
     t0 = time.perf_counter()
-    result = mtp_speculative_sample_cached(
-        model.llm.model, mtp, input_ids,
-        max_new_tokens=sampling_params.max_tokens,
-        eos_token_id=eos_id,
-        temperature=sampling_params.temperature,
-        top_k=sampling_params.top_k,
-        top_p=sampling_params.top_p,
-        repetition_penalty=sampling_params.repetition_penalty,
-        use_ras=sampling_params.use_ras,
-        ras_win_size=sampling_params.win_size,
-        ras_tau_r=sampling_params.tau_r,
-        seed=42,
-    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        result = mtp_speculative_sample_cached(
+            model.llm.model,
+            mtp,
+            input_ids,
+            max_new_tokens=sampling_params.max_tokens,
+            eos_token_id=eos_id,
+            temperature=sampling_params.temperature,
+            top_k=sampling_params.top_k,
+            top_p=sampling_params.top_p,
+            repetition_penalty=sampling_params.repetition_penalty,
+            use_ras=sampling_params.use_ras,
+            ras_win_size=sampling_params.win_size,
+            ras_tau_r=sampling_params.tau_r,
+            seed=42,
+        )
     t_llm = time.perf_counter() - t0
 
     # Extract generated speech tokens (strip the trailing EOS).
@@ -206,7 +236,7 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     flow_input_len = torch.tensor([flow_input.shape[1]])
     prompt_mel = prompt_mels_for_flow[turn_spk][None]
     prompt_mel_len = prompt_mels_lens_for_flow[turn_spk]
-    spk_emb = spk_emb_for_flow[turn_spk: turn_spk + 1].cuda()
+    spk_emb = spk_emb_for_flow[turn_spk : turn_spk + 1].cuda()
 
     t0 = time.perf_counter()
     with torch.amp.autocast(
@@ -214,11 +244,15 @@ def generate_mtp(model, mtp, prepared, sampling_params):
         dtype=torch.float16 if model.config.hf_config.fp16_flow else torch.float32,
     ):
         mels, mels_lens = model.flow(
-            flow_input.cuda(), flow_input_len.cuda(),
-            prompt_mel, prompt_mel_len, spk_emb,
-            streaming=False, finalize=True,
+            flow_input.cuda(),
+            flow_input_len.cuda(),
+            prompt_mel,
+            prompt_mel_len,
+            spk_emb,
+            streaming=False,
+            finalize=True,
         )
-    mel = mels[:, :, prompt_mel_len[0].item(): mels_lens[0].item()]
+    mel = mels[:, :, prompt_mel_len[0].item() : mels_lens[0].item()]
     wav, _ = model.hift(speech_feat=mel)
     t_synth = time.perf_counter() - t0
 
@@ -229,35 +263,61 @@ def generate_mtp(model, mtp, prepared, sampling_params):
 
 
 def main():
-    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("ckpt_path", help="MTP checkpoint .pt")
-    ap.add_argument("out_dir", nargs="?", default="outputs/mtp_audio_ab")
-    ap.add_argument("--model-path", default=MODEL_PATH,
-                    help="Trunk model dir. Must match train_config.json:model_path "
-                         "(e.g. runs/merged for the v5 run).")
+    ap.add_argument("ckpt")
+    ap.add_argument("output_dir", nargs="?", default="outputs/mtp_audio_ab")
+    ap.add_argument(
+        "--base",
+        default=None,
+        help="SoulXPodcast trunk path. Defaults to checkpoint train_config.model_path.",
+    )
+    ap.add_argument(
+        "--no_warmup",
+        action="store_true",
+        help="Skip one untimed warmup pass before measurements.",
+    )
     args = ap.parse_args()
 
-    ckpt_path = args.ckpt_path
-    out_dir = Path(args.out_dir)
+    ckpt_path = args.ckpt
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_path = resolve_model_path(ckpt, args.base)
+    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[init] loading SoulXPodcast model from {args.model_path}")
+    print(f"[init] loading SoulXPodcast model: {model_path}")
     model, dataset_handler = initiate_model(
-        seed=42, model_path=args.model_path, llm_engine="hf", fp16_flow=True,
+        seed=42,
+        model_path=model_path,
+        llm_engine="hf",
+        fp16_flow=True,
     )
 
     print(f"[init] loading MTP checkpoint: {ckpt_path}")
-    mtp = load_mtp(ckpt_path, model.llm.model)
+    mtp = load_mtp(ckpt, model.llm.model)
 
     # Production sampling params (matches what process_single_input attaches).
     from soulxpodcast.config import SamplingParams
+
     sampling_params = SamplingParams()
-    print(f"[init] sampling: temp={sampling_params.temperature}, "
-          f"top_k={sampling_params.top_k}, top_p={sampling_params.top_p}, "
-          f"rep_pen={sampling_params.repetition_penalty}")
+    print(
+        f"[init] sampling: temp={sampling_params.temperature}, "
+        f"top_k={sampling_params.top_k}, top_p={sampling_params.top_p}, "
+        f"rep_pen={sampling_params.repetition_penalty}"
+    )
 
     summary_lines = []
+
+    if not args.no_warmup:
+        case_name, target_text, prompt_dict = TEST_CASES[0]
+        print(f"[init] warmup on {case_name}")
+        _, warm_prepared = make_data(
+            case_name, target_text, prompt_dict, dataset_handler
+        )
+        try:
+            _ = generate_baseline(model, warm_prepared)
+            _ = generate_mtp(model, mtp, warm_prepared, sampling_params)
+        except Exception as e:
+            print(f"[warn] warmup failed: {type(e).__name__}: {e}")
 
     for case_name, target_text, prompt_dict in TEST_CASES:
         print(f"\n{'=' * 60}")
@@ -265,7 +325,9 @@ def main():
         print(f"  target: {target_text[:80]}{'...' if len(target_text) > 80 else ''}")
         print(f"{'=' * 60}")
 
-        parsed, prepared = make_data(case_name, target_text, prompt_dict, dataset_handler)
+        parsed, prepared = make_data(
+            case_name, target_text, prompt_dict, dataset_handler
+        )
 
         # --- Baseline ---
         print("  [baseline] running forward_longform (no MTP)...")
@@ -274,9 +336,11 @@ def main():
             audio_sec_base = wav_base.shape[-1] / 24000
             base_path = out_dir / f"{case_name}_baseline.wav"
             torchaudio.save(str(base_path), wav_base, 24000)
-            print(f"  [baseline] {t_base:.2f}s wall, "
-                  f"{audio_sec_base:.2f}s audio, {n_tok_base} speech tokens, "
-                  f"eos_hit={eos_base}, RTF={t_base/audio_sec_base:.3f}")
+            print(
+                f"  [baseline] {t_base:.2f}s wall, "
+                f"{audio_sec_base:.2f}s audio, {n_tok_base} speech tokens, "
+                f"eos_hit={eos_base}, RTF={t_base/audio_sec_base:.3f}"
+            )
             print(f"  [baseline] saved → {base_path}")
         except Exception as e:
             print(f"  [baseline] FAILED: {type(e).__name__}: {e}")
@@ -285,20 +349,27 @@ def main():
         # --- MTP ---
         print("  [mtp_spec] running spec decode (sampling)...")
         try:
-            wav_mtp, t_llm_mtp, t_synth_mtp, spec_result, n_tok_mtp, eos_mtp = generate_mtp(
-                model, mtp, prepared, sampling_params,
+            wav_mtp, t_llm_mtp, t_synth_mtp, spec_result, n_tok_mtp, eos_mtp = (
+                generate_mtp(
+                    model,
+                    mtp,
+                    prepared,
+                    sampling_params,
+                )
             )
             audio_sec_mtp = wav_mtp.shape[-1] / 24000
             t_total_mtp = t_llm_mtp + t_synth_mtp
             mtp_path = out_dir / f"{case_name}_mtp_spec.wav"
             torchaudio.save(str(mtp_path), wav_mtp, 24000)
-            print(f"  [mtp_spec] LLM={t_llm_mtp:.2f}s ({spec_result.n_steps} steps, "
-                  f"mean accept={spec_result.mean_accept_length:.2f}, "
-                  f"tok/step={spec_result.tokens_per_step:.2f})  "
-                  f"synth={t_synth_mtp:.2f}s  "
-                  f"total={t_total_mtp:.2f}s  "
-                  f"{n_tok_mtp} tokens, {audio_sec_mtp:.2f}s audio, "
-                  f"eos_hit={eos_mtp}, RTF={t_total_mtp/audio_sec_mtp:.3f}")
+            print(
+                f"  [mtp_spec] LLM={t_llm_mtp:.2f}s ({spec_result.n_steps} steps, "
+                f"mean accept={spec_result.mean_accept_length:.2f}, "
+                f"tok/step={spec_result.tokens_per_step:.2f}, "
+                f"tokens={spec_result.n_committed}, eos={spec_result.eos_hit})  "
+                f"synth={t_synth_mtp:.2f}s  "
+                f"total={t_total_mtp:.2f}s  "
+                f"audio={audio_sec_mtp:.2f}s  RTF={t_total_mtp/audio_sec_mtp:.3f}"
+            )
             print(f"  [mtp_spec] saved → {mtp_path}")
 
             # Per-case A/B report
@@ -309,23 +380,28 @@ def main():
                 warn = " ⚠ MTP shorter — possible early EOS / truncation"
             elif tok_ratio > 1.25 or audio_ratio > 1.25:
                 warn = " ⚠ MTP longer than baseline (>25%)"
-            print(f"  [report] tok_ratio={tok_ratio:.2f}  audio_ratio={audio_ratio:.2f}{warn}")
+            print(
+                f"  [report] tok_ratio={tok_ratio:.2f}  audio_ratio={audio_ratio:.2f}{warn}"
+            )
 
             # Speedup summary (LLM stage only — flow+HiFT is identical).
             speedup = t_base / t_total_mtp
             from collections import Counter
+
             hist = Counter(spec_result.accept_lengths)
             n_drafts = len(mtp.layers) + 1
             bucket = " ".join(f"{i}:{hist.get(i, 0)}" for i in range(1, n_drafts + 1))
             print(f"  >>> overall speedup (LLM+synth): {speedup:.2f}x")
             print(f"      accept-len histogram (1..{n_drafts}): {bucket}")
             summary_lines.append(
-                f"{case_name:>18s}  base[{n_tok_base:4d}tok eos={int(eos_base)} {audio_sec_base:5.2f}s {t_base:5.2f}s]  "
-                f"mtp[{n_tok_mtp:4d}tok eos={int(eos_mtp)} {audio_sec_mtp:5.2f}s {t_total_mtp:5.2f}s]  "
-                f"spdup={speedup:.2f}x  accept={spec_result.mean_accept_length:.2f}"
+                f"{case_name:>20s}  base={t_base:5.2f}s  mtp={t_total_mtp:5.2f}s  "
+                f"speedup={speedup:.2f}x  mean_accept={spec_result.mean_accept_length:.2f}  "
+                f"base_audio={audio_sec_base:.2f}s  mtp_audio={audio_sec_mtp:.2f}s  "
+                f"tokens={spec_result.n_committed}  eos={spec_result.eos_hit}"
             )
         except Exception as e:
             import traceback
+
             print(f"  [mtp_spec] FAILED: {type(e).__name__}: {e}")
             traceback.print_exc()
             continue
@@ -336,7 +412,9 @@ def main():
     for line in summary_lines:
         print(line)
     print(f"\nWavs saved to {out_dir}/")
-    print(f"Listen to pairs (baseline vs mtp_spec) — they should sound essentially identical.")
+    print(
+        f"Listen to pairs (baseline vs mtp_spec) — they should sound essentially identical."
+    )
     print(f"Audible artifacts = bug; equivalent quality = ship-ready.")
 
 

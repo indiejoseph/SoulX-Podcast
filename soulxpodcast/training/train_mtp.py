@@ -291,6 +291,7 @@ class TrainConfig:
     eval_split_size: int = 0               # 0 = no eval split
     max_samples: int = 0                   # 0 = use full dataset, >0 = first N (overfit tests)
     shuffle: bool = True                   # disable for repeatable overfit cycles
+    resume_mtp: str = ""                   # optional checkpoint to initialize MTP weights from
     # Weights & Biases logging
     wandb: bool = False                    # enable wandb logging
     wandb_project: str = "soulxpodcast-mtp"
@@ -336,6 +337,9 @@ def parse_args() -> TrainConfig:
                    help="If >0, use only the first N samples (overfit tests).")
     p.add_argument("--no_shuffle", action="store_true",
                    help="Disable shuffling (useful for repeatable overfit).")
+    p.add_argument("--resume_mtp", default="",
+                   help="Optional MTP checkpoint to initialize from. Loads only "
+                        "mtp_state; optimizer/scheduler start fresh.")
     # wandb
     p.add_argument("--wandb", action="store_true",
                    help="Log metrics + config to Weights & Biases.")
@@ -394,6 +398,26 @@ def build_model_and_mtp(cfg: TrainConfig, dtype: torch.dtype):
     # confirmed by inspecting runs/mtp_h100_v5_trunkargmax/mtp_step8000.pt where
     # all norm params were bit-identical across the 3 MTP layers.
     mtp = mtp.to(device="cuda")
+
+    if cfg.resume_mtp:
+        ckpt = torch.load(cfg.resume_mtp, map_location="cpu", weights_only=False)
+        ckpt_cfg = ckpt.get("train_config", {})
+        ckpt_model_path = ckpt_cfg.get("model_path")
+        if ckpt_model_path and ckpt_model_path != cfg.model_path:
+            log.warning(
+                "resume checkpoint was trained against a different trunk: "
+                f"{ckpt_model_path!r} vs current {cfg.model_path!r}"
+            )
+        missing, unexpected = mtp.load_state_dict(ckpt["mtp_state"], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "resume_mtp state did not match current MTP module. "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        log.info(
+            f"loaded MTP weights from {cfg.resume_mtp} "
+            f"(checkpoint step={ckpt.get('step', '?')}); optimizer starts fresh"
+        )
 
     # Sanity log on param counts.
     trainable = sum(p.numel() for p in mtp.parameters() if p.requires_grad)
