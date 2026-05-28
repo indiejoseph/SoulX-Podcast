@@ -7,26 +7,28 @@ Two decoding variants:
      useful for correctness benchmarks.
 
   2. `mtp_speculative_sample_cached` — Leviathan-Kalman speculative sampling.
-     Provably preserves the trunk's true sampling distribution (with
-     temperature / top-K / top-P / repetition penalty applied). Required
-     for production deployment where the existing SamplingParams (top-K,
-     top-P, temperature) are non-trivial — the SoulX-Podcast model is
-     trained with sampling at inference and greedy output sounds robotic.
+     Preserves the trunk's sampling distribution for the normal sampling
+     processors (temperature / top-K / top-P / repetition penalty). Required
+     for production deployment where the existing SamplingParams are
+     non-trivial — the SoulX-Podcast model is trained with sampling at
+     inference and greedy output sounds robotic.
 
 The Leviathan-Kalman acceptance rule:
     u ~ Uniform(0, 1)
     accept if u < min(1, p(x) / q(x))   where x is the drafted token,
                                           q = draft distribution,
                                           p = target (trunk) distribution
-On reject, sample the replacement from `max(0, p - q)` normalized.
-This rule provably gives output ~ p (trunk's distribution).
+Strictly, on reject the replacement should come from `max(0, p - q)`
+normalized, which gives output ~ p exactly. The cached sampled decoder below
+uses a cheaper trunk-resample approximation on the rejection path; when q is
+close to p, the bias is small, and the audio A/B harness is meant to catch
+practical regressions.
 
-NOTE on RAS: this implementation supports temperature / top-K / top-P /
-repetition penalty but NOT RAS (Repetition-Aware Sampling). RAS is a
-stochastic post-hoc reset that's hard to integrate cleanly with rejection
-sampling. For SoulX-Podcast production deployment, the repetition penalty
-alone (which IS supported) handles most of the repetition pathology RAS was
-designed for.
+NOTE on RAS: this implementation can apply SoulX-Podcast's Repetition-Aware
+Sampling branch in both trunk and draft samplers. RAS is a stochastic reset
+on top of the filtered distribution, so the exact distributional guarantee is
+less clean than plain top-k/top-p sampling, but the branch is matched between
+the sampled baseline and speculative path for practical timing and audio A/Bs.
 
 Greedy Medusa-style speculative decoding using K-1 trained MTP heads.
 
@@ -656,9 +658,9 @@ def mtp_speculative_sample_cached(
     ras_tau_r: float = 0.2,
     seed: Optional[int] = None,
 ) -> SpecDecodeResult:
-    """KV-cached MTP speculative decoding with PROPER rejection sampling.
+    """KV-cached MTP speculative decoding with sampling-aware validation.
 
-    Output distribution provably equals trunk's sampling distribution under
+    The acceptance test is based on the trunk's sampling distribution under
     the given temperature/top_k/top_p/repetition_penalty — NOT just greedy.
     This is what's needed for SoulX-Podcast production deployment, where the
     existing SamplingParams (top_k=100, top_p=0.9, temperature=0.6, etc.)
@@ -905,10 +907,14 @@ def baseline_sample_decode_cached(
     top_k: int = 0,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
+    use_ras: bool = False,
+    ras_win_size: int = 25,
+    ras_tau_r: float = 0.2,
     seed: Optional[int] = None,
 ) -> Tuple[torch.LongTensor, int]:
     """KV-cached sampling baseline. Fair comparison target for
-    `mtp_speculative_sample_cached` — both use cache + same sampling processors.
+    `mtp_speculative_sample_cached` — both use cache + the same sampling
+    processors, including optional RAS.
     """
     device = input_ids.device
     lm_head = base.lm_head
@@ -926,16 +932,17 @@ def baseline_sample_decode_cached(
     n_steps = 0
     while full_ids.shape[1] - prompt_len < max_new_tokens:
         raw = lm_head(last_hidden)[:, 0]  # [1, V]
-        logits = _apply_sampling_processors(
+        next_id, _ = _sample_with_ras(
             raw, full_ids,
-            temperature=temperature, top_k=top_k, top_p=top_p,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
             repetition_penalty=repetition_penalty,
+            use_ras=use_ras,
+            win_size=ras_win_size,
+            tau_r=ras_tau_r,
+            generator=gen,
         )
-        probs = F.softmax(logits, dim=-1)
-        if not torch.isfinite(probs).any() or probs.sum() == 0:
-            next_id = logits.argmax(dim=-1, keepdim=True)
-        else:
-            next_id = torch.multinomial(probs, num_samples=1, generator=gen)
         full_ids = torch.cat([full_ids, next_id], dim=1)
         n_steps += 1
         if eos_token_id is not None and int(next_id.item()) == eos_token_id:

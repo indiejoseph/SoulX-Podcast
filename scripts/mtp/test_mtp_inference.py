@@ -21,20 +21,18 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 
-import sys
+import argparse
 import time
-from pathlib import Path
 
 import torch
 from datasets import load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from soulxpodcast.training.mtp_dataset import (
-    DIALECT_PREFIX, MtpDataset, MtpDatasetConfig, SPECIAL_TOKENS,
+    DIALECT_PREFIX, MtpDatasetConfig, SPECIAL_TOKENS,
 )
 from soulxpodcast.training.mtp_inference import (
-    baseline_greedy_decode, baseline_greedy_decode_cached,
-    mtp_speculative_decode, mtp_speculative_decode_cached,
+    baseline_greedy_decode_cached, mtp_speculative_decode_cached,
 )
 from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 
@@ -43,15 +41,26 @@ MODEL_PATH = "pretrained_models/SoulX-Podcast-1.7B-dialect-avg"
 DATASET_PATH = "/notebooks/projects/SoulX-Podcast/tmp/dataset_small_with_tokens"
 
 
-def load_mtp_from_checkpoint(ckpt_path: str, base):
+def resolve_base_path(ckpt, cli_base: str | None) -> str:
+    train_base = ckpt.get("train_config", {}).get("model_path")
+    if cli_base:
+        if train_base and cli_base != train_base:
+            print(f"[warn] --base {cli_base!r} differs from checkpoint train_config model_path {train_base!r}")
+        return cli_base
+    if train_base:
+        return train_base
+    print(f"[warn] checkpoint has no train_config.model_path; falling back to {MODEL_PATH!r}")
+    return MODEL_PATH
+
+
+def load_mtp_from_checkpoint(ckpt, base):
     """Reconstruct the SequentialMTP module from a saved checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     mtp_config_dict = ckpt["mtp_config"]
     mtp_config = MtpConfig(**mtp_config_dict)
     decoder_layer_cls = base.model.layers[0].__class__
     mtp = SequentialMTP(mtp_config, decoder_layer_cls, base.config)
     mtp.load_state_dict(ckpt["mtp_state"])
-    mtp = mtp.to(device="cuda", dtype=torch.bfloat16).eval()
+    mtp = mtp.to(device="cuda").eval()
     return mtp, ckpt.get("step", -1)
 
 
@@ -100,14 +109,15 @@ def run_one_test(label, sample, base, mtp, tokenizer, max_new_tokens=200):
     # ---- Spec decoding (KV-cached) ----
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    spec = mtp_speculative_decode_cached(
-        base, mtp, prompt_tensor,
-        max_new_tokens=cap, eos_token_id=eos_id,
-    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        spec = mtp_speculative_decode_cached(
+            base, mtp, prompt_tensor,
+            max_new_tokens=cap, eos_token_id=eos_id,
+        )
     torch.cuda.synchronize()
     t_spec = time.perf_counter() - t0
     print(f"  [spec+kv ] generated {spec.n_committed} tokens in {spec.n_steps} steps "
-          f"({t_spec:.2f}s)")
+          f"({t_spec:.2f}s), target_len={len(target_speech_llm)}")
     print(f"             mean accept length: {spec.mean_accept_length:.2f}  "
           f"tokens/step: {spec.tokens_per_step:.2f}  eos_hit: {spec.eos_hit}")
     other = t_spec - spec.t_trunk - spec.t_mtp
@@ -134,6 +144,8 @@ def run_one_test(label, sample, base, mtp, tokenizer, max_new_tokens=200):
     t_base = time.perf_counter() - t0
     base_new = base_ids.shape[1] - prompt_tensor.shape[1]
     print(f"  [base+kv ] generated {base_new} tokens in {base_steps} steps ({t_base:.2f}s)")
+    if base_new:
+        print(f"             generated length ratio: spec/base={spec.n_committed/base_new:.2%}")
     speedup = t_base / t_spec if t_spec > 0 else 0
     print(f"             >>> spec speedup vs base: {speedup:.2f}x "
           f"({'FASTER' if speedup > 1 else 'slower'})")
@@ -162,21 +174,29 @@ def run_one_test(label, sample, base, mtp, tokenizer, max_new_tokens=200):
 
 
 def main():
-    ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "runs/mtp_overfit/mtp_final.pt"
-    print(f"[init] loading tokenizer + base from {MODEL_PATH}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ckpt", nargs="?", default="runs/mtp_overfit/mtp_final.pt")
+    ap.add_argument("--base", default=None,
+                    help="Base trunk path. Defaults to checkpoint train_config.model_path.")
+    ap.add_argument("--dataset", default=DATASET_PATH)
+    args = ap.parse_args()
+
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    base_path = resolve_base_path(ckpt, args.base)
+    print(f"[init] loading tokenizer + base from {base_path}")
+    tokenizer = AutoTokenizer.from_pretrained(base_path, use_fast=True)
     base = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, dtype=torch.bfloat16, device_map="cuda",
+        base_path, dtype=torch.bfloat16, device_map="cuda",
     ).eval()
 
-    print(f"[init] loading MTP checkpoint: {ckpt_path}")
-    mtp, ckpt_step = load_mtp_from_checkpoint(ckpt_path, base)
+    print(f"[init] loading MTP checkpoint: {args.ckpt}")
+    mtp, ckpt_step = load_mtp_from_checkpoint(ckpt, base)
     n_layers = len(mtp.layers)
     print(f"[init] loaded MTP step={ckpt_step}, {n_layers} layers, "
           f"K total tokens per step = {n_layers + 1}")
 
-    print(f"[init] loading dataset: {DATASET_PATH}")
-    hf_ds = load_from_disk(DATASET_PATH).remove_columns(["audio", "id", "phone"])
+    print(f"[init] loading dataset: {args.dataset}")
+    hf_ds = load_from_disk(args.dataset).remove_columns(["audio", "id", "phone"])
 
     # ---- Test on samples the model WAS overfit on (first 8) ----
     print(f"\n{'#' * 70}")

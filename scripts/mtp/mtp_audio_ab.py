@@ -9,13 +9,10 @@ LLM decoding paths:
                         mtp_speculative_sample_cached (Leviathan-Kalman
                         rejection sampling against trunk's distribution).
 
-Listen to pairs side-by-side. The output distributions are *provably*
-equivalent under proper speculative sampling, so any audible difference
-indicates either (a) a bug in the spec decoder, (b) the approximation in our
-residual-resample (we sample from p instead of max(0, p-q) on reject — see
-mtp_inference.py notes), or (c) a difference between the production sampler
-(RAS) and the spec sampler (no RAS). (a) and (b) are the things to watch
-for; (c) is expected.
+Listen to pairs side-by-side. The baseline and MTP path both use production
+RAS. Audible differences are worth investigating as either a spec-decoder bug
+or the known rejection-path approximation where we resample from p instead of
+max(0, p-q) on reject.
 
 Usage:
     python mtp_audio_ab.py <path/to/mtp_final.pt> [output_dir]
@@ -28,7 +25,7 @@ from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 
-import sys
+import argparse
 import time
 from pathlib import Path
 
@@ -74,19 +71,32 @@ TEST_CASES = [
 ]
 
 
-def load_mtp(ckpt_path: str, base):
+def resolve_model_path(ckpt, cli_base: str | None) -> str:
+    train_base = ckpt.get("train_config", {}).get("model_path")
+    if cli_base:
+        if train_base and cli_base != train_base:
+            print(f"[warn] --base {cli_base!r} differs from checkpoint train_config model_path {train_base!r}")
+        return cli_base
+    if train_base:
+        return train_base
+    print(f"[warn] checkpoint has no train_config.model_path; falling back to {MODEL_PATH!r}")
+    return MODEL_PATH
+
+
+def load_mtp(ckpt, base):
     """Reconstruct SequentialMTP from a saved checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    train_cfg = ckpt.get("train_config", {})
     mtp_config = MtpConfig(**ckpt["mtp_config"])
     decoder_layer_cls = base.model.layers[0].__class__
     mtp = SequentialMTP(mtp_config, decoder_layer_cls, base.config)
     mtp.load_state_dict(ckpt["mtp_state"])
-    mtp = mtp.to(device="cuda", dtype=torch.bfloat16).eval()
-    print(f"  loaded MTP: {ckpt['train_config'].get('num_mtp_layers', '?')} layers, "
-          f"step={ckpt['step']}, "
-          f"kl_top_k={ckpt['train_config'].get('kl_top_k', '?')}, "
-          f"kl_temp={ckpt['train_config'].get('kl_temperature', '?')}, "
-          f"ce_weight={ckpt['train_config'].get('ce_weight', '?')}")
+    mtp = mtp.to(device="cuda").eval()
+    print(f"  loaded MTP: {train_cfg.get('num_mtp_layers', '?')} layers, "
+          f"step={ckpt.get('step', '?')}, "
+          f"model_path={train_cfg.get('model_path', '?')}, "
+          f"kl_top_k={train_cfg.get('kl_top_k', '?')}, "
+          f"kl_temp={train_cfg.get('kl_temperature', '?')}, "
+          f"ce_weight={train_cfg.get('ce_weight', '?')}")
     return mtp
 
 
@@ -171,19 +181,20 @@ def generate_mtp(model, mtp, prepared, sampling_params):
 
     # --- MTP spec decode (sampling-aware, with RAS to match baseline) ---
     t0 = time.perf_counter()
-    result = mtp_speculative_sample_cached(
-        model.llm.model, mtp, input_ids,
-        max_new_tokens=sampling_params.max_tokens,
-        eos_token_id=eos_id,
-        temperature=sampling_params.temperature,
-        top_k=sampling_params.top_k,
-        top_p=sampling_params.top_p,
-        repetition_penalty=sampling_params.repetition_penalty,
-        use_ras=sampling_params.use_ras,
-        ras_win_size=sampling_params.win_size,
-        ras_tau_r=sampling_params.tau_r,
-        seed=42,
-    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        result = mtp_speculative_sample_cached(
+            model.llm.model, mtp, input_ids,
+            max_new_tokens=sampling_params.max_tokens,
+            eos_token_id=eos_id,
+            temperature=sampling_params.temperature,
+            top_k=sampling_params.top_k,
+            top_p=sampling_params.top_p,
+            repetition_penalty=sampling_params.repetition_penalty,
+            use_ras=sampling_params.use_ras,
+            ras_win_size=sampling_params.win_size,
+            ras_tau_r=sampling_params.tau_r,
+            seed=42,
+        )
     t_llm = time.perf_counter() - t0
 
     # Extract generated speech tokens (strip the trailing EOS).
@@ -222,21 +233,28 @@ def generate_mtp(model, mtp, prepared, sampling_params):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <mtp_checkpoint.pt> [output_dir]")
-        sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ckpt")
+    ap.add_argument("output_dir", nargs="?", default="outputs/mtp_audio_ab")
+    ap.add_argument("--base", default=None,
+                    help="SoulXPodcast trunk path. Defaults to checkpoint train_config.model_path.")
+    ap.add_argument("--no_warmup", action="store_true",
+                    help="Skip one untimed warmup pass before measurements.")
+    args = ap.parse_args()
 
-    ckpt_path = sys.argv[1]
-    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("outputs/mtp_audio_ab")
+    ckpt_path = args.ckpt
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_path = resolve_model_path(ckpt, args.base)
+    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[init] loading SoulXPodcast model")
+    print(f"[init] loading SoulXPodcast model: {model_path}")
     model, dataset_handler = initiate_model(
-        seed=42, model_path=MODEL_PATH, llm_engine="hf", fp16_flow=True,
+        seed=42, model_path=model_path, llm_engine="hf", fp16_flow=True,
     )
 
     print(f"[init] loading MTP checkpoint: {ckpt_path}")
-    mtp = load_mtp(ckpt_path, model.llm.model)
+    mtp = load_mtp(ckpt, model.llm.model)
 
     # Production sampling params (matches what process_single_input attaches).
     from soulxpodcast.config import SamplingParams
@@ -246,6 +264,16 @@ def main():
           f"rep_pen={sampling_params.repetition_penalty}")
 
     summary_lines = []
+
+    if not args.no_warmup:
+        case_name, target_text, prompt_dict = TEST_CASES[0]
+        print(f"[init] warmup on {case_name}")
+        _, warm_prepared = make_data(case_name, target_text, prompt_dict, dataset_handler)
+        try:
+            _ = generate_baseline(model, warm_prepared)
+            _ = generate_mtp(model, mtp, warm_prepared, sampling_params)
+        except Exception as e:
+            print(f"[warn] warmup failed: {type(e).__name__}: {e}")
 
     for case_name, target_text, prompt_dict in TEST_CASES:
         print(f"\n{'=' * 60}")
@@ -281,10 +309,11 @@ def main():
             torchaudio.save(str(mtp_path), wav_mtp, 24000)
             print(f"  [mtp_spec] LLM={t_llm_mtp:.2f}s ({spec_result.n_steps} steps, "
                   f"mean accept={spec_result.mean_accept_length:.2f}, "
-                  f"tok/step={spec_result.tokens_per_step:.2f})  "
+                  f"tok/step={spec_result.tokens_per_step:.2f}, "
+                  f"tokens={spec_result.n_committed}, eos={spec_result.eos_hit})  "
                   f"synth={t_synth_mtp:.2f}s  "
                   f"total={t_total_mtp:.2f}s  "
-                  f"RTF={t_total_mtp/audio_sec_mtp:.3f}")
+                  f"audio={audio_sec_mtp:.2f}s  RTF={t_total_mtp/audio_sec_mtp:.3f}")
             print(f"  [mtp_spec] saved → {mtp_path}")
 
             # Speedup summary (LLM stage only — flow+HiFT is identical).
@@ -297,7 +326,9 @@ def main():
             print(f"      accept-len histogram (1..{n_drafts}): {bucket}")
             summary_lines.append(
                 f"{case_name:>20s}  base={t_base:5.2f}s  mtp={t_total_mtp:5.2f}s  "
-                f"speedup={speedup:.2f}x  mean_accept={spec_result.mean_accept_length:.2f}"
+                f"speedup={speedup:.2f}x  mean_accept={spec_result.mean_accept_length:.2f}  "
+                f"base_audio={audio_sec_base:.2f}s  mtp_audio={audio_sec_mtp:.2f}s  "
+                f"tokens={spec_result.n_committed}  eos={spec_result.eos_hit}"
             )
         except Exception as e:
             import traceback
