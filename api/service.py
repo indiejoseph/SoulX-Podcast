@@ -1024,6 +1024,10 @@ class SoulXPodcastService:
     ) -> Iterator[bytes]:
         self._seed_all(self._resolve_seed(request))
         prepared = prepared or self._build_speech_prepared(request)
+        if request.stream:
+            yield from self._stream_speech_pcm_trunk(request, prepared)
+            return
+
         with torch.no_grad():
             results_dict = self.model.forward_longform(**prepared)
         target_audio = None
@@ -1031,6 +1035,34 @@ class SoulXPodcastService:
             target_audio = wav if target_audio is None else torch.concat([target_audio, wav], axis=1)
         if target_audio is not None:
             yield tensor_to_pcm16_bytes(target_audio)
+
+    def _stream_speech_pcm_trunk(
+        self,
+        request: SpeechRequest,
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[bytes]:
+        flow_streaming = request.flow_streaming if request.flow_streaming is not None else api_config.flow_streaming
+        flow_steps = request.flow_steps if request.flow_steps is not None else api_config.flow_steps
+        chunk_size = request.chunk_size or api_config.stream_chunk_size
+        first_chunk_size = request.first_chunk_size or api_config.stream_first_chunk_size
+
+        if self.trt_streaming_mode is not None and flow_streaming != self.trt_streaming_mode:
+            raise ValueError(
+                "TRT estimator was built for flow_streaming="
+                f"{self.trt_streaming_mode}; request used {flow_streaming}"
+            )
+
+        prepared = prepared or self._build_speech_prepared(request)
+        for event in self.model.forward_longform_streaming(
+            **prepared,
+            chunk_size=chunk_size,
+            first_chunk_size=first_chunk_size,
+            flow_streaming=flow_streaming,
+            flow_steps=flow_steps,
+        ):
+            chunk_bytes = tensor_to_pcm16_bytes(event["audio"])
+            if chunk_bytes:
+                yield chunk_bytes
 
     def stream_speech_pcm(
         self,

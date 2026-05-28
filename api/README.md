@@ -99,7 +99,8 @@ MTP serving currently forces `LLM_ENGINE=hf` because the speculative sampler
 requires direct access to the Qwen trunk and KV cache. The image is still based
 on the patched vLLM runtime so the container remains compatible with vLLM
 fallback/baseline experiments. For those experiments, set `ENABLE_MTP=false`
-and `LLM_ENGINE=vllm`.
+and `LLM_ENGINE=vllm`; streamed trunk requests then use vLLM `LLMEngine.step()`
+token streaming instead of post-hoc token replay.
 
 ## TTFA Measurement
 

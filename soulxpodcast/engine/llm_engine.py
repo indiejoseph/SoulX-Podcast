@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 import os
 import types
 import atexit
+import queue
+import threading
+import uuid
 from time import perf_counter
 from functools import partial
 from dataclasses import fields, asdict
@@ -9,8 +14,11 @@ import torch
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteriaList
 from transformers import EosTokenCriteria, RepetitionPenaltyLogitsProcessor
+
+# SoulX-Podcast relies on the patched vLLM 0.10.1 V0 sampler for RAS fields.
+os.environ["VLLM_USE_V1"] = "0"
 try:    
-    from vllm import LLM
+    from vllm import EngineArgs, LLMEngine
     from vllm import SamplingParams as VllmSamplingParams
     from vllm.inputs import TokensPrompt as TokensPrompt
     SUPPORT_VLLM = True
@@ -36,7 +44,7 @@ class HFLLMEngine:
 
     def generate(
         self,
-        prompt: list[str],
+        prompt: list[int],
         sampling_param: SamplingParams,
         past_key_values=None,
         streamer=None,
@@ -97,14 +105,17 @@ class VLLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = config.hf_config.eos_token_id # speech eos token;
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        os.environ["VLLM_USE_V1"] = "0"
         if SUPPORT_VLLM:
             # Auto-detect AWQ / other quantization from the model's config.json.
             # vLLM 0.10.1 needs explicit `quantization=` kwarg even when the
             # config has the marker, so we read it ourselves and pass through.
-            llm_kwargs = dict(
-                model=model, enforce_eager=True,
-                dtype="bfloat16", max_model_len=8192,
+            engine_kwargs = dict(
+                model=model,
+                enforce_eager=config.enforce_eager,
+                dtype="bfloat16",
+                max_model_len=config.max_model_len,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                tensor_parallel_size=config.tensor_parallel_size,
                 enable_prefix_caching=True,
             )
             import json as _json
@@ -116,35 +127,152 @@ class VLLMEngine:
                 if qcfg and qcfg.get("quant_method"):
                     qmethod = qcfg["quant_method"]
                     # Prefer the faster Marlin kernel for AWQ on supported GPUs.
-                    llm_kwargs["quantization"] = "awq_marlin" if qmethod == "awq" else qmethod
+                    engine_kwargs["quantization"] = "awq_marlin" if qmethod == "awq" else qmethod
                     # AWQ packs in fp16, not bf16 — vLLM requires matching dtype.
-                    llm_kwargs["dtype"] = "float16"
-            self.model = LLM(**llm_kwargs)
+                    engine_kwargs["dtype"] = "float16"
+            self.model = LLMEngine.from_engine_args(EngineArgs(**engine_kwargs))
         else:
             raise ImportError("Not Support VLLM now!!!")
         self.config = config
         self.pad_token_id = self.tokenizer.pad_token_id
+        self._engine_lock = threading.Lock()
+        self._engine_cv = threading.Condition(self._engine_lock)
+        self._request_queues: dict[str, "queue.Queue"] = {}
+        self._request_seen_tokens: dict[str, int] = {}
+        self._shutdown = False
+        self._engine_thread = threading.Thread(
+            target=self._run_engine_loop,
+            name="soulx-vllm-engine",
+            daemon=True,
+        )
+        self._engine_thread.start()
+        atexit.register(self.shutdown)
+
+    def _make_sampling_params(self, sampling_param: SamplingParams) -> VllmSamplingParams:
+        params = asdict(sampling_param)
+        params["stop_token_ids"] = [self.config.hf_config.eos_token_id]
+        return VllmSamplingParams(**params)
+
+    def _run_engine_loop(self):
+        while True:
+            with self._engine_cv:
+                while (
+                    not self._shutdown
+                    and (
+                        not self._request_queues
+                        or not self.model.has_unfinished_requests()
+                    )
+                ):
+                    self._engine_cv.wait()
+                if self._shutdown:
+                    return
+
+            try:
+                with self._engine_lock:
+                    request_outputs = self.model.step()
+            except BaseException as exc:
+                with self._engine_lock:
+                    queues = list(self._request_queues.values())
+                for output_queue in queues:
+                    output_queue.put(("error", exc))
+                continue
+
+            for request_output in request_outputs:
+                request_id = str(request_output.request_id)
+                outputs = getattr(request_output, "outputs", None) or []
+                if not outputs:
+                    continue
+                output = outputs[0]
+                token_ids = list(output.token_ids)
+                finish_reason = getattr(output, "finish_reason", None)
+                finished = bool(getattr(request_output, "finished", False))
+
+                with self._engine_lock:
+                    output_queue = self._request_queues.get(request_id)
+                    if output_queue is None:
+                        continue
+                    seen = self._request_seen_tokens.get(request_id, 0)
+                    new_tokens = token_ids[seen:]
+                    self._request_seen_tokens[request_id] = len(token_ids)
+
+                output_queue.put(("tokens", new_tokens, finished, finish_reason, token_ids))
+
+    def shutdown(self):
+        with self._engine_cv:
+            self._shutdown = True
+            self._engine_cv.notify_all()
+        if getattr(self, "_engine_thread", None) is not None and self._engine_thread.is_alive():
+            self._engine_thread.join(timeout=1.0)
 
     def generate(
         self,
-        prompt: list[str],
+        prompt: list[int],
         sampling_param: SamplingParams,
         past_key_values=None,
         streamer=None,
     ) -> dict:
-        # vLLM token-level streaming is not wired here yet; fall back to
-        # post-hoc replay so callers that pass a streamer still observe tokens.
-        sampling_param.stop_token_ids = [self.config.hf_config.eos_token_id]
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                TokensPrompt(prompt_token_ids=prompt),
-                VllmSamplingParams(**asdict(sampling_param)),
-                use_tqdm=False,
-            )[0].outputs[0].token_ids
-        if streamer is not None:
-            for tok in generated_ids:
-                streamer.put(torch.tensor([tok]))
-            streamer.end()
+        request_id = f"vllm-{uuid.uuid4().hex}"
+        output_queue: "queue.Queue" = queue.Queue()
+        sampling_params = self._make_sampling_params(sampling_param)
+        eos_id = self.config.hf_config.eos_token_id
+        registered = False
+        request_added = False
+
+        generated_ids: list[int] = []
+        finish_reason = None
+        finished_request = False
+        try:
+            if streamer is not None:
+                # Match HF generate(): first streamer.put() contains the prompt
+                # and is intentionally skipped by SpeechTokenStreamer.
+                streamer.put(torch.tensor(prompt, dtype=torch.long))
+
+            with self._engine_cv:
+                self._request_queues[request_id] = output_queue
+                self._request_seen_tokens[request_id] = 0
+                registered = True
+                self.model.add_request(
+                    request_id,
+                    TokensPrompt(prompt_token_ids=prompt),
+                    sampling_params,
+                )
+                request_added = True
+                self._engine_cv.notify()
+
+            while True:
+                item = output_queue.get()
+                kind = item[0]
+                if kind == "error":
+                    raise item[1]
+
+                _, new_tokens, finished, finish_reason, token_ids = item
+                for tok in new_tokens:
+                    generated_ids.append(int(tok))
+                    if streamer is not None:
+                        streamer.put(torch.tensor([int(tok)], dtype=torch.long))
+
+                if finished:
+                    # vLLM may omit special stop tokens from output token_ids.
+                    # Downstream code expects HF-like output with EOS present
+                    # unless generation stopped by max length.
+                    if finish_reason != "length" and (not generated_ids or generated_ids[-1] != eos_id):
+                        generated_ids.append(eos_id)
+                    finished_request = True
+                    break
+        finally:
+            if registered:
+                with self._engine_cv:
+                    if request_added and not finished_request:
+                        try:
+                            self.model.abort_request(request_id)
+                        except BaseException:
+                            pass
+                    self._request_queues.pop(request_id, None)
+                    self._request_seen_tokens.pop(request_id, None)
+                    self._engine_cv.notify_all()
+            if streamer is not None:
+                streamer.end()
+
         output = {
             "text": self.tokenizer.decode(generated_ids),
             "token_ids": list(generated_ids),

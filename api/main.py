@@ -164,8 +164,8 @@ async def openai_audio_speech(
     """OpenAI-compatible TTS endpoint.
 
     Request shape follows the `/v1/audio/speech` convention: JSON in, audio
-    bytes out. `stream=true` returns chunked transfer from the MTP bi-stream
-    path when `MTP_CHECKPOINT` is configured.
+    bytes out. `stream=true` returns chunked transfer from the bi-stream
+    path for both trunk and MTP-backed synthesis.
     """
     try:
         service = get_service()
