@@ -8,10 +8,15 @@ import requests
 import time
 import json
 import argparse
+import os
 from pathlib import Path
 
 
-def test_sync_single_speaker(api_url: str):
+def auth_headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def test_sync_single_speaker(api_url: str, api_key: str):
     """测试同步生成 - 单说话人"""
     print("\n" + "=" * 60)
     print("测试: 同步生成 - 单说话人")
@@ -36,7 +41,7 @@ def test_sync_single_speaker(api_url: str):
     start_time = time.time()
 
     try:
-        response = requests.post(f"{api_url}/generate", files=files, data=data)
+        response = requests.post(f"{api_url}/generate", files=files, data=data, headers=auth_headers(api_key))
         response.raise_for_status()
 
         # 保存结果
@@ -55,7 +60,7 @@ def test_sync_single_speaker(api_url: str):
         files['prompt_audio'].close()
 
 
-def test_sync_multi_speaker(api_url: str):
+def test_sync_multi_speaker(api_url: str, api_key: str):
     """测试同步生成 - 多说话人"""
     print("\n" + "=" * 60)
     print("测试: 同步生成 - 多说话人")
@@ -89,7 +94,7 @@ def test_sync_multi_speaker(api_url: str):
     start_time = time.time()
 
     try:
-        response = requests.post(f"{api_url}/generate", files=files, data=data)
+        response = requests.post(f"{api_url}/generate", files=files, data=data, headers=auth_headers(api_key))
         response.raise_for_status()
 
         # 保存结果
@@ -109,7 +114,7 @@ def test_sync_multi_speaker(api_url: str):
             file_obj.close()
 
 
-def test_async(api_url: str):
+def test_async(api_url: str, api_key: str):
     """测试异步生成"""
     print("\n" + "=" * 60)
     print("测试: 异步生成")
@@ -143,7 +148,7 @@ def test_async(api_url: str):
 
     try:
         # 提交任务
-        response = requests.post(f"{api_url}/generate-async", files=files, data=data)
+        response = requests.post(f"{api_url}/generate-async", files=files, data=data, headers=auth_headers(api_key))
         response.raise_for_status()
         result = response.json()
 
@@ -161,7 +166,7 @@ def test_async(api_url: str):
             time.sleep(2)
             attempt += 1
 
-            status_response = requests.get(f"{api_url}/task/{task_id}")
+            status_response = requests.get(f"{api_url}/task/{task_id}", headers=auth_headers(api_key))
             status_response.raise_for_status()
             status = status_response.json()
 
@@ -175,7 +180,7 @@ def test_async(api_url: str):
                 download_url = f"{api_url}{status['result_url']}"
                 print(f"  下载URL: {download_url}")
 
-                audio_response = requests.get(download_url)
+                audio_response = requests.get(download_url, headers=auth_headers(api_key))
                 audio_response.raise_for_status()
 
                 output_path = "api/outputs/test_async.wav"
@@ -236,10 +241,16 @@ def main():
         default="all",
         help="测试模式（默认: all）"
     )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.getenv("API_KEY", ""),
+        help="Bearer token for authenticated endpoints. Defaults to API_KEY."
+    )
 
     args = parser.parse_args()
 
-    print("SoulX-Podcast API 测试客户端")
+    print("TTS API 测试客户端")
     print(f"API地址: {args.url}")
 
     # 确保输出目录存在
@@ -249,11 +260,11 @@ def main():
         test_health(args.url)
 
     if args.mode in ["sync", "all"]:
-        test_sync_single_speaker(args.url)
-        test_sync_multi_speaker(args.url)
+        test_sync_single_speaker(args.url, args.api_key)
+        test_sync_multi_speaker(args.url, args.api_key)
 
     if args.mode in ["async", "all"]:
-        test_async(args.url)
+        test_async(args.url, args.api_key)
 
     print("\n" + "=" * 60)
     print("测试完成!")

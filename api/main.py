@@ -1,14 +1,15 @@
 """
-FastAPI Main Application for SoulX-Podcast Voice Cloning API
+FastAPI main application for the TTS API.
 """
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List
 import json
 import threading
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks, Depends, Header
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Header
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
@@ -25,6 +26,7 @@ from api.models import (
 )
 from api.service import get_service
 from api.tasks import get_task_manager
+from api.redis_state import ping_redis
 from api.utils import (
     generate_task_id,
     save_upload_file,
@@ -49,7 +51,8 @@ MAX_CONCURRENT_SYNC_INFERENCES = 1
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management."""
-    logger.info("Starting SoulX-Podcast API...")
+    logger.info("Starting TTS API...")
+    config.validate_runtime_security()
 
     logger.info("Loading model...")
     service = get_service()
@@ -88,29 +91,31 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="SoulX-Podcast Voice Cloning API",
-    description="Voice cloning and text-to-speech API powered by SoulX-Podcast.",
+    title="TTS API",
+    description="Voice cloning and text-to-speech API.",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Prompt-Cache-Id"],
-)
+# CORS is disabled unless explicitly configured. This keeps the API safe when
+# exposed behind a proxy and lets deployments opt in per frontend origin.
+if config.cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(config.cors_allowed_origins),
+        allow_credentials=config.cors_allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Prompt-Cache-Id"],
+    )
 
 
 def require_api_key(authorization: str | None = Header(default=None)) -> None:
-    """Optional local bearer-token guard for OpenAI-compatible clients."""
+    """Bearer-token guard for all generation and artifact endpoints."""
     if not config.require_api_key:
         return
     if not config.api_key:
-        raise HTTPException(status_code=500, detail="SOULX_API_KEY is required but not configured")
+        raise HTTPException(status_code=500, detail="API_KEY is required but not configured")
     expected = f"Bearer {config.api_key}"
     if authorization != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -120,7 +125,7 @@ def require_api_key(authorization: str | None = Header(default=None)) -> None:
 async def root():
     """Root endpoint."""
     return {
-        "name": "SoulX-Podcast Voice Cloning API",
+        "name": "TTS API",
         "version": "1.0.0",
         "status": "running",
         "docs": "/docs"
@@ -132,15 +137,23 @@ async def health_check():
     """Health check."""
     service = get_service()
     task_manager = get_task_manager()
+    redis_available = ping_redis()
+    model_loaded = service.is_loaded()
+    gpu_available = torch.cuda.is_available()
+    healthy = model_loaded and gpu_available and redis_available is not False
 
-    return HealthResponse(
-        status="healthy",
-        model_loaded=service.is_loaded(),
-        gpu_available=torch.cuda.is_available(),
+    response = HealthResponse(
+        status="healthy" if healthy else "unhealthy",
+        model_loaded=model_loaded,
+        gpu_available=gpu_available,
+        redis_available=redis_available,
         llm_engine=config.llm_engine,
         active_tasks=task_manager.get_active_task_count(),
         version="1.0.0"
     )
+    if not healthy:
+        raise HTTPException(status_code=503, detail=response.dict())
+    return response
 
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
@@ -160,7 +173,7 @@ async def openai_audio_speech(
         media_type = "audio/wav" if request.output_format == "wav" else "audio/pcm"
         headers = {
             "Content-Disposition": f'attachment; filename="speech.{request.output_format}"',
-            "X-SoulX-Model": request.model,
+            "X-TTS-Model": request.model,
             "Prompt-Cache-Id": speech_context["prompt_cache_id"],
         }
         if request.stream:
@@ -193,6 +206,7 @@ async def generate_sync(
     top_k: int = Form(default=100, ge=1, le=500, description="Top-k sampling parameter."),
     top_p: float = Form(default=0.9, ge=0.0, le=1.0, description="Top-p sampling parameter."),
     repetition_penalty: float = Form(default=1.25, ge=1.0, le=2.0, description="Repetition penalty."),
+    _: None = Depends(require_api_key),
 ):
     """
     Synchronously generate speech and return the audio file.
@@ -269,6 +283,7 @@ async def generate_async(
     top_k: int = Form(default=100, ge=1, le=500, description="Top-k sampling parameter."),
     top_p: float = Form(default=0.9, ge=0.0, le=1.0, description="Top-p sampling parameter."),
     repetition_penalty: float = Form(default=1.25, ge=1.0, le=2.0, description="Repetition penalty."),
+    _: None = Depends(require_api_key),
 ):
     """
     Asynchronously generate speech and return a task id.
@@ -321,7 +336,7 @@ async def generate_async(
             task_id=task_id,
             status=task.status,
             created_at=task.created_at,
-            message=f"Task created. Queue size: {task_manager.queue.qsize()}"
+            message=f"Task created. Queue size: {task_manager.queue_size()}"
         )
 
     except HTTPException:
@@ -332,7 +347,7 @@ async def generate_async(
 
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse, tags=["Tasks"])
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, _: None = Depends(require_api_key)):
     """Get async task status."""
     task_manager = get_task_manager()
     task = task_manager.get_task(task_id)
@@ -357,9 +372,15 @@ async def get_task_status(task_id: str):
 
 
 @app.get("/download/{filename}", tags=["Download"])
-async def download_file(filename: str):
+async def download_file(filename: str, _: None = Depends(require_api_key)):
     """Download a generated audio file."""
-    file_path = config.output_dir / filename
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    output_root = config.output_dir.resolve()
+    file_path = (config.output_dir / filename).resolve()
+    if not file_path.is_relative_to(output_root):
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")

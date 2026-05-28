@@ -63,15 +63,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--url",
-        default=os.getenv("SOULX_SPEECH_URL", "http://localhost:8000/v1/audio/speech"),
+        default=os.getenv("SPEECH_URL", "http://localhost:8000/v1/audio/speech"),
         help="Speech endpoint URL.",
     )
     parser.add_argument(
         "--api-key",
-        default=os.getenv("SOULX_API_KEY", "local-dev-key"),
+        default=os.getenv("API_KEY", ""),
         help="Bearer token. Pass an empty string for unauthenticated local servers.",
     )
-    parser.add_argument("--model", default="soulx-podcast-mtp")
+    parser.add_argument("--model", default="tts")
     parser.add_argument(
         "--input",
         "--text",

@@ -5,6 +5,7 @@ import base64
 import binascii
 import copy
 import hashlib
+import json
 import re
 import logging
 import tempfile
@@ -36,6 +37,7 @@ from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 from api.audio import tensor_to_pcm16_bytes, wav_bytes_from_pcm, wav_header
 from api.config import config as api_config
 from api.models import SpeechRequest
+from api.redis_state import get_redis_client, redis_key
 from api.utils import parse_dialogue_text
 
 logger = logging.getLogger(__name__)
@@ -420,6 +422,7 @@ class SoulXPodcastService:
                 "prompt_audio": str(path),
                 "_cache_key": cache_key,
                 "_cache_id": self._prompt_cache_id_from_key(cache_key),
+                "_prompt_audio_kind": "file",
             }
 
         if value.startswith("data:"):
@@ -439,6 +442,7 @@ class SoulXPodcastService:
             return {
                 "_cache_key": cache_key,
                 "_cache_id": self._prompt_cache_id_from_key(cache_key),
+                "_prompt_audio_kind": "inline",
                 "_inline_audio_payload": payload,
                 "_inline_audio_suffix": suffix,
             }
@@ -453,6 +457,7 @@ class SoulXPodcastService:
         return {
             "_cache_key": cache_key,
             "_cache_id": self._prompt_cache_id_from_key(cache_key),
+            "_prompt_audio_kind": "inline",
             "_inline_audio_payload": payload,
             "_inline_audio_suffix": ".wav",
         }
@@ -536,6 +541,93 @@ class SoulXPodcastService:
                     self._prompt_cache_ids.pop(evicted_id, None)
         return entry
 
+    def _prompt_cache_metadata_key(self, cache_id: str) -> str:
+        return redis_key("prompt_cache", cache_id)
+
+    def _store_prompt_cache_metadata(
+        self,
+        *,
+        cache_key: str,
+        cache_id: str,
+        prompt: Dict[str, Any],
+    ) -> None:
+        redis = get_redis_client()
+        if redis is None:
+            return
+
+        metadata: Dict[str, Any] = {
+            "cache_key": cache_key,
+            "cache_id": cache_id,
+            "prompt_text": prompt.get("prompt_text"),
+            "kind": prompt.get("_prompt_audio_kind"),
+        }
+        if prompt.get("_prompt_audio_kind") == "file":
+            metadata["prompt_audio"] = prompt.get("prompt_audio")
+        elif (
+            prompt.get("_prompt_audio_kind") == "inline"
+            and api_config.prompt_cache_store_inline_audio
+            and "_inline_audio_payload" in prompt
+        ):
+            metadata["payload_b64"] = base64.b64encode(prompt["_inline_audio_payload"]).decode("ascii")
+            metadata["suffix"] = prompt.get("_inline_audio_suffix", ".wav")
+        else:
+            metadata["rebuildable"] = False
+
+        try:
+            redis.set(
+                self._prompt_cache_metadata_key(cache_id),
+                json.dumps(metadata, ensure_ascii=False),
+                ex=api_config.prompt_cache_ttl_seconds,
+            )
+        except Exception:
+            logger.exception("Failed to store prompt cache metadata in Redis")
+
+    def _restore_prompt_from_cache_metadata(self, cache_id: str) -> Optional[Dict[str, Any]]:
+        redis = get_redis_client()
+        if redis is None:
+            return None
+        try:
+            raw = redis.get(self._prompt_cache_metadata_key(cache_id))
+        except Exception:
+            logger.exception("Failed to read prompt cache metadata from Redis")
+            return None
+        if not raw:
+            return None
+
+        metadata = json.loads(raw)
+        cache_key = metadata.get("cache_key")
+        prompt_text = metadata.get("prompt_text")
+        if not cache_key or not prompt_text:
+            return None
+
+        if metadata.get("kind") == "file" and metadata.get("prompt_audio"):
+            return {
+                "id": "cached_prompt",
+                "_cache_key": cache_key,
+                "_cache_id": cache_id,
+                "_prompt_audio_kind": "file",
+                "prompt_audio": metadata["prompt_audio"],
+                "prompt_text": prompt_text,
+            }
+
+        if metadata.get("kind") == "inline" and metadata.get("payload_b64"):
+            try:
+                payload = base64.b64decode(metadata["payload_b64"], validate=True)
+            except binascii.Error:
+                logger.warning("Prompt cache metadata has invalid inline audio payload")
+                return None
+            return {
+                "id": "cached_prompt",
+                "_cache_key": cache_key,
+                "_cache_id": cache_id,
+                "_prompt_audio_kind": "inline",
+                "_inline_audio_payload": payload,
+                "_inline_audio_suffix": metadata.get("suffix", ".wav"),
+                "prompt_text": prompt_text,
+            }
+
+        return None
+
     def _encode_target_text(self, text: str) -> List[int]:
         # Keep this template in sync with PodcastInferHandler.__getitem__
         # target-text preprocessing in soulxpodcast/utils/dataloader.py.
@@ -568,7 +660,11 @@ class SoulXPodcastService:
         if cached is not None:
             return cached
         if cache_key is None:
-            raise ValueError(f"Unknown or expired prompt_cache_id: {cache_id}")
+            restored_prompt = self._restore_prompt_from_cache_metadata(cache_id)
+            if restored_prompt is None:
+                raise ValueError(f"Unknown or expired prompt_cache_id: {cache_id}")
+            prompt = restored_prompt
+            cache_key = prompt["_cache_key"]
 
         temp_prompt_audio = None
         if "_inline_audio_payload" in prompt:
@@ -641,7 +737,9 @@ class SoulXPodcastService:
             entry["prompt_prefix_cache"] = prefix_cache
             entry["prompt_prefix_hidden"] = prefix_hidden
         logger.info("Cached prompt audio entry %s", prompt.get("id", "inline_prompt"))
-        return self._store_prompt_cache_entry(cache_key, cache_id, entry)
+        stored = self._store_prompt_cache_entry(cache_key, cache_id, entry)
+        self._store_prompt_cache_metadata(cache_key=cache_key, cache_id=cache_id, prompt=prompt)
+        return stored
 
     def _build_speech_prepared(self, request: SpeechRequest):
         prompt = self._resolve_speech_prompt(request)

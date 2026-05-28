@@ -1,5 +1,5 @@
 """
-GPU Memory Monitor for SoulX-Podcast API
+GPU memory monitor for the TTS API.
 用于监控GPU内存使用情况，帮助诊断内存泄漏问题
 """
 import time

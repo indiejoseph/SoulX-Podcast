@@ -5,6 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 ARG INSTALL_TRT=true
+ARG VLLM_PATCH_REF=df57a93a9e21715f2d46835ff0a049e195fe6af4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -17,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # compatible with the repo's vLLM baseline and fallback modes.
 RUN git clone https://github.com/Soul-AILab/vllm.git /tmp/soulx-vllm && \
     cd /tmp/soulx-vllm && \
-    git checkout v0.10.1.1-soulxpodcast && \
+    git checkout "${VLLM_PATCH_REF}" && \
     VLLM_PATH=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") && \
     cp /tmp/soulx-vllm/vllm/model_executor/layers/sampler.py "${VLLM_PATH}/model_executor/layers/sampler.py" && \
     cp /tmp/soulx-vllm/vllm/model_executor/layers/utils.py "${VLLM_PATH}/model_executor/layers/utils.py" && \
@@ -37,6 +38,11 @@ RUN pip3 install -r /tmp/requirements.txt -r /tmp/api-requirements.txt && \
 
 COPY . /app
 
+RUN groupadd --system app && \
+    useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app && \
+    mkdir -p /app/api/temp /app/api/outputs && \
+    chown -R app:app /app
+
 ENV MODEL_PATH=/app/runs/merged \
     LLM_ENGINE=hf \
     FP16_FLOW=true \
@@ -51,5 +57,7 @@ ENV MODEL_PATH=/app/runs/merged \
     API_PORT=8000
 
 EXPOSE 8000
+
+USER app
 
 CMD ["python", "run_api.py"]

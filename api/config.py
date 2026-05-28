@@ -7,6 +7,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv(name: str) -> tuple[str, ...]:
+    value = os.getenv(name, "")
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 @dataclass
 class APIConfig:
     """API configuration."""
@@ -37,12 +49,21 @@ class APIConfig:
                 self.llm_engine = "hf"
     fp16_flow: bool = os.getenv("FP16_FLOW", "false").lower() == "true"
 
+    # API security
+    api_key: str = os.getenv("API_KEY", "").strip()
+    require_api_key: bool = _env_bool("REQUIRE_API_KEY", True)
+    cors_allowed_origins: tuple[str, ...] = _env_csv("CORS_ALLOWED_ORIGINS")
+    cors_allow_credentials: bool = _env_bool("CORS_ALLOW_CREDENTIALS", False)
+
+    # Redis-backed coordination. GPU-resident prompt tensors still stay local to
+    # each API process; Redis stores task state and prompt cache metadata.
+    redis_url: str = os.getenv("REDIS_URL", "").strip()
+    redis_key_prefix: str = os.getenv("REDIS_KEY_PREFIX", "tts").strip() or "tts"
+    task_ttl_seconds: int = int(os.getenv("TASK_TTL_SECONDS", "86400"))
+    prompt_cache_ttl_seconds: int = int(os.getenv("PROMPT_CACHE_TTL_SECONDS", "3600"))
+    prompt_cache_store_inline_audio: bool = _env_bool("PROMPT_CACHE_STORE_INLINE_AUDIO", False)
+
     # OpenAI-compatible speech endpoint
-    api_key: str = os.getenv("SOULX_API_KEY", "")
-    require_api_key: bool = os.getenv(
-        "REQUIRE_API_KEY",
-        "true" if os.getenv("SOULX_API_KEY") else "false",
-    ).lower() == "true"
     prompt_audio_root: Optional[str] = os.getenv("PROMPT_AUDIO_ROOT")
     prompt_cache_size: int = int(os.getenv("PROMPT_CACHE_SIZE", "16"))
     mtp_checkpoint: str = os.getenv("MTP_CHECKPOINT", "")
@@ -83,6 +104,26 @@ class APIConfig:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.validate_llm_engine()
+        self.validate_cors_config()
+
+    def validate_cors_config(self):
+        """Validate CORS settings that would be unsafe in browsers."""
+        if "*" in self.cors_allowed_origins and self.cors_allow_credentials:
+            raise ValueError("CORS_ALLOW_CREDENTIALS=true cannot be used with CORS_ALLOWED_ORIGINS=*")
+
+    def validate_runtime_security(self):
+        """Validate settings that should fail server startup in production mode."""
+        if not self.require_api_key:
+            return
+        if not self.api_key:
+            raise RuntimeError("API_KEY is required when REQUIRE_API_KEY=true")
+        weak_key = self.api_key.lower()
+        if (
+            weak_key in {"changeme", "change-me", "dev", "test"}
+            or weak_key.startswith("change-me")
+            or weak_key.endswith("-dev-key")
+        ):
+            raise RuntimeError("API_KEY must be changed from the development placeholder")
 
 
 # Global configuration instance

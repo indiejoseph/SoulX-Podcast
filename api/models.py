@@ -158,6 +158,10 @@ class HealthResponse(BaseModel):
     status: str = Field(default="healthy", description="Service status.")
     model_loaded: bool = Field(..., description="Whether the model is loaded.")
     gpu_available: bool = Field(..., description="Whether CUDA/GPU is available.")
+    redis_available: Optional[bool] = Field(
+        default=None,
+        description="Whether Redis is available. Null means Redis is not configured.",
+    )
     llm_engine: str = Field(..., description="Active LLM engine: hf or vllm.")
     active_tasks: int = Field(default=0, description="Number of active async tasks.")
     version: str = Field(default="1.0.0", description="API version.")

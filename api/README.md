@@ -5,10 +5,10 @@ The production endpoint mirrors OpenAI's speech-generation shape:
 ```bash
 curl http://localhost:8000/v1/audio/speech \
   -X POST \
-  -H "Authorization: Bearer ${SOULX_API_KEY:-local-dev-key}" \
+  -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "soulx-podcast-mtp",
+    "model": "tts",
     "prompt_audio": "file:///app/example/audios/female_mandarin.wav",
     "prompt_text": "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。",
     "input": "Maple est le meilleur golden retriever du monde entier.",
@@ -40,7 +40,7 @@ the prepared prompt state:
 
 ```json
 {
-  "model": "soulx-podcast-mtp",
+  "model": "tts",
   "prompt_cache_id": "pc_...",
   "input": "The next sentence to synthesize.",
   "format": "pcm",
@@ -48,8 +48,11 @@ the prepared prompt state:
 }
 ```
 
-Cache ids are in-memory and local to one API process. They are invalid after
-restart or LRU eviction.
+Cache ids use a local GPU tensor cache for the fast path. When Redis is
+configured, file-based prompt metadata is also stored with a TTL so another API
+process can rebuild its local GPU cache from the same mounted file. Inline
+base64 prompt audio is not stored in Redis unless
+`PROMPT_CACHE_STORE_INLINE_AUDIO=true`.
 
 ## Docker Compose
 
@@ -63,7 +66,7 @@ python scripts/flow/export_flow_runtime.py \
   --encoder_fp16 \
   --streaming
 
-SOULX_API_KEY=local-dev-key \
+API_KEY="$(openssl rand -hex 32)" \
 MTP_CHECKPOINT=/app/runs/mtp_h100_v3_kl_refresh_from22000/mtp_step2000.pt \
 docker compose up --build
 ```
@@ -80,6 +83,17 @@ Default production knobs in `docker-compose.yml`:
 - `STREAM_CHUNK_SIZE=100`
 - `TRT_ESTIMATOR=true`
 - `PROMPT_CACHE_SIZE=16`
+- `REDIS_URL=redis://redis:6379/0`
+
+The compose service and image are named `tts`. The API binds to
+`127.0.0.1:${API_PORT}` by default; put a reverse proxy or load balancer in
+front of it for TLS, external access, request-size limits, and rate limiting.
+Set `API_BIND_HOST=0.0.0.0` only when that exposure is intentional.
+
+`API_KEY` is required by the compose file. The OpenAI-compatible endpoint,
+legacy generation endpoints, task status endpoint, and download endpoint all
+require `Authorization: Bearer <API_KEY>`. `/health` remains unauthenticated for
+container health checks.
 
 MTP serving currently forces `LLM_ENGINE=hf` because the speculative sampler
 requires direct access to the Qwen trunk and KV cache. The image is still based
@@ -93,9 +107,9 @@ Use streamed PCM for latency measurements. Streamed WAV responses send the WAV
 header before generated audio, so first-byte timing does not equal TTFA.
 
 ```bash
-SOULX_API_KEY=local-dev-key \
 python scripts/api/measure_ttfa.py \
   --url http://localhost:8000/v1/audio/speech \
+  --api-key "$API_KEY" \
   --prompt-audio file:///app/example/audios/female_mandarin.wav \
   --prompt-text "喜欢攀岩、徒步、滑雪的语言爱好者，以及过两天要带着全部家当去景德镇做陶瓷的白日梦想家。" \
   --first-chunk-size 4 \

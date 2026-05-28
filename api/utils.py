@@ -4,7 +4,6 @@ Utility Functions for API
 import os
 import re
 import uuid
-import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple
@@ -23,19 +22,39 @@ def generate_task_id() -> str:
 
 def save_upload_file(upload_file: UploadFile, task_id: str, index: int) -> Path:
     """Save an uploaded file to the temporary directory."""
+    file_path = None
     try:
         file_extension = Path(upload_file.filename).suffix or ".wav"
 
         filename = f"{task_id}_prompt_{index}{file_extension}"
         file_path = config.temp_dir / filename
 
+        bytes_written = 0
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(upload_file.file, buffer)
+            while True:
+                chunk = upload_file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > config.max_upload_size:
+                    file_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File {upload_file.filename} exceeds the maximum size limit "
+                            f"({config.max_upload_size / 1024 / 1024:.0f}MB)"
+                        ),
+                    )
+                buffer.write(chunk)
 
         logger.info(f"Saved upload file to {file_path}")
         return file_path
 
+    except HTTPException:
+        raise
     except Exception as e:
+        if file_path is not None:
+            file_path.unlink(missing_ok=True)
         logger.error(f"Failed to save upload file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
     finally:

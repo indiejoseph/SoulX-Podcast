@@ -1,16 +1,21 @@
+name: tts
+
 services:
-  soulx-tts:
+  tts:
     build:
       context: .
       dockerfile: Dockerfile.serve
       args:
         INSTALL_TRT: "${INSTALL_TRT:-true}"
-    image: soulxpodcast-tts:latest
+    image: tts:latest
     gpus: all
     shm_size: "16gb"
     ipc: host
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
     environment:
       MODEL_PATH: "${MODEL_PATH:-/app/runs/merged}"
       LLM_ENGINE: "${LLM_ENGINE:-hf}"
@@ -27,8 +32,15 @@ services:
       TRT_OPT_MEL_LEN: "${TRT_OPT_MEL_LEN:-256}"
       PROMPT_AUDIO_ROOT: "${PROMPT_AUDIO_ROOT:-/app}"
       PROMPT_CACHE_SIZE: "${PROMPT_CACHE_SIZE:-16}"
-      SOULX_API_KEY: "${SOULX_API_KEY:-local-dev-key}"
+      PROMPT_CACHE_TTL_SECONDS: "${PROMPT_CACHE_TTL_SECONDS:-3600}"
+      PROMPT_CACHE_STORE_INLINE_AUDIO: "${PROMPT_CACHE_STORE_INLINE_AUDIO:-false}"
+      API_KEY: "${API_KEY:?API_KEY must be set}"
       REQUIRE_API_KEY: "${REQUIRE_API_KEY:-true}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
+      CORS_ALLOW_CREDENTIALS: "${CORS_ALLOW_CREDENTIALS:-false}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-tts}"
+      TASK_TTL_SECONDS: "${TASK_TTL_SECONDS:-86400}"
     volumes:
       - ./pretrained_models:/app/pretrained_models:ro
       - ./runs:/app/runs:ro
@@ -37,8 +49,22 @@ services:
       - ./api/outputs:/app/api/outputs
       - ./api/temp:/app/api/temp
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      test: ["CMD", "python", "-c", "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); assert data['status'] == 'healthy'"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 120s
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:

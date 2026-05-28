@@ -1,5 +1,5 @@
 """
-Quick start script for SoulX-Podcast API
+Quick start script for the TTS API
 使用示例:
     python run_api.py
     python run_api.py --port 8080
@@ -13,7 +13,7 @@ import time
 
 
 def main():
-    parser = argparse.ArgumentParser(description="启动SoulX-Podcast API服务")
+    parser = argparse.ArgumentParser(description="启动TTS API服务")
     parser.add_argument(
         "--model",
         type=str,
@@ -78,7 +78,7 @@ def main():
 
     # 打印启动信息
     print("=" * 60)
-    print("SoulX-Podcast API 服务启动中...")
+    print("TTS API 服务启动中...")
     print("=" * 60)
     print(f"模型路径: {args.model}")
     print(f"服务地址: http://{args.host}:{args.port}")
