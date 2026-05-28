@@ -61,6 +61,17 @@ logging.basicConfig(
 log = logging.getLogger("train_mtp")
 
 
+def resolve_speech_token_offset(tokenizer) -> int:
+    """Resolve the LLM-vocab id of raw s3tokenizer token 0."""
+    ids = tokenizer.encode("<|0|>", add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(
+            "Tokenizer did not encode '<|0|>' as one token; cannot derive "
+            f"speech_token_offset safely. Got ids={ids}"
+        )
+    return int(ids[0])
+
+
 # ------------------------------------------------------------------------- #
 # Loss
 # ------------------------------------------------------------------------- #
@@ -113,6 +124,8 @@ def mtp_loss(
     B, T = input_ids.shape
     total_loss = input_ids.new_zeros((), dtype=torch.float32)
     per_head = []
+    do_ce = ce_weight != 0.0
+    do_kl = kl_weight != 0.0
 
     for k_idx, mtp_h in enumerate(mtp_hiddens_list, start=1):
         # mtp_h: [B, T-k_idx, H]. The first valid position predicts token at
@@ -142,8 +155,11 @@ def mtp_loss(
                 continue
 
             s_logits = lm_head(mtp_h_slice[:, start:end])  # [B, chunk, V]
-            with torch.no_grad():
-                t_logits = lm_head(trunk_h_slice[:, start:end])  # [B, chunk, V]
+            need_teacher_logits = do_kl or ce_target == "trunk_argmax"
+            t_logits = None
+            if need_teacher_logits:
+                with torch.no_grad():
+                    t_logits = lm_head(trunk_h_slice[:, start:end])  # [B, chunk, V]
 
             if ce_target == "trunk_argmax":
                 # Teacher's argmax as the CE pseudo-label. Richer than the raw
@@ -151,17 +167,19 @@ def mtp_loss(
                 # top choice) and directly optimizes the spec-decode metric
                 # (student.argmax == trunk.argmax).
                 with torch.no_grad():
+                    assert t_logits is not None
                     target_chunk = t_logits.argmax(dim=-1)
             else:
                 target_chunk = target_ids[:, start:end]
 
-            # CE (fused log_softmax + nll, memory-efficient).
-            ce_pos = F.cross_entropy(
-                s_logits.reshape(-1, s_logits.size(-1)),
-                target_chunk.reshape(-1),
-                reduction="none",
-            ).view(B, end - start)
-            ce_sum = ce_sum + (ce_pos * mask_chunk).sum()
+            if do_ce:
+                # CE (fused log_softmax + nll, memory-efficient).
+                ce_pos = F.cross_entropy(
+                    s_logits.reshape(-1, s_logits.size(-1)),
+                    target_chunk.reshape(-1),
+                    reduction="none",
+                ).view(B, end - start)
+                ce_sum = ce_sum + (ce_pos * mask_chunk).sum()
 
             # KL(student || teacher).
             #
@@ -180,24 +198,26 @@ def mtp_loss(
             #      position the teacher assigns ~0 mass to text region.
             #      Top-K skips this uninformative bulk.
             #   3. ~1600× memory saving on the KL intermediates (K=100 vs V=159K).
-            if kl_top_k > 0:
-                with torch.no_grad():
-                    t_topk_vals, t_topk_idx = t_logits.topk(kl_top_k, dim=-1)
-                    t_log_topk = F.log_softmax(t_topk_vals / kl_temperature, dim=-1)
-                    t_prob_topk = t_log_topk.exp()
-                # Gather student logits at teacher's top-K positions, then
-                # renormalize within that K-element support. This matches
-                # MiniLLM / DistiLLM truncated-KL convention.
-                s_topk = s_logits.gather(-1, t_topk_idx)
-                s_log_topk = F.log_softmax(s_topk / kl_temperature, dim=-1)
-                kl_pos = (t_prob_topk * (t_log_topk - s_log_topk)).sum(dim=-1)
-            else:
-                s_log = F.log_softmax(s_logits / kl_temperature, dim=-1)
-                with torch.no_grad():
-                    t_log = F.log_softmax(t_logits / kl_temperature, dim=-1)
-                    t_prob = t_log.exp()
-                kl_pos = (t_prob * (t_log - s_log)).sum(dim=-1)
-            kl_sum = kl_sum + (kl_pos * mask_chunk).sum() * (kl_temperature ** 2)
+            if do_kl:
+                assert t_logits is not None
+                if kl_top_k > 0:
+                    with torch.no_grad():
+                        t_topk_vals, t_topk_idx = t_logits.topk(kl_top_k, dim=-1)
+                        t_log_topk = F.log_softmax(t_topk_vals / kl_temperature, dim=-1)
+                        t_prob_topk = t_log_topk.exp()
+                    # Gather student logits at teacher's top-K positions, then
+                    # renormalize within that K-element support. This matches
+                    # MiniLLM / DistiLLM truncated-KL convention.
+                    s_topk = s_logits.gather(-1, t_topk_idx)
+                    s_log_topk = F.log_softmax(s_topk / kl_temperature, dim=-1)
+                    kl_pos = (t_prob_topk * (t_log_topk - s_log_topk)).sum(dim=-1)
+                else:
+                    s_log = F.log_softmax(s_logits / kl_temperature, dim=-1)
+                    with torch.no_grad():
+                        t_log = F.log_softmax(t_logits / kl_temperature, dim=-1)
+                        t_prob = t_log.exp()
+                    kl_pos = (t_prob * (t_log - s_log)).sum(dim=-1)
+                kl_sum = kl_sum + (kl_pos * mask_chunk).sum() * (kl_temperature ** 2)
 
             # Top-1 acc against dataset tokens (metric only; under KL-only
             # training this stays low because the model mimics trunk, not data).
@@ -209,11 +229,14 @@ def mtp_loss(
 
             # Explicitly drop chunk tensors before the next iteration so the
             # autograd graph doesn't retain them all simultaneously.
-            del s_logits, t_logits
-            if kl_top_k > 0:
-                del t_topk_vals, t_topk_idx, t_log_topk, t_prob_topk, s_topk, s_log_topk
-            else:
-                del s_log, t_log, t_prob
+            del s_logits
+            if t_logits is not None:
+                del t_logits
+            if do_kl:
+                if kl_top_k > 0:
+                    del t_topk_vals, t_topk_idx, t_log_topk, t_prob_topk, s_topk, s_log_topk
+                else:
+                    del s_log, t_log, t_prob
 
         ce = ce_sum / n_total
         kl = kl_sum / n_total
@@ -426,6 +449,8 @@ def train(cfg: TrainConfig):
 
     # ---- Tokenizer + dataset --------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, use_fast=True)
+    speech_token_offset = resolve_speech_token_offset(tokenizer)
+    log.info(f"speech_token_offset resolved from tokenizer: {speech_token_offset}")
     log.info(f"loading dataset: {cfg.dataset_path}")
     hf_ds = load_from_disk(cfg.dataset_path)
     # Drop unused columns. Keep `audio` only if `speech_tokens` is absent —
@@ -448,6 +473,7 @@ def train(cfg: TrainConfig):
         log.info(f"truncated dataset to first {cfg.max_samples} samples (overfit mode)")
 
     ds_cfg = MtpDatasetConfig(
+        speech_token_offset=speech_token_offset,
         max_total_tokens=cfg.max_total_tokens,
         max_speech_tokens=cfg.max_speech_tokens,
     )
@@ -482,6 +508,7 @@ def train(cfg: TrainConfig):
     # ---- Train loop ------------------------------------------------------
     global_step = 0
     accum_loss = 0.0
+    accum_loss_count = 0
     accum_count = 0
     t_last_log = time.perf_counter()
     tokens_since_log = 0
@@ -522,7 +549,7 @@ def train(cfg: TrainConfig):
             )
 
             # 3) Loss (chunked: lm_head applied per sequence chunk).
-            loss, per_head = mtp_loss(
+            raw_loss, per_head = mtp_loss(
                 mtp_hiddens_list=mtp_hiddens,
                 trunk_hidden=trunk_hidden,
                 lm_head=lm_head,
@@ -533,11 +560,12 @@ def train(cfg: TrainConfig):
                 depth_decay=cfg.depth_decay,
                 ce_target=cfg.ce_target,
             )
-            loss = loss / cfg.grad_accum_steps
+            loss = raw_loss / cfg.grad_accum_steps
 
             # 4) Backprop.
             loss.backward()
-            accum_loss += loss.item()
+            accum_loss += float(raw_loss.detach().item())
+            accum_loss_count += 1
             accum_count += 1
             tokens_since_log += int(speech_mask.sum().item())
 
@@ -560,19 +588,20 @@ def train(cfg: TrainConfig):
                     dt = time.perf_counter() - t_last_log
                     tps = tokens_since_log / max(dt, 1e-6)
                     lr_now = scheduler.get_last_lr()[0]
+                    avg_loss = accum_loss / max(accum_loss_count, 1)
                     head_summary = " | ".join(
                         f"k={h['k']} acc={h['acc_top1']:.3f} ce={h['ce']:.3f} kl={h['kl']:.3f}"
                         for h in per_head
                     )
                     log.info(
                         f"step={global_step}/{total_steps}  "
-                        f"loss={accum_loss:.4f}  lr={lr_now:.2e}  "
+                        f"loss={avg_loss:.4f}  lr={lr_now:.2e}  "
                         f"|grad|={grad_norm:.3f}  "
                         f"tok/s={tps:.0f}  | {head_summary}"
                     )
                     if wandb_run is not None:
                         metrics = {
-                            "train/loss": accum_loss,
+                            "train/loss": avg_loss,
                             "train/lr": lr_now,
                             "train/grad_norm": grad_norm,
                             "train/tok_per_sec": tps,
@@ -586,6 +615,7 @@ def train(cfg: TrainConfig):
                             metrics[f"head_{k}/n_positions"] = h["n"]
                         wandb_run.log(metrics, step=global_step)
                     accum_loss = 0.0
+                    accum_loss_count = 0
                     tokens_since_log = 0
                     t_last_log = time.perf_counter()
 

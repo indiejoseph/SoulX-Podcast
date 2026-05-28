@@ -111,7 +111,7 @@ def _mtp_layer_forward_seq(
     )
     if isinstance(out, tuple):
         out = out[0]
-    return out
+    return layer.final_norm(out)
 
 
 def _build_causal_mask(L: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:

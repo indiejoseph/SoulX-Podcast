@@ -215,3 +215,4 @@ __marimo__/
 tmp
 *.ipynb
 runs
+.DS_Store
