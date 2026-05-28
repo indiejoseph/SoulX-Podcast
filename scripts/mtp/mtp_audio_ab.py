@@ -119,7 +119,12 @@ def generate_baseline(model, prepared):
     wav = result["generated_wavs"][0].cpu()
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
-    return wav, t
+    # forward_longform strips trailing EOS before appending to per_turn_speech_tokens,
+    # so EOS-hit is inferred by: did we stop before max_tokens-1?
+    n_tokens = len(result["generated_speech_tokens"][0])
+    max_tok = prepared["sampling_params"].max_tokens if "sampling_params" in prepared else 3000
+    eos_hit = n_tokens < max_tok - 1
+    return wav, t, n_tokens, eos_hit
 
 
 # --- MTP path: spec decode + flow + HiFT ------------------------------------
@@ -188,9 +193,11 @@ def generate_mtp(model, mtp, prepared, sampling_params):
 
     # Extract generated speech tokens (strip the trailing EOS).
     generated_ids = result.generated_tokens[0].tolist()
-    if generated_ids and generated_ids[-1] == eos_id:
+    eos_hit_mtp = bool(generated_ids and generated_ids[-1] == eos_id)
+    if eos_hit_mtp:
         generated_ids = generated_ids[:-1]
     generated_speech_tokens = [t - cfg_off for t in generated_ids]
+    n_tokens_mtp = len(generated_speech_tokens)
 
     # --- Flow + HiFT (identical to forward_longform's per-turn synth) ---
     turn_spk = spk_ids[0]
@@ -218,21 +225,26 @@ def generate_mtp(model, mtp, prepared, sampling_params):
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
 
-    return wav.cpu(), t_llm, t_synth, result
+    return wav.cpu(), t_llm, t_synth, result, n_tokens_mtp, eos_hit_mtp
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <mtp_checkpoint.pt> [output_dir]")
-        sys.exit(1)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ckpt_path", help="MTP checkpoint .pt")
+    ap.add_argument("out_dir", nargs="?", default="outputs/mtp_audio_ab")
+    ap.add_argument("--model-path", default=MODEL_PATH,
+                    help="Trunk model dir. Must match train_config.json:model_path "
+                         "(e.g. runs/merged for the v5 run).")
+    args = ap.parse_args()
 
-    ckpt_path = sys.argv[1]
-    out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("outputs/mtp_audio_ab")
+    ckpt_path = args.ckpt_path
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[init] loading SoulXPodcast model")
+    print(f"[init] loading SoulXPodcast model from {args.model_path}")
     model, dataset_handler = initiate_model(
-        seed=42, model_path=MODEL_PATH, llm_engine="hf", fp16_flow=True,
+        seed=42, model_path=args.model_path, llm_engine="hf", fp16_flow=True,
     )
 
     print(f"[init] loading MTP checkpoint: {ckpt_path}")
@@ -258,12 +270,13 @@ def main():
         # --- Baseline ---
         print("  [baseline] running forward_longform (no MTP)...")
         try:
-            wav_base, t_base = generate_baseline(model, prepared)
+            wav_base, t_base, n_tok_base, eos_base = generate_baseline(model, prepared)
             audio_sec_base = wav_base.shape[-1] / 24000
             base_path = out_dir / f"{case_name}_baseline.wav"
             torchaudio.save(str(base_path), wav_base, 24000)
             print(f"  [baseline] {t_base:.2f}s wall, "
-                  f"{audio_sec_base:.2f}s audio, RTF={t_base/audio_sec_base:.3f}")
+                  f"{audio_sec_base:.2f}s audio, {n_tok_base} speech tokens, "
+                  f"eos_hit={eos_base}, RTF={t_base/audio_sec_base:.3f}")
             print(f"  [baseline] saved → {base_path}")
         except Exception as e:
             print(f"  [baseline] FAILED: {type(e).__name__}: {e}")
@@ -272,7 +285,7 @@ def main():
         # --- MTP ---
         print("  [mtp_spec] running spec decode (sampling)...")
         try:
-            wav_mtp, t_llm_mtp, t_synth_mtp, spec_result = generate_mtp(
+            wav_mtp, t_llm_mtp, t_synth_mtp, spec_result, n_tok_mtp, eos_mtp = generate_mtp(
                 model, mtp, prepared, sampling_params,
             )
             audio_sec_mtp = wav_mtp.shape[-1] / 24000
@@ -284,8 +297,19 @@ def main():
                   f"tok/step={spec_result.tokens_per_step:.2f})  "
                   f"synth={t_synth_mtp:.2f}s  "
                   f"total={t_total_mtp:.2f}s  "
-                  f"RTF={t_total_mtp/audio_sec_mtp:.3f}")
+                  f"{n_tok_mtp} tokens, {audio_sec_mtp:.2f}s audio, "
+                  f"eos_hit={eos_mtp}, RTF={t_total_mtp/audio_sec_mtp:.3f}")
             print(f"  [mtp_spec] saved → {mtp_path}")
+
+            # Per-case A/B report
+            tok_ratio = n_tok_mtp / max(n_tok_base, 1)
+            audio_ratio = audio_sec_mtp / max(audio_sec_base, 0.01)
+            warn = ""
+            if tok_ratio < 0.8 or audio_ratio < 0.8:
+                warn = " ⚠ MTP shorter — possible early EOS / truncation"
+            elif tok_ratio > 1.25 or audio_ratio > 1.25:
+                warn = " ⚠ MTP longer than baseline (>25%)"
+            print(f"  [report] tok_ratio={tok_ratio:.2f}  audio_ratio={audio_ratio:.2f}{warn}")
 
             # Speedup summary (LLM stage only — flow+HiFT is identical).
             speedup = t_base / t_total_mtp
@@ -296,8 +320,9 @@ def main():
             print(f"  >>> overall speedup (LLM+synth): {speedup:.2f}x")
             print(f"      accept-len histogram (1..{n_drafts}): {bucket}")
             summary_lines.append(
-                f"{case_name:>20s}  base={t_base:5.2f}s  mtp={t_total_mtp:5.2f}s  "
-                f"speedup={speedup:.2f}x  mean_accept={spec_result.mean_accept_length:.2f}"
+                f"{case_name:>18s}  base[{n_tok_base:4d}tok eos={int(eos_base)} {audio_sec_base:5.2f}s {t_base:5.2f}s]  "
+                f"mtp[{n_tok_mtp:4d}tok eos={int(eos_mtp)} {audio_sec_mtp:5.2f}s {t_total_mtp:5.2f}s]  "
+                f"spdup={speedup:.2f}x  accept={spec_result.mean_accept_length:.2f}"
             )
         except Exception as e:
             import traceback
