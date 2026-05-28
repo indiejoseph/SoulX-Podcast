@@ -216,3 +216,4 @@ tmp
 *.ipynb
 runs
 .DS_Store
+exports/*

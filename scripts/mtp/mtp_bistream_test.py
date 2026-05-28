@@ -198,21 +198,31 @@ def main():
                     help=argparse.SUPPRESS)
     ap.add_argument("--flow_steps", type=int, default=15,
                     help="Diffusion Euler steps for chunk synthesis. Lower values are latency/quality sweeps only.")
+    ap.add_argument("--trt_estimator", action="store_true",
+                    help="Swap flow.decoder.estimator for a TensorRT-fp16 engine.")
+    ap.add_argument("--trt_onnx", default=None,
+                    help="Override ONNX path. Defaults to streaming/full per --flow_streaming.")
+    ap.add_argument("--trt_plan", default=None,
+                    help="Override plan path. Defaults to matching the ONNX.")
+    ap.add_argument("--trt_opt_mel_len", type=int, default=256,
+                    help="optShape mel_len for TRT engine build (only used on first build).")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model_path = resolve_model_path(ckpt, args.base)
     flow_mode = "flowstream" if args.flow_streaming else "flowfull"
+    trt_suffix = "_trt" if args.trt_estimator else ""
     out_dir = Path(args.output_dir) if args.output_dir else (
         Path("outputs/mtp_bistream")
-        / f"first{args.first_chunk_size}_chunk{args.chunk_size}_{flow_mode}_steps{args.flow_steps}"
+        / f"first{args.first_chunk_size}_chunk{args.chunk_size}_{flow_mode}_steps{args.flow_steps}{trt_suffix}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
         f"[init] model={model_path}  ckpt={args.ckpt}  "
         f"chunk_size={args.chunk_size}  first_chunk_size={args.first_chunk_size}  "
-        f"flow_streaming={args.flow_streaming}  flow_steps={args.flow_steps}"
+        f"flow_streaming={args.flow_streaming}  flow_steps={args.flow_steps}  "
+        f"trt_estimator={args.trt_estimator}"
     )
     model, dataset = initiate_model(
         seed=198964,
@@ -220,6 +230,18 @@ def main():
         llm_engine="hf",
         fp16_flow=True,
     )
+    if args.trt_estimator:
+        from soulxpodcast.models.modules.flow_components.estimator_trt import install_trt_estimator
+        mode = "streaming" if args.flow_streaming else "full"
+        onnx_path = args.trt_onnx or f"exports/flow_runtime/flow.decoder.estimator.fp32.{mode}.onnx"
+        plan_path = args.trt_plan or f"exports/flow_runtime/flow.decoder.estimator.fp16.{mode}.plan"
+        from pathlib import Path as _P
+        install_trt_estimator(
+            model,
+            onnx_path=_P(onnx_path),
+            plan_path=_P(plan_path),
+            opt_mel_len=args.trt_opt_mel_len,
+        )
     mtp = load_mtp(ckpt, model.llm.model)
 
     inputs = podcast_format_parser(build_demo_input())
