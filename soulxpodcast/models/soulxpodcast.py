@@ -193,7 +193,7 @@ class SoulXPodcast(torch.nn.Module):
         dialect_prefix: list[list[int]] = None,
         chunk_size: int = 50,
         first_chunk_size: int | None = None,
-        flow_streaming: bool = True,
+        flow_streaming: bool = False,
         flow_steps: int = 15,
         **kwargs,
     ):

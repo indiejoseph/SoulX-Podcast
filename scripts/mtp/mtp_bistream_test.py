@@ -5,7 +5,7 @@ committed speech tokens to the flow/vocoder chunker. Use a small first chunk
 for TTFA, then larger chunks for better total wall time.
 
 Usage:
-    python scripts/mtp/mtp_bistream_test.py CKPT [chunk_size=100] [first_chunk_size=12]
+    python scripts/mtp/mtp_bistream_test.py CKPT [chunk_size=100] [first_chunk_size=12] [--flow_streaming] [--flow_steps 15]
 """
 
 from __future__ import annotations
@@ -192,24 +192,27 @@ def main():
     ap.add_argument("--output_dir", default="")
     ap.add_argument("--no_warmup", action="store_true",
                     help="Report cold TTFA including first CUDA/kernel overhead.")
-    ap.add_argument("--no_flow_streaming", action="store_true",
-                    help="Use full-context flow attention for chunks instead of chunk-masked streaming flow.")
+    ap.add_argument("--flow_streaming", action="store_true",
+                    help="Use chunk-masked flow attention for chunks. A/B audio before production use.")
+    ap.add_argument("--no_flow_streaming", action="store_false", dest="flow_streaming",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--flow_steps", type=int, default=15,
-                    help="Diffusion Euler steps for chunk synthesis. Default keeps the trained baseline.")
+                    help="Diffusion Euler steps for chunk synthesis. Lower values are latency/quality sweeps only.")
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model_path = resolve_model_path(ckpt, args.base)
+    flow_mode = "flowstream" if args.flow_streaming else "flowfull"
     out_dir = Path(args.output_dir) if args.output_dir else (
         Path("outputs/mtp_bistream")
-        / f"first{args.first_chunk_size}_chunk{args.chunk_size}"
+        / f"first{args.first_chunk_size}_chunk{args.chunk_size}_{flow_mode}_steps{args.flow_steps}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
         f"[init] model={model_path}  ckpt={args.ckpt}  "
         f"chunk_size={args.chunk_size}  first_chunk_size={args.first_chunk_size}  "
-        f"flow_streaming={not args.no_flow_streaming}  flow_steps={args.flow_steps}"
+        f"flow_streaming={args.flow_streaming}  flow_steps={args.flow_steps}"
     )
     model, dataset = initiate_model(
         seed=198964,
@@ -241,7 +244,7 @@ def main():
             sampling_params,
             eos_id,
             synth_state,
-            flow_streaming=not args.no_flow_streaming,
+            flow_streaming=args.flow_streaming,
             flow_steps=args.flow_steps,
         )
 
@@ -274,7 +277,7 @@ def main():
                 synth_state,
                 accumulated_speech_tokens,
                 finalize=False,
-                streaming=not args.no_flow_streaming,
+                streaming=args.flow_streaming,
                 flow_steps=args.flow_steps,
             )
         new_audio = wav_full[:, prev_audio_len:].detach().cpu()
@@ -301,7 +304,7 @@ def main():
             synth_state,
             accumulated_speech_tokens,
             finalize=True,
-            streaming=not args.no_flow_streaming,
+            streaming=args.flow_streaming,
             flow_steps=args.flow_steps,
         )
     final_audio = wav_full[:, prev_audio_len:].detach().cpu()

@@ -2,7 +2,8 @@
 
 This follows the CosyVoice deployment split:
   - TorchScript/JIT for the flow encoder.
-  - ONNX for flow.decoder.estimator, which can then be converted to TensorRT.
+  - fp32 ONNX for flow.decoder.estimator, which can then be converted to
+    fp16 TensorRT with trtexec --fp16.
 
 The exported estimator is the hot path inside every CFM Euler step. TensorRT
 acceleration there is the most realistic flow-side path to lower first-chunk
@@ -18,6 +19,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 import sys
 from typing import Any
@@ -111,16 +113,44 @@ def export_encoder(
     context_len: int,
     fp16: bool,
     streaming: bool,
+    skip_trace_check: bool,
 ) -> None:
     token = torch.randn(1, token_len, flow.input_size, device=device, dtype=dtype)
     token_lens = torch.tensor([token_len], device=device, dtype=torch.long)
     context = torch.randn(1, context_len, flow.input_size, device=device, dtype=dtype)
+    check_len = max(token_len + 17, 8)
+    check_context_len = max(context_len, 1)
+    check_token = torch.randn(1, check_len, flow.input_size, device=device, dtype=dtype)
+    check_lens = torch.tensor([check_len], device=device, dtype=torch.long)
+    check_context = torch.randn(
+        1,
+        check_context_len,
+        flow.input_size,
+        device=device,
+        dtype=dtype,
+    )
+    check_tolerance = 1e-2 if fp16 else 1e-5
 
-    final = EncoderFinalWrapper(flow.encoder, streaming=streaming).eval()
-    chunk = EncoderChunkWrapper(flow.encoder, streaming=streaming).eval()
+    encoder = copy.deepcopy(flow.encoder).to(device=device, dtype=dtype)
+    final = EncoderFinalWrapper(encoder, streaming=streaming).eval()
+    chunk = EncoderChunkWrapper(encoder, streaming=streaming).eval()
 
-    final_ts = torch.jit.trace(final, (token, token_lens), strict=False)
-    chunk_ts = torch.jit.trace(chunk, (token, token_lens, context), strict=False)
+    final_ts = torch.jit.trace(
+        final,
+        (token, token_lens),
+        strict=True,
+        check_trace=not skip_trace_check,
+        check_inputs=[] if skip_trace_check else [(check_token, check_lens)],
+        check_tolerance=check_tolerance,
+    )
+    chunk_ts = torch.jit.trace(
+        chunk,
+        (token, token_lens, context),
+        strict=True,
+        check_trace=not skip_trace_check,
+        check_inputs=[] if skip_trace_check else [(check_token, check_lens, check_context)],
+        check_tolerance=check_tolerance,
+    )
 
     final_path = output_dir / f"flow.encoder.final.{suffix(fp16, streaming)}.zip"
     chunk_path = output_dir / f"flow.encoder.chunk.{suffix(fp16, streaming)}.zip"
@@ -128,6 +158,10 @@ def export_encoder(
     chunk_ts.save(str(chunk_path))
     print(f"[export] encoder final: {final_path}")
     print(f"[export] encoder chunk: {chunk_path}")
+    if skip_trace_check:
+        print("[warn] skipped JIT trace validation")
+    else:
+        print(f"[check] encoder trace matched eager on alternate shape, tol={check_tolerance:g}")
 
 
 def export_estimator(
@@ -136,11 +170,12 @@ def export_estimator(
     dtype: torch.dtype,
     device: torch.device,
     mel_len: int,
-    fp16: bool,
+    onnx_fp16: bool,
     streaming: bool,
     opset: int,
 ) -> None:
-    wrapper = EstimatorWrapper(flow.decoder.estimator, streaming=streaming).eval()
+    estimator = copy.deepcopy(flow.decoder.estimator).to(device=device, dtype=dtype)
+    wrapper = EstimatorWrapper(estimator, streaming=streaming).eval()
 
     # CFG doubles the batch: conditional + unconditional.
     batch = 2
@@ -151,7 +186,7 @@ def export_estimator(
     spks = torch.randn(batch, flow.output_size, device=device, dtype=dtype)
     cond = torch.randn(batch, flow.output_size, mel_len, device=device, dtype=dtype)
 
-    onnx_path = output_dir / f"flow.decoder.estimator.{suffix(fp16, streaming)}.onnx"
+    onnx_path = output_dir / f"flow.decoder.estimator.{suffix(onnx_fp16, streaming)}.onnx"
     torch.onnx.export(
         wrapper,
         (x, mask, mu, t, spks, cond),
@@ -173,10 +208,16 @@ def export_estimator(
     print(f"[export] estimator onnx: {onnx_path}")
 
 
-def print_trtexec_hint(output_dir: Path, fp16: bool, streaming: bool, mel_len: int) -> None:
-    onnx_path = output_dir / f"flow.decoder.estimator.{suffix(fp16, streaming)}.onnx"
-    engine_path = output_dir / f"flow.decoder.estimator.{suffix(fp16, streaming)}.plan"
-    fp16_flag = " --fp16" if fp16 else ""
+def print_trtexec_hint(
+    output_dir: Path,
+    onnx_fp16: bool,
+    trt_fp16: bool,
+    streaming: bool,
+    mel_len: int,
+) -> None:
+    onnx_path = output_dir / f"flow.decoder.estimator.{suffix(onnx_fp16, streaming)}.onnx"
+    engine_path = output_dir / f"flow.decoder.estimator.{suffix(trt_fp16, streaming)}.plan"
+    fp16_flag = " --fp16" if trt_fp16 else ""
     print("\n[trt] starter command:")
     print(
         "trtexec"
@@ -194,9 +235,14 @@ def main() -> None:
     parser.add_argument("--model_path", default="runs/merged")
     parser.add_argument("--output_dir", default="exports/flow_runtime")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Export encoder JIT in fp16 and print a TensorRT fp16 build command.")
+    parser.add_argument("--onnx_fp16", action="store_true",
+                        help="Export estimator ONNX in fp16. Default is fp32; use TRT --fp16 for runtime precision.")
     parser.add_argument("--streaming", action="store_true",
                         help="Export chunk-masked streaming variants.")
+    parser.add_argument("--skip_trace_check", action="store_true",
+                        help="Skip alternate-shape eager-vs-traced encoder validation.")
     parser.add_argument("--token_len", type=int, default=128)
     parser.add_argument("--context_len", type=int, default=3)
     parser.add_argument("--mel_len", type=int, default=256)
@@ -204,32 +250,40 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    dtype = torch.float16 if args.fp16 else torch.float32
+    encoder_dtype = torch.float16 if args.fp16 else torch.float32
+    estimator_dtype = torch.float16 if args.onnx_fp16 else torch.float32
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    flow = load_flow(Path(args.model_path), device=device, fp16=args.fp16)
+    flow = load_flow(Path(args.model_path), device=device, fp16=False)
     export_encoder(
         flow,
         output_dir,
-        dtype=dtype,
+        dtype=encoder_dtype,
         device=device,
         token_len=args.token_len,
         context_len=args.context_len,
         fp16=args.fp16,
         streaming=args.streaming,
+        skip_trace_check=args.skip_trace_check,
     )
     export_estimator(
         flow,
         output_dir,
-        dtype=dtype,
+        dtype=estimator_dtype,
         device=device,
         mel_len=args.mel_len,
-        fp16=args.fp16,
+        onnx_fp16=args.onnx_fp16,
         streaming=args.streaming,
         opset=args.opset,
     )
-    print_trtexec_hint(output_dir, fp16=args.fp16, streaming=args.streaming, mel_len=args.mel_len)
+    print_trtexec_hint(
+        output_dir,
+        onnx_fp16=args.onnx_fp16,
+        trt_fp16=args.fp16,
+        streaming=args.streaming,
+        mel_len=args.mel_len,
+    )
 
 
 if __name__ == "__main__":

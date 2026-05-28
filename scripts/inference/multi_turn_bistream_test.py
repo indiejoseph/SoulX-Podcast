@@ -32,7 +32,7 @@ def main():
     model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
     chunk_size = int(sys.argv[1]) if len(sys.argv) > 1 else 100
     first_chunk_size = int(sys.argv[2]) if len(sys.argv) > 2 else 12
-    flow_streaming = bool(int(sys.argv[3])) if len(sys.argv) > 3 else True
+    flow_streaming = bool(int(sys.argv[3])) if len(sys.argv) > 3 else False
     flow_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 15
 
     print(f"[init] loading model (hf engine, chunk_size={chunk_size}, "
@@ -72,7 +72,11 @@ def main():
         inputs["use_dialect_prompt"], inputs["dialect_prompt_text"],
     )
 
-    out_dir = Path("outputs/bistream_multiturn") / f"first{first_chunk_size}_chunk{chunk_size}"
+    flow_mode = "flowstream" if flow_streaming else "flowfull"
+    out_dir = (
+        Path("outputs/bistream_multiturn")
+        / f"first{first_chunk_size}_chunk{chunk_size}_{flow_mode}_steps{flow_steps}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-turn state for TTFA measurement and per-turn wav assembly.
