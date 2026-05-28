@@ -83,6 +83,10 @@ def mtp_loss(
     kl_temperature: float = 1.0,
     kl_top_k: int = 0,                      # 0 = full-vocab KL; >0 = top-K KL distillation
     depth_decay: float = 0.5,
+    ce_target: str = "data",                # "data" = next-token from dataset;
+                                            # "trunk_argmax" = teacher argmax (richer
+                                            # hard-label distillation — directly
+                                            # optimizes spec-decode acceptance)
     loss_chunk_size: int = 256,             # chunk along seq to bound peak memory
 ):
     """Memory-efficient MTP loss.
@@ -141,7 +145,15 @@ def mtp_loss(
             with torch.no_grad():
                 t_logits = lm_head(trunk_h_slice[:, start:end])  # [B, chunk, V]
 
-            target_chunk = target_ids[:, start:end]
+            if ce_target == "trunk_argmax":
+                # Teacher's argmax as the CE pseudo-label. Richer than the raw
+                # data label (trunk has integrated context and committed to its
+                # top choice) and directly optimizes the spec-decode metric
+                # (student.argmax == trunk.argmax).
+                with torch.no_grad():
+                    target_chunk = t_logits.argmax(dim=-1)
+            else:
+                target_chunk = target_ids[:, start:end]
 
             # CE (fused log_softmax + nll, memory-efficient).
             ce_pos = F.cross_entropy(
@@ -244,6 +256,7 @@ class TrainConfig:
     kl_temperature: float = 1.0
     kl_top_k: int = 0                      # 0 = full-vocab KL; >0 = top-K KL distillation
     depth_decay: float = 0.5
+    ce_target: str = "data"                # "data" or "trunk_argmax" (see mtp_loss)
     num_mtp_layers: int = 3
     max_total_tokens: int = 2048
     max_speech_tokens: int = 750           # drop clips with >this many speech tokens (~30s @ 25Hz)
@@ -283,6 +296,10 @@ def parse_args() -> TrainConfig:
                         "(MiniLLM-style). 0 = full-vocab KL. Recommended: 100-200 "
                         "to match inference top_k.")
     p.add_argument("--depth_decay", type=float, default=0.5)
+    p.add_argument("--ce_target", choices=["data", "trunk_argmax"], default="data",
+                   help="CE label source: 'data' (next-token from dataset) or "
+                        "'trunk_argmax' (teacher argmax pseudo-label — better for "
+                        "spec-decode acceptance).")
     p.add_argument("--num_mtp_layers", type=int, default=3)
     p.add_argument("--max_total_tokens", type=int, default=2048)
     p.add_argument("--max_speech_tokens", type=int, default=750)
@@ -514,6 +531,7 @@ def train(cfg: TrainConfig):
                 ce_weight=cfg.ce_weight, kl_weight=cfg.kl_weight,
                 kl_temperature=cfg.kl_temperature, kl_top_k=cfg.kl_top_k,
                 depth_decay=cfg.depth_decay,
+                ce_target=cfg.ce_target,
             )
             loss = loss / cfg.grad_accum_steps
 

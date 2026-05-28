@@ -109,6 +109,7 @@ class SoulXPodcast(torch.nn.Module):
                 history_inputs.append(prompt_text_tokens_for_llm[i] + speech_tokens_i )
 
         generated_wavs, results_dict = [], {}
+        per_turn_speech_tokens: list[list[int]] = []  # captured for diagnostics
         
         # LLM generation
         inputs = list(chain.from_iterable(prompt_inputs))
@@ -141,6 +142,7 @@ class SoulXPodcast(torch.nn.Module):
             # Prepare Flow inputs
             turn_spk = spk_ids[i]
             generated_speech_tokens = [token - self.config.hf_config.speech_token_offset for token in  llm_outputs['token_ids'][:-1]]  # ignore last eos
+            per_turn_speech_tokens.append(generated_speech_tokens)
             prompt_speech_token = prompt_speech_tokens[turn_spk].tolist()
             flow_input = torch.tensor([prompt_speech_token + generated_speech_tokens])
             flow_inputs_len = torch.tensor([len(prompt_speech_token) + len(generated_speech_tokens)])
@@ -166,6 +168,7 @@ class SoulXPodcast(torch.nn.Module):
 
         # Save the generated wav;
         results_dict['generated_wavs'] = generated_wavs
+        results_dict['generated_speech_tokens'] = per_turn_speech_tokens
         return results_dict
 
     # ------------------------------------------------------------------ #

@@ -99,7 +99,27 @@ class VLLMEngine:
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         os.environ["VLLM_USE_V1"] = "0"
         if SUPPORT_VLLM:
-            self.model = LLM(model=model, enforce_eager=True, dtype="bfloat16", max_model_len=8192, enable_prefix_caching=True,)
+            # Auto-detect AWQ / other quantization from the model's config.json.
+            # vLLM 0.10.1 needs explicit `quantization=` kwarg even when the
+            # config has the marker, so we read it ourselves and pass through.
+            llm_kwargs = dict(
+                model=model, enforce_eager=True,
+                dtype="bfloat16", max_model_len=8192,
+                enable_prefix_caching=True,
+            )
+            import json as _json
+            cfg_path = os.path.join(model, "config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as _f:
+                    _cfg = _json.load(_f)
+                qcfg = _cfg.get("quantization_config")
+                if qcfg and qcfg.get("quant_method"):
+                    qmethod = qcfg["quant_method"]
+                    # Prefer the faster Marlin kernel for AWQ on supported GPUs.
+                    llm_kwargs["quantization"] = "awq_marlin" if qmethod == "awq" else qmethod
+                    # AWQ packs in fp16, not bf16 — vLLM requires matching dtype.
+                    llm_kwargs["dtype"] = "float16"
+            self.model = LLM(**llm_kwargs)
         else:
             raise ImportError("Not Support VLLM now!!!")
         self.config = config

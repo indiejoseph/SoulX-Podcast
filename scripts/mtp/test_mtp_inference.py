@@ -39,7 +39,7 @@ from soulxpodcast.training.mtp_inference import (
 from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 
 
-MODEL_PATH = "pretrained_models/SoulX-Podcast-1.7B-dialect"
+MODEL_PATH = "pretrained_models/SoulX-Podcast-1.7B-dialect-avg"
 DATASET_PATH = "/notebooks/projects/SoulX-Podcast/tmp/dataset_small_with_tokens"
 
 
