@@ -139,13 +139,18 @@ def _ras_sample_hf_engine(
         # pre-process distribution
         next_token_scores = logits_processor(input_ids, next_token_logits)
 
-        # Repetition Aware Sampling in VALL-E 2
+        # Repetition Aware Sampling in VALL-E 2.
+        # Candidate is sampled once; reused when no repetition reset is needed so
+        # we avoid a second multinomial draw that would change the distribution.
+        ras_candidate = None
         if use_ras:
             probs_candidate = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens_candidate = torch.multinomial(probs_candidate, num_samples=1).squeeze(1)
-            rep_num = (input_ids[:,-win_size:] == next_tokens_candidate).sum().item() + 1
+            ras_candidate = torch.multinomial(probs_candidate, num_samples=1).squeeze(1)
+            rep_num = (input_ids[:,-win_size:] == ras_candidate).sum().item() + 1
             if rep_num >= win_size * tau_r:
+                # Repetition detected — reset to raw logits and resample.
                 next_token_scores = next_token_logits
+                ras_candidate = None
 
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate:
@@ -168,7 +173,10 @@ def _ras_sample_hf_engine(
                 )
 
         # token selection
-        if do_sample:
+        if ras_candidate is not None:
+            # No repetition reset — reuse the candidate to avoid double-sampling.
+            next_tokens = ras_candidate
+        elif do_sample:
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)

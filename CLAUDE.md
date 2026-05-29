@@ -57,7 +57,9 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 
 5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimises TTFA, chunk=150 minimises wall. Per-chunk flow overhead is roughly constant, so fewer chunks → less total overhead. Default of 100 balances both.
 
-6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150. The next meaningful RTF win is TRT_ESTIMATOR=true (TensorRT for flow estimator inference).
+6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150.
+
+7. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
 
 ## Implications for PLAN.md phases
 

@@ -73,6 +73,12 @@ class APIConfig:
     stream_first_chunk_size: int = int(os.getenv("STREAM_FIRST_CHUNK_SIZE", "4"))
     flow_streaming: bool = os.getenv("FLOW_STREAMING", "true").lower() == "true"
     flow_steps: int = int(os.getenv("FLOW_STEPS", "8"))
+    # vLLM execution mode. enforce_eager=True disables CUDA graphs (safe but slower).
+    # Set VLLM_ENFORCE_EAGER=false to enable CUDA graphs — ~5-10% wall speedup on
+    # repeated requests but adds ~25s cold-start compilation cost on first request.
+    # No effect when LLM_ENGINE=hf or when MTP is enabled (MTP forces hf engine).
+    enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", True)
+
     trt_estimator: bool = os.getenv("TRT_ESTIMATOR", "false").lower() == "true"
     trt_onnx: str = os.getenv("TRT_ONNX", "")
     trt_plan: str = os.getenv("TRT_PLAN", "")
