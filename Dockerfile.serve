@@ -50,12 +50,14 @@ RUN groupadd --system app && \
     chown -R app:app /app
 
 ENV MODEL_PATH=/app/runs/merged \
-    LLM_ENGINE=hf \
+    LLM_ENGINE=vllm \
+    VLLM_ENFORCE_EAGER=false \
     FP16_FLOW=true \
-    ENABLE_MTP=true \
+    ENABLE_MTP=false \
     FLOW_STREAMING=true \
-    FLOW_STEPS=8 \
-    STREAM_CHUNK_SIZE=100 \
+    FLOW_STEPS=4 \
+    FLOW_CHUNK_CACHE=true \
+    STREAM_CHUNK_SIZE=150 \
     STREAM_FIRST_CHUNK_SIZE=4 \
     PROMPT_AUDIO_ROOT=/app \
     PROMPT_CACHE_SIZE=16 \

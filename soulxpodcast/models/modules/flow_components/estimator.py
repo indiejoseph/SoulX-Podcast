@@ -32,41 +32,32 @@ def _self_attention_with_kv_cache(
     attention_mask: Optional[torch.Tensor],
     cache: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run diffusers self-attention while appending cached K/V state."""
-    residual = hidden_states
-    spatial_norm = getattr(attn, "spatial_norm", None)
-    if spatial_norm is not None:
-        hidden_states = spatial_norm(hidden_states, None)
+    """Run diffusers self-attention while appending cached K/V state.
 
-    input_ndim = hidden_states.ndim
-    if input_ndim == 4:
-        batch_size, channel, height, width = hidden_states.shape
-        hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
-
-    batch_size = hidden_states.shape[0]
+    Cache layout: ``[B, prev_seq_len, head_dim*heads, 2]`` where the last dim
+    indexes (key, value). The returned cache contains the **accumulated** K/V
+    (past + current); callers persist it back unchanged for the next chunk.
+    This matches the existing SoulX conformer cache contract in
+    ``MultiHeadedAttention.forward`` (cache stores accumulated K/V).
+    """
+    batch_size, q_len, _ = hidden_states.shape
     if attention_mask is not None and attention_mask.ndim == 3:
         attention_mask = attention_mask.unsqueeze(dim=1).repeat(1, attn.heads, 1, 1)
-
-    group_norm = getattr(attn, "group_norm", None)
-    if group_norm is not None:
-        hidden_states = group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
     query = attn.to_q(hidden_states)
     key_current = attn.to_k(hidden_states)
     value_current = attn.to_v(hidden_states)
 
     if cache.size(0) != 0:
-        key_cache = cache[:, :, :, 0]
-        value_cache = cache[:, :, :, 1]
-        key = torch.concat([key_cache, key_current], dim=1)
-        value = torch.concat([value_cache, value_current], dim=1)
+        key = torch.concat([cache[:, :, :, 0], key_current], dim=1)
+        value = torch.concat([cache[:, :, :, 1], value_current], dim=1)
     else:
         key, value = key_current, value_current
     new_cache = torch.stack([key, value], dim=3)
 
     inner_dim = key.shape[-1]
     head_dim = inner_dim // attn.heads
-    query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    query = query.view(batch_size, q_len, attn.heads, head_dim).transpose(1, 2)
     key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
     value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
@@ -78,17 +69,11 @@ def _self_attention_with_kv_cache(
         dropout_p=0.0,
         is_causal=False,
     )
-    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, q_len, attn.heads * head_dim)
     hidden_states = hidden_states.to(query.dtype)
 
     hidden_states = attn.to_out[0](hidden_states)
     hidden_states = attn.to_out[1](hidden_states)
-
-    if input_ndim == 4:
-        hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
-    if getattr(attn, "residual_connection", False):
-        hidden_states = hidden_states + residual
-    hidden_states = hidden_states / getattr(attn, "rescale_output_factor", 1.0)
     return hidden_states, new_cache
 
 

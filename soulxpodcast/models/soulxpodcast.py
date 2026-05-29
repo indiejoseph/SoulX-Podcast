@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 
@@ -380,13 +381,22 @@ class SoulXPodcast(torch.nn.Module):
             accumulated_speech_tokens = []
             prev_audio_len = 0
             chunk_idx = 0
-            import os
+            # FLOW_CHUNK_CACHE=1 enables the experimental cached-flow path
+            # (see flow.py:forward_chunk_cached). It is approximate vs. the
+            # default streaming=True path because per-chunk attention uses an
+            # all-ones mask rather than the static-chunk-mask used at training;
+            # we keep this path opt-in until quality has been validated.
             use_flow_chunk_cache = (
                 flow_streaming
                 and os.getenv("FLOW_CHUNK_CACHE", "").lower() in {"1", "true", "yes", "on"}
             )
             flow_cache = None
             flow_processed_tokens = 0
+            # HiFT is bandwidth-bound and per-call wall time is roughly flat
+            # across mel length (CLAUDE.md), so re-running it on the full
+            # accumulated mel each chunk costs ~0.05s/call regardless. Adding
+            # HiFT caching would target the smallest share of the per-call
+            # budget; skip it until flow caching itself is verified.
             cached_mel_chunks = []
             # Low first_chunk_size is only useful for turn 0 (user is waiting for
             # first audio). For later turns the previous turn's audio is already
@@ -506,7 +516,6 @@ class SoulXPodcast(torch.nn.Module):
                              streaming: bool, flow_steps: int):
         """Run flow+HiFT on (prompt_speech_tokens + generated_speech_tokens).
         Returns the full waveform; caller slices off already-emitted portion."""
-        import os
         _time_stages = os.getenv("PROFILE_FLOW_STAGES")
         device = prompt_mel.device
         flow_input = torch.tensor(
@@ -542,7 +551,6 @@ class SoulXPodcast(torch.nn.Module):
                                        prompt_mel_len_t, spk_emb, flow_cache,
                                        flow_steps: int):
         """Run cache-aware Flow on only the newly processable speech tokens."""
-        import os
         _time_stages = os.getenv("PROFILE_FLOW_STAGES")
         device = prompt_mel.device
         first_chunk = flow_cache is None or not flow_cache.get("started", False)
