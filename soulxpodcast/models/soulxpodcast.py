@@ -380,10 +380,15 @@ class SoulXPodcast(torch.nn.Module):
             accumulated_speech_tokens = []
             prev_audio_len = 0
             chunk_idx = 0
+            # Low first_chunk_size is only useful for turn 0 (user is waiting for
+            # first audio). For later turns the previous turn's audio is already
+            # playing, so a tiny first chunk just wastes a full Flow call (~0.23s)
+            # to emit ~40 ms of audio.
+            effective_first_chunk_size = first_chunk_size if turn_i == 0 else chunk_size
             try:
                 for chunk in streamer.iter_chunks(
                     chunk_size=chunk_size,
-                    first_chunk_size=first_chunk_size,
+                    first_chunk_size=effective_first_chunk_size,
                 ):
                     cur_speech_tokens = [t - self.config.hf_config.speech_token_offset for t in chunk]
                     accumulated_speech_tokens.extend(cur_speech_tokens)
