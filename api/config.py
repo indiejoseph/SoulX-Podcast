@@ -80,6 +80,10 @@ class APIConfig:
     trt_plan: str = os.getenv("TRT_PLAN", "")
     trt_opt_mel_len: int = int(os.getenv("TRT_OPT_MEL_LEN", "256"))
 
+    # torch.compile optimisation for flow estimator + HiFT vocoder.
+    # First inference triggers JIT compilation (~30-60s); warmup runs at startup.
+    torch_compile: bool = _env_bool("TORCH_COMPILE", False)
+
     # Service configuration
     host: str = os.getenv("API_HOST", "0.0.0.0")
     port: int = int(os.getenv("API_PORT", "8000"))

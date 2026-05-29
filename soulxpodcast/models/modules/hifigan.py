@@ -22,12 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import get_window
 from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm
-
 try:
     from torch.nn.utils.parametrizations import weight_norm
+    from torch.nn.utils.parametrize import remove_parametrizations as _remove_param
+    def remove_weight_norm(module):
+        _remove_param(module, 'weight', leave_parametrized=True)
 except ImportError:
     from torch.nn.utils import weight_norm  # noqa
+    from torch.nn.utils import remove_weight_norm  # noqa
 
 from soulxpodcast.models.modules.hifigan_components.layers import (
     ResBlock, SourceModuleHnNSF, SourceModuleHnNSF2, init_weights)
@@ -171,16 +173,14 @@ class HiFTGenerator(nn.Module):
         self.f0_predictor = ConvRNNF0Predictor() if f0_predictor is None else f0_predictor
 
     def remove_weight_norm(self):
-        print('Removing weight norm...')
         for up in self.ups:
             remove_weight_norm(up)
         for resblock in self.resblocks:
             resblock.remove_weight_norm()
         remove_weight_norm(self.conv_pre)
         remove_weight_norm(self.conv_post)
-        self.m_source.remove_weight_norm()
-        for source_down in self.source_downs:
-            remove_weight_norm(source_down)
+        # source_downs are plain Conv1d (no weight_norm); m_source is SourceModuleHnNSF2
+        # (also no weight_norm) — skip both.
         for source_resblock in self.source_resblocks:
             source_resblock.remove_weight_norm()
 

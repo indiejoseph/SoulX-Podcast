@@ -83,10 +83,33 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 
 9. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
 
+11. **`TORCH_COMPILE=true` is NOT beneficial (makes things slower).** `torch.compile(flow.decoder.estimator, mode="default", dynamic=True)` hits two blockers in PyTorch 2.7.1: (a) Inductor bounds analysis crashes on a `torch.bool` tensor of symbolic shape `[s5, s3, s3]` from the streaming attention mask (`TypeError: Invalid NaN comparison`); (b) `LoRACompatibleLinear.attn1.processor` object-identity guards cause 127+ Dynamo recompilations per request until the 128-recompile limit is hit and the estimator permanently falls back to eager. Net result: run-1 RTF ≈ 10 (compilation cost), run-2+ RTF ≈ 0.56 (eager fallback, worse than no-compile 0.486). Root cause: the estimator is only ~5% of total flow+HiFT time (~0.1s of 2.2s), so even a perfect 2× speedup would save 0.05s. Not worth fighting compiler bugs. `TORCH_COMPILE` is set to `false` in both compose files.
+
+## Phase 0 inference optimization — exhausted
+
+All practical vLLM/inference-level speedups have been tried. Summary:
+
+| Optimization | Outcome | Active? |
+|---|---|---|
+| vLLM CUDA graphs (`ENFORCE_EAGER=false`) | RTF 0.90 → 0.42 | ✅ yes |
+| FLOW_STEPS 8→4 | RTF 0.42 → 0.37 | ✅ yes |
+| Dual CUDA streams (B3) | ~7% wall improvement | ✅ always on |
+| MTP removed | No regression, simpler | ✅ done |
+| TRT_ESTIMATOR | Slower (RTF 1.02 vs 0.90) | ❌ disabled |
+| TORCH_COMPILE | Slower (compiler bugs, 128 recompilations) | ❌ disabled |
+| RESTRICT_SPEECH_VOCAB | ~1.5% HF-only, backbone dominates | ❌ disabled |
+| Flow state cache | Multi-day refactor, audio quality risk | ❌ not attempted |
+| FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
+
+**Structural ceiling:** flow+HiFT is the bottleneck at ~2.2s/call. HiFT accounts for ~82% of that, encoder ~9%, ODE steps ~9%. None of these are cheaply optimizable without model architecture changes.
+
+**Current best:** RTF=0.374 (long, ~30s audio) / RTF=0.486 (short, ~6s audio), TTFA=0.65s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+
 ## Implications for PLAN.md phases
 
-- **Phase 0 is essentially exhausted on the inference side.** Remaining wins (real flow state cache) fight the architecture for diminishing returns.
-- **The path to real-time podcast generation goes through the LLM.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both target the LLM directly. Both require retraining/fine-tuning.
+- **Phase 0 inference optimization is complete.** The RTF=0.374 ceiling is structural — it requires changing the model, not the runtime.
+- **The path to lower RTF goes through reducing flow+HiFT calls or making them cheaper.** Larger chunk sizes (>150) reduce call count at the cost of higher TTFA. Architecture changes (smaller vocoder, fewer mel frames) would be more impactful.
+- **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
 

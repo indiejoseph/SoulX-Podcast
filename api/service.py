@@ -125,6 +125,10 @@ class SoulXPodcastService:
             if api_config.trt_estimator:
                 self._install_trt_estimator()
 
+            if api_config.torch_compile:
+                self.model.compile_for_inference()
+                self.model.warmup_compiled()
+
             logger.info(f"Model loaded successfully with {api_config.llm_engine} engine!")
 
         except Exception as e:
