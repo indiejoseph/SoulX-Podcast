@@ -25,29 +25,32 @@ Measured via `scripts/inference/inference_test.py`, `scripts/inference/bistream_
 | bi-stream chunk=50, dual CUDA streams (B3) | 2.80s | 14.3s | 0.94 | B3 always active in forward_longform_streaming |
 | bi-stream chunk=150, single stream | 5.52s | 11.9s | 0.78 | best wall, modest TTFA |
 
-### API streaming via Docker (HF + MTP, dual CUDA streams)
+### API streaming via Docker (dual CUDA streams always active)
 
 Measured via `scripts/inference/bench_stream.py` against `/generate-stream` endpoint. RTX 3090, Docker `tts:latest`, `vllm/vllm-openai:v0.10.1` base. B3 dual streams always active.
 
-Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~31s audio).
+Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~30s audio).
 
-| chunk\_size | first\_chunk | Dialogue | TTFA | Wall | RTF | Notes |
-|------------|-------------|----------|------|------|-----|-------|
-| 50 | 4 | short | 1.32s | 8.38s | 1.332 | most TTFA variance |
-| 100 | 4 | short | **0.95s** | 7.36s | 1.219 | server default |
-| 150 | 4 | short | 0.94s | 7.62s | 1.197 | marginal gain on short audio |
-| **150** | **4** | **long** | **0.97s** | **28.56s** | **0.904** | **RTF < 1 on realistic content** |
-| 150 (vLLM) | 4 | long | 1.17s¹ | 28.28s | 0.904 | no RTF gain over HF with MTP |
+| Engine | MTP | CUDA graphs | chunk | Dialogue | TTFA | Wall | RTF | Notes |
+|--------|-----|------------|-------|----------|------|------|-----|-------|
+| HF | on | n/a | 50 | short | 1.32s | 8.38s | 1.332 | |
+| HF | on | n/a | 100 | short | 0.95s | 7.36s | 1.219 | |
+| HF | on | n/a | 150 | short | 0.94s | 7.62s | 1.197 | |
+| HF | on | n/a | 150 | long | 0.97s | 28.56s | 0.904 | old best |
+| vLLM | off | off (eager) | 150 | long | 1.17s¹ | 28.28s | 0.904 | same as HF+MTP |
+| **vLLM** | **off** | **on** | **100** | **short** | **0.88s** | **4.53s** | **0.680** | **RTF < 1 even on short** |
+| **vLLM** | **off** | **on** | **150** | **long** | **0.86s²** | **12.56s** | **🏆 0.418** | **new best** |
 
-¹ vLLM cold-start TTFA on first request ~2s; warm runs match HF.
+¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
+² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** with MTP enabled, HF and vLLM have identical RTF — the bottleneck is flow+HiFT, not token generation. HF is preferred (no cold-start TTFA penalty). RTF < 1 requires realistic-length content (~30s) to amortise per-chunk flow overhead.
+**Key finding:** vLLM with CUDA graphs (`VLLM_ENFORCE_EAGER=false`) is **2.2× faster** than HF+MTP (RTF 0.418 vs 0.904). CUDA graphs eliminate per-step Python/CUDA overhead, making vLLM's LLM throughput so high that flow+HiFT is now the bottleneck. MTP + HF cannot beat this on total wall time. The prior vLLM A/B tests were all hampered by `enforce_eager=True` being hardcoded — they never tested real CUDA-graph mode.
 
-## Key findings — bottleneck has shifted to flow+HiFT with MTP
+## Key findings — vLLM CUDA graphs dominate; flow+HiFT is the new bottleneck
 
-**With MTP enabled, the flow+HiFT stack dominates wall time.** Without MTP the LLM (~38 tok/s) was the bottleneck; MTP multiplies effective throughput so the per-chunk diffusion overhead (~1s fixed cost per flow call) is now the binding constraint.
+**vLLM with CUDA graphs (`VLLM_ENFORCE_EAGER=false`) is the dominant mode.** The LLM runs so fast under CUDA graphs that flow+HiFT is the new bottleneck, same as MTP but 2.2× cheaper to achieve.
 
-1. **vLLM gives only ~22% on multi-turn, ~2% on single-turn without MTP.** With MTP, HF and vLLM are identical in RTF — the LLM is no longer the bottleneck. HF is preferred: no cold-start penalty (~25s CUDA graph compilation for vLLM), same RTF.
+1. **`VLLM_ENFORCE_EAGER=false` is the key unlock.** All prior vLLM tests had `enforce_eager=True` hardcoded in service.py — they tested vLLM eager mode, not CUDA-graph mode. With graphs enabled, vLLM (no MTP) achieves RTF=0.418 vs HF+MTP RTF=0.904. MTP is no longer needed for RTF < 1.
 
 2. **Bi-streaming reduces TTFA dramatically (3.5×) but adds 7-50% total-wall regression** depending on chunk size. The regression is from per-chunk diffusion overhead (~1s fixed cost per flow call) compounding across chunks.
 
@@ -56,6 +59,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 4. **Separate CUDA streams (B3) give ~7% wall improvement** by letting LLM and flow overlap on the GPU. Win is modest because both are memory-bandwidth bound on the 3090. B3 is always active in `forward_longform_streaming` — no action needed. Would scale better on H100/H200.
 
 5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimises TTFA, chunk=150 minimises wall. Per-chunk flow overhead is roughly constant, so fewer chunks → less total overhead. Default of 100 balances both.
+
+6. **MTP is now optional** — it helps HF-engine RTF (from ~0.9 to ~0.9 on long content), but vLLM+CUDA graphs already achieves RTF=0.418 without MTP. MTP cannot be combined with vLLM (service enforces HF engine when MTP_CHECKPOINT is set).
 
 6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150.
 
