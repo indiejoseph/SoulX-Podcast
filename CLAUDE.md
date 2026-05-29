@@ -12,7 +12,9 @@ For full architecture details read `.claude/skills/soulx-model/SKILL.md` and `re
 
 ## Performance baselines (RTX 3090, 24 GB, bf16)
 
-Measured via `scripts/inference/inference_test.py`, `scripts/inference/bistream_test.py`, `scripts/inference/multi_turn_bistream_test.py`:
+### Direct model calls (no HTTP overhead)
+
+Measured via `scripts/inference/inference_test.py`, `scripts/inference/bistream_test.py`, `scripts/inference/multi_turn_bistream_test.py`. Dialogue: 4-turn Cantonese dialect.
 
 | Mode | TTFA | Total wall | RTF | Notes |
 |------|------|-----------|-----|-------|
@@ -20,22 +22,42 @@ Measured via `scripts/inference/inference_test.py`, `scripts/inference/bistream_
 | HF one-shot, 4-turn dialect | — | 48.6s | 1.02 | full multi-turn baseline |
 | vLLM one-shot, 4-turn | — | 44.7s | 0.79 | ~22% faster than HF on multi-turn |
 | bi-stream chunk=50, single CUDA stream | 2.93s | 15.4s | 1.01 | 3.5× faster TTFA |
-| **bi-stream chunk=50, dual CUDA streams (B3)** | **2.80s** | **14.3s** | **0.94** | current best for low TTFA |
+| bi-stream chunk=50, dual CUDA streams (B3) | 2.80s | 14.3s | 0.94 | B3 always active in forward_longform_streaming |
 | bi-stream chunk=150, single stream | 5.52s | 11.9s | 0.78 | best wall, modest TTFA |
 
-## Key findings — the LLM is the bottleneck
+### API streaming via Docker (HF + MTP, dual CUDA streams)
 
-**The 1.7B Qwen3 LLM is the dominant cost at ~38 tok/s on a 3090** (memory-bandwidth bound, not compute bound). Everything else is downstream:
+Measured via `scripts/inference/bench_stream.py` against `/generate-stream` endpoint. RTX 3090, Docker `tts:latest`, `vllm/vllm-openai:v0.10.1` base. B3 dual streams always active.
 
-1. **vLLM gives only ~22% on multi-turn, ~2% on single-turn.** KV reuse helps as context grows. Cold start ~25s from CUDA graph compilation.
+Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~31s audio).
+
+| chunk\_size | first\_chunk | Dialogue | TTFA | Wall | RTF | Notes |
+|------------|-------------|----------|------|------|-----|-------|
+| 50 | 4 | short | 1.32s | 8.38s | 1.332 | most TTFA variance |
+| 100 | 4 | short | **0.95s** | 7.36s | 1.219 | server default |
+| 150 | 4 | short | 0.94s | 7.62s | 1.197 | marginal gain on short audio |
+| **150** | **4** | **long** | **0.97s** | **28.56s** | **0.904** | **RTF < 1 on realistic content** |
+| 150 (vLLM) | 4 | long | 1.17s¹ | 28.28s | 0.904 | no RTF gain over HF with MTP |
+
+¹ vLLM cold-start TTFA on first request ~2s; warm runs match HF.
+
+**Key finding:** with MTP enabled, HF and vLLM have identical RTF — the bottleneck is flow+HiFT, not token generation. HF is preferred (no cold-start TTFA penalty). RTF < 1 requires realistic-length content (~30s) to amortise per-chunk flow overhead.
+
+## Key findings — bottleneck has shifted to flow+HiFT with MTP
+
+**With MTP enabled, the flow+HiFT stack dominates wall time.** Without MTP the LLM (~38 tok/s) was the bottleneck; MTP multiplies effective throughput so the per-chunk diffusion overhead (~1s fixed cost per flow call) is now the binding constraint.
+
+1. **vLLM gives only ~22% on multi-turn, ~2% on single-turn without MTP.** With MTP, HF and vLLM are identical in RTF — the LLM is no longer the bottleneck. HF is preferred: no cold-start penalty (~25s CUDA graph compilation for vLLM), same RTF.
 
 2. **Bi-streaming reduces TTFA dramatically (3.5×) but adds 7-50% total-wall regression** depending on chunk size. The regression is from per-chunk diffusion overhead (~1s fixed cost per flow call) compounding across chunks.
 
-3. **The flow architecture has no inter-call state cache.** The existing `streaming=True` flag only enables chunk-masked attention within a single call. Building true incremental streaming requires modifying `flow.py` + `flow_components/estimator.py` to add encoder KV cache + decoder feature cache + `solve_euler` state — a multi-day refactor with audio-quality risk that fights the architecture. Not worth it given the LLM bottleneck.
+3. **The flow architecture has no inter-call state cache.** The existing `streaming=True` flag only enables chunk-masked attention within a single call. Building true incremental streaming requires modifying `flow.py` + `flow_components/estimator.py` to add encoder KV cache + decoder feature cache + `solve_euler` state — a multi-day refactor with audio-quality risk. Not worth it given the flow call count is already minimised by large chunk sizes.
 
-4. **Separate CUDA streams (B3) give ~7% wall improvement** by letting LLM and flow overlap on the GPU. Win is modest because both are memory-bandwidth bound on the 3090. Would scale better on H100/H200.
+4. **Separate CUDA streams (B3) give ~7% wall improvement** by letting LLM and flow overlap on the GPU. Win is modest because both are memory-bandwidth bound on the 3090. B3 is always active in `forward_longform_streaming` — no action needed. Would scale better on H100/H200.
 
-5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimizes TTFA, chunk=150 minimizes wall. Per-chunk flow overhead is roughly constant, so fewer chunks → less total overhead.
+5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimises TTFA, chunk=150 minimises wall. Per-chunk flow overhead is roughly constant, so fewer chunks → less total overhead. Default of 100 balances both.
+
+6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150. The next meaningful RTF win is TRT_ESTIMATOR=true (TensorRT for flow estimator inference).
 
 ## Implications for PLAN.md phases
 
@@ -58,13 +80,18 @@ Measured via `scripts/inference/inference_test.py`, `scripts/inference/bistream_
 
 ## File map
 
-- `soulxpodcast/models/soulxpodcast.py` — main model. `forward_longform` (batch) + `forward_longform_streaming` (generator, bi-stream).
+- `soulxpodcast/models/soulxpodcast.py` — main model. `forward_longform` (batch) + `forward_longform_streaming` (generator, bi-stream, B3 dual streams always active).
 - `soulxpodcast/engine/llm_engine.py` — `HFLLMEngine` (with streamer hook) + `VLLMEngine`.
 - `soulxpodcast/utils/streaming.py` — `SpeechTokenStreamer` + `run_llm_in_thread` (supports `cuda_stream=` for B3).
 - `soulxpodcast/utils/infer_utils.py` — `initiate_model`, `process_single_input`.
 - `soulxpodcast/utils/parser.py` — `podcast_format_parser` (user dict → internal format).
 - `soulxpodcast/models/modules/flow.py` — `CausalMaskedDiffWithXvec` (encoder + CFM decoder).
 - `soulxpodcast/models/modules/hifigan.py` — `HiFTGenerator` vocoder.
+- `api/main.py` — FastAPI app. `/generate` (sync), `/generate-stream` (chunked streaming, accepts `chunk_size`/`first_chunk_size` per-request), `/generate-async` (Redis task queue), `/task/{id}`, `/download/{filename}`.
+- `api/service.py` — `SoulXPodcastService`. `generate_speech_podcast` (one-shot) + `stream_speech_podcast` (streaming generator).
+- `Dockerfile.serve` — production image (`vllm/vllm-openai:v0.10.1` base, RAS-patched vLLM, `python3 run_api.py` entrypoint).
+- `docker-compose.yml` — production stack (tts + redis). GPU reservation via `deploy.resources`.
+- `docker-compose.dev.yml` — local dev overlay: exposes Redis, mounts external model paths, symlink resolution volume, overrides `REDIS_URL`/`MODEL_PATH`/`MTP_CHECKPOINT`.
 
 ## Scripts layout
 
@@ -78,6 +105,7 @@ All dev scripts live under `scripts/` (organized by topic). Each has a small
     - `bistream_test.py` — single-turn bi-streaming with per-chunk wavs.
     - `multi_turn_bistream_test.py` — full 4-turn Cantonese dialect dialogue with speaker switching.
     - `profile_latency.py` — per-stage latency profiling.
+    - `bench_stream.py` — HTTP API streaming benchmark (TTFA/wall/RTF); `--chunk N`, `--first-chunk N`, `--long` flags.
 - `scripts/lora/` — LoRA sweep, averaging, and tests
     - `lora_sweep.py` — generate audio for every adapter checkpoint via `set_adapter()` (no merge).
     - `lora_average.py` — element-wise weighted average of N adapter `.safetensors` (incl. `lm_head` from `modules_to_save`).
