@@ -125,6 +125,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    vllm_speculative_config: str = ""
     hf_config: SoulXPodcastLLMConfig | AutoConfig = field(default_factory=SoulXPodcastLLMConfig)
     eos: int = -1
     llm_engine: str = "hf" # support hf, nano-vllm

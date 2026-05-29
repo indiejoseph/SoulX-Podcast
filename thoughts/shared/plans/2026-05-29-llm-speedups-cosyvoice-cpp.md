@@ -109,6 +109,30 @@ This helps TTFA and repeated same-speaker API calls, but it does not solve decod
 
 Next real speedup path is MTP/speculative decoding, because it reduces the number of Qwen backbone steps. Non-MTP sampler optimizations should not be expected to beat the backbone bottleneck.
 
+### Phase 7: vLLM P-EAGLE Experiment
+
+**Goal:** Test a vLLM-native multi-token predictor without coupling serving to the
+current HF-only Sequential MTP implementation.
+
+**Implementation status on `experiment/vllm-peagle-speculator`:**
+- `Config.vllm_speculative_config` carries an opt-in vLLM `speculative_config`
+  JSON object or JSON file path.
+- API and Docker expose `VLLM_SPECULATIVE_CONFIG`.
+- Benchmark scripts accept `--vllm-speculative-config`.
+- `VLLM_USE_V1` is now overridable instead of being forcibly reset after env
+  setup, which lets newer vLLM/speculators runtimes opt into V1 if required.
+- `scripts/peagle/` contains helpers for support checks and config generation.
+- `scripts/peagle/prepare_soulx_dataset.py` converts SoulX `text`,
+  `speech_tokens`, and `lang` rows into Speculators Arrow data with
+  `input_ids`, `loss_mask`, and `seq_len`.
+- `scripts/peagle/train_soulx_peagle.py` wraps the upstream Speculators
+  launch, hidden-state generation, P-EAGLE train, and config-writing stages.
+
+**Caveat:** the default patched vLLM `0.10.1` runtime is still the production
+runtime for RAS and is not expected to support P-EAGLE. This experiment requires
+a separate newer vLLM/speculators environment plus a trained SoulX speech-token
+P-EAGLE checkpoint.
+
 ## Verification Commands
 
 Use the project environment from `AGENTS.md`:
@@ -118,6 +142,23 @@ conda deactivate || true
 source .venv/bin/activate
 python -m py_compile soulxpodcast/config.py soulxpodcast/engine/llm_engine.py soulxpodcast/models/modules/sampler.py soulxpodcast/utils/infer_utils.py api/config.py api/service.py scripts/inference/profile_latency.py scripts/inference/inference_test.py
 git diff --check
+```
+
+P-EAGLE plumbing:
+
+```bash
+python -m py_compile scripts/peagle/check_vllm_speculative_support.py scripts/peagle/write_speculative_config.py
+python -m py_compile scripts/peagle/prepare_soulx_dataset.py scripts/peagle/train_soulx_peagle.py
+
+python scripts/peagle/write_speculative_config.py \
+  --speculator-model /path/to/peagle/checkpoints/checkpoint_best \
+  --num-speculative-tokens 3 \
+  --output exports/peagle/speculative_config.json
+
+python scripts/inference/inference_test.py vllm \
+  --vllm-speculative-config exports/peagle/speculative_config.json \
+  --no-dialect-prompt \
+  --json-output outputs/bench/inference_vllm_peagle.json
 ```
 
 Benchmark sequence:

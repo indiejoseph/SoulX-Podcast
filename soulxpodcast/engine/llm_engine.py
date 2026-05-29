@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import types
 import atexit
+import inspect
+import json
 import queue
 import threading
 import uuid
@@ -15,8 +17,10 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteriaList
 from transformers import EosTokenCriteria, RepetitionPenaltyLogitsProcessor
 
-# SoulX-Podcast relies on the patched vLLM 0.10.1 V0 sampler for RAS fields.
-os.environ["VLLM_USE_V1"] = "0"
+# SoulX-Podcast relies on the patched vLLM 0.10.1 V0 sampler for RAS fields by
+# default. Keep this overridable so experimental newer vLLM runtimes can opt in
+# to V1/speculative decoding with VLLM_USE_V1=1.
+os.environ.setdefault("VLLM_USE_V1", "0")
 try:    
     from vllm import EngineArgs, LLMEngine
     from vllm import SamplingParams as VllmSamplingParams
@@ -35,6 +39,57 @@ _VLLM_BASE_FIELDS = frozenset({
 })
 # Extra fields from the Soul-AILab RAS patch (vllm@v0.10.1.1-soulxpodcast).
 _VLLM_RAS_FIELDS = frozenset({"use_ras", "win_size", "tau_r"})
+
+
+def _load_json_value_or_path(value: str, *, name: str) -> dict:
+    value = value.strip()
+    if not value:
+        return {}
+    if value[0] in "[{":
+        parsed = json.loads(value)
+    else:
+        with open(value, "r", encoding="utf-8") as f:
+            parsed = json.load(f)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object or a path to a JSON object")
+    return parsed
+
+
+def _make_vllm_engine_args(engine_kwargs: dict, *, speculative_requested: bool) -> EngineArgs:
+    """Build EngineArgs while producing a useful error for unsupported P-EAGLE."""
+    try:
+        signature = inspect.signature(EngineArgs)
+    except (TypeError, ValueError):
+        accepted = set()
+    else:
+        has_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+        accepted = set() if has_var_kwargs else set(signature.parameters)
+
+    if accepted:
+        unsupported = sorted(k for k in engine_kwargs if k not in accepted)
+        if unsupported:
+            if speculative_requested and "speculative_config" in unsupported:
+                raise RuntimeError(
+                    "VLLM_SPECULATIVE_CONFIG was set, but the installed vLLM "
+                    "EngineArgs does not support speculative_config. P-EAGLE "
+                    "requires a newer vLLM/speculators runtime than the default "
+                    "patched vLLM 0.10.1 image."
+                )
+            engine_kwargs = {k: v for k, v in engine_kwargs.items() if k not in unsupported}
+
+    try:
+        return EngineArgs(**engine_kwargs)
+    except TypeError as exc:
+        if speculative_requested and "speculative" in str(exc):
+            raise RuntimeError(
+                "VLLM_SPECULATIVE_CONFIG was set, but this vLLM build rejected "
+                "the speculative decoding arguments. Use a vLLM/speculators "
+                "runtime with P-EAGLE support."
+            ) from exc
+        raise
 
 class HFLLMEngine:
 
@@ -126,11 +181,10 @@ class VLLMEngine:
                 tensor_parallel_size=config.tensor_parallel_size,
                 enable_prefix_caching=True,
             )
-            import json as _json
             cfg_path = os.path.join(model, "config.json")
             if os.path.exists(cfg_path):
                 with open(cfg_path) as _f:
-                    _cfg = _json.load(_f)
+                    _cfg = json.load(_f)
                 qcfg = _cfg.get("quantization_config")
                 if qcfg and qcfg.get("quant_method"):
                     qmethod = qcfg["quant_method"]
@@ -138,7 +192,18 @@ class VLLMEngine:
                     engine_kwargs["quantization"] = "awq_marlin" if qmethod == "awq" else qmethod
                     # AWQ packs in fp16, not bf16 — vLLM requires matching dtype.
                     engine_kwargs["dtype"] = "float16"
-            self.model = LLMEngine.from_engine_args(EngineArgs(**engine_kwargs))
+            speculative_requested = bool(config.vllm_speculative_config.strip())
+            if speculative_requested:
+                engine_kwargs["speculative_config"] = _load_json_value_or_path(
+                    config.vllm_speculative_config,
+                    name="VLLM_SPECULATIVE_CONFIG",
+                )
+            self.model = LLMEngine.from_engine_args(
+                _make_vllm_engine_args(
+                    engine_kwargs,
+                    speculative_requested=speculative_requested,
+                )
+            )
         else:
             raise ImportError("Not Support VLLM now!!!")
         self.config = config

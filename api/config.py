@@ -30,6 +30,7 @@ class APIConfig:
     )
     llm_engine: str = os.getenv("LLM_ENGINE", "hf")  # hf or vllm
     vllm_enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", False)
+    vllm_speculative_config: str = os.getenv("VLLM_SPECULATIVE_CONFIG", "").strip()
     hf_prompt_prefix_cache: bool = _env_bool("HF_PROMPT_PREFIX_CACHE", False)
 
     def validate_llm_engine(self):
@@ -38,6 +39,10 @@ class APIConfig:
             import logging
             logging.warning("MTP serving requires direct HF trunk access; forcing LLM_ENGINE=hf")
             self.llm_engine = "hf"
+
+        if self.vllm_speculative_config and self.llm_engine != "vllm":
+            import logging
+            logging.warning("VLLM_SPECULATIVE_CONFIG is ignored unless LLM_ENGINE=vllm")
 
         if self.llm_engine not in ["hf", "vllm"]:
             raise ValueError(f"Invalid llm_engine: {self.llm_engine}. Must be 'hf' or 'vllm'")

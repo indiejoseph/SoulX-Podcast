@@ -30,6 +30,7 @@ def run_engine(
     fp16_flow: bool = True,
     max_new_tokens: int | None = None,
     vllm_enforce_eager: bool = False,
+    vllm_speculative_config: str = "",
 ):
     """Run a single dialogue through the model with the given LLM engine."""
     from soulxpodcast.utils.infer_utils import process_single_input, initiate_model
@@ -46,6 +47,7 @@ def run_engine(
         llm_engine,
         fp16_flow,
         enforce_eager=vllm_enforce_eager,
+        vllm_speculative_config=vllm_speculative_config,
     )
     t_load = time.perf_counter() - t_load_start
     print(f"[engine={llm_engine}]  load time: {t_load:.2f}s")
@@ -93,6 +95,7 @@ def run_engine(
         "num_turns": len(wavs),
         "max_new_tokens": max_new_tokens,
         "vllm_enforce_eager": vllm_enforce_eager,
+        "vllm_speculative_config": vllm_speculative_config,
     }
 
 
@@ -105,6 +108,11 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=None)
     ap.add_argument("--no-dialect-prompt", action="store_true")
     ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument(
+        "--vllm-speculative-config",
+        default="",
+        help="Experimental vLLM speculative_config JSON string or JSON file path, e.g. a trained P-EAGLE config.",
+    )
     ap.add_argument("--json-output", default=None)
     args = ap.parse_args()
 
@@ -150,6 +158,7 @@ def main():
                 seed=args.seed,
                 max_new_tokens=args.max_new_tokens,
                 vllm_enforce_eager=args.vllm_enforce_eager,
+                vllm_speculative_config=args.vllm_speculative_config,
             )
             results.append(r)
         except Exception as e:

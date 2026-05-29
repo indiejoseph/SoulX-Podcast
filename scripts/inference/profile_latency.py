@@ -20,6 +20,11 @@ def profile():
     ap.add_argument("--seed", type=int, default=198964)
     ap.add_argument("--max-new-tokens", type=int, default=None)
     ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument(
+        "--vllm-speculative-config",
+        default="",
+        help="Experimental vLLM speculative_config JSON string or JSON file path, e.g. a trained P-EAGLE config.",
+    )
     ap.add_argument("--json-output", default=None)
     args = ap.parse_args()
 
@@ -39,6 +44,7 @@ def profile():
         llm_engine=args.engine,
         fp16_flow=True,
         enforce_eager=args.vllm_enforce_eager,
+        vllm_speculative_config=args.vllm_speculative_config,
     )
     print(f"[Profiler] Model loaded in {time.time() - load_start:.2f}s")
     
@@ -141,6 +147,7 @@ def profile():
     summary = {
         "engine": args.engine,
         "vllm_enforce_eager": args.vllm_enforce_eager,
+        "vllm_speculative_config": args.vllm_speculative_config,
         "total_audio_sec": total_audio_length_sec,
         "frontend_time_sec": frontend_time,
         "total_time_sec": total_time,

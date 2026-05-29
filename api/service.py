@@ -109,6 +109,7 @@ class SoulXPodcastService:
             model_config = Config(
                 model=api_config.model_path,
                 enforce_eager=api_config.vllm_enforce_eager,
+                vllm_speculative_config=api_config.vllm_speculative_config,
                 llm_engine=api_config.llm_engine,
                 hf_config=hf_config
             )

@@ -20,6 +20,7 @@ def initiate_model(
     fp16_flow,
     *,
     enforce_eager=False,
+    vllm_speculative_config="",
 ):
     set_all_random_seed(seed)
     
@@ -34,7 +35,13 @@ def initiate_model(
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
             tqdm.write(f"[{timestamp}] - [WARNING]: No install VLLM, switch to hf engine.")
 
-    config = Config(model=model_path, enforce_eager=enforce_eager, llm_engine=llm_engine, hf_config=hf_config)
+    config = Config(
+        model=model_path,
+        enforce_eager=enforce_eager,
+        vllm_speculative_config=vllm_speculative_config,
+        llm_engine=llm_engine,
+        hf_config=hf_config,
+    )
     model = SoulXPodcast(config)
 
     dataset = PodcastInferHandler(model.llm.tokenizer, None, config)
