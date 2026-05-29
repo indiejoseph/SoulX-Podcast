@@ -59,8 +59,7 @@ class HFLLMEngine:
     ) -> dict:
 
         stopping_criteria = StoppingCriteriaList([EosTokenCriteria(eos_token_id=self.config.hf_config.eos_token_id)])
-        use_custom_sampler = sampling_param.use_ras or sampling_param.restrict_speech_vocab
-        if use_custom_sampler:
+        if sampling_param.use_ras:
             # HF's generate() drops `streamer` from the kwargs it forwards to a
             # custom_generate callable (it filters to keys unique to the custom
             # function, and `streamer` is shared with the built-in `_sample`).
@@ -69,10 +68,6 @@ class HFLLMEngine:
                 use_ras=sampling_param.use_ras,
                 win_size=sampling_param.win_size,
                 tau_r=sampling_param.tau_r,
-                restrict_speech_vocab=sampling_param.restrict_speech_vocab,
-                speech_token_offset=self.config.hf_config.speech_token_offset,
-                speech_vocab_size=sampling_param.speech_vocab_size,
-                speech_eos_token_id=self.config.hf_config.eos_token_id,
             )
             if streamer is not None:
                 handler_kwargs["streamer"] = streamer

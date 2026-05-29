@@ -29,9 +29,7 @@ def run_engine(
     seed: int = 198964,
     fp16_flow: bool = True,
     max_new_tokens: int | None = None,
-    restrict_speech_vocab: bool = False,
-    speech_vocab_size: int = 6561,
-    vllm_enforce_eager: bool = True,
+    vllm_enforce_eager: bool = False,
 ):
     """Run a single dialogue through the model with the given LLM engine."""
     from soulxpodcast.utils.infer_utils import process_single_input, initiate_model
@@ -60,8 +58,6 @@ def run_engine(
         inputs["prompt_text"],
         inputs["use_dialect_prompt"],
         inputs["dialect_prompt_text"],
-        restrict_speech_vocab=restrict_speech_vocab,
-        speech_vocab_size=speech_vocab_size,
     )
     if max_new_tokens is not None:
         prepared["sampling_params"].max_tokens = max_new_tokens
@@ -96,8 +92,6 @@ def run_engine(
         "rtf": round(t_infer / total_audio_sec, 3),
         "num_turns": len(wavs),
         "max_new_tokens": max_new_tokens,
-        "restrict_speech_vocab": restrict_speech_vocab,
-        "speech_vocab_size": speech_vocab_size,
         "vllm_enforce_eager": vllm_enforce_eager,
     }
 
@@ -110,9 +104,7 @@ def main():
     ap.add_argument("--seed", type=int, default=198964)
     ap.add_argument("--max-new-tokens", type=int, default=None)
     ap.add_argument("--no-dialect-prompt", action="store_true")
-    ap.add_argument("--restrict-speech-vocab", action="store_true")
-    ap.add_argument("--speech-vocab-size", type=int, default=6561)
-    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--json-output", default=None)
     args = ap.parse_args()
 
@@ -157,8 +149,6 @@ def main():
                 data,
                 seed=args.seed,
                 max_new_tokens=args.max_new_tokens,
-                restrict_speech_vocab=args.restrict_speech_vocab,
-                speech_vocab_size=args.speech_vocab_size,
                 vllm_enforce_eager=args.vllm_enforce_eager,
             )
             results.append(r)
