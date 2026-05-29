@@ -29,6 +29,10 @@ class APIConfig:
         "pretrained_models/SoulX-Podcast-1.7B"
     )
     llm_engine: str = os.getenv("LLM_ENGINE", "hf")  # hf or vllm
+    vllm_enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", False)
+    restrict_speech_vocab: bool = _env_bool("RESTRICT_SPEECH_VOCAB", False)
+    speech_vocab_size: int = int(os.getenv("SPEECH_VOCAB_SIZE", "6561"))
+    hf_prompt_prefix_cache: bool = _env_bool("HF_PROMPT_PREFIX_CACHE", False)
 
     def validate_llm_engine(self):
         """Validate LLM engine configuration."""

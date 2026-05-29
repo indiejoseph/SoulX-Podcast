@@ -116,6 +116,10 @@ class SamplingParams:
     use_ras: bool = True
     win_size: int = 25
     tau_r: float = 0.2
+    # Experimental HF-only sampler path. Disabled by default to preserve
+    # current generation behavior unless explicitly benchmarked.
+    restrict_speech_vocab: bool = False
+    speech_vocab_size: int = 6561
 
 
 @dataclass

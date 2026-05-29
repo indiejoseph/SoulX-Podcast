@@ -13,7 +13,14 @@ from soulxpodcast.utils.commons import set_all_random_seed
 from soulxpodcast.config import Config, SoulXPodcastLLMConfig, SamplingParams
 
 
-def initiate_model(seed, model_path, llm_engine, fp16_flow):
+def initiate_model(
+    seed,
+    model_path,
+    llm_engine,
+    fp16_flow,
+    *,
+    enforce_eager=True,
+):
     set_all_random_seed(seed)
     
     hf_config = SoulXPodcastLLMConfig.from_initial_and_json(
@@ -27,7 +34,7 @@ def initiate_model(seed, model_path, llm_engine, fp16_flow):
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
             tqdm.write(f"[{timestamp}] - [WARNING]: No install VLLM, switch to hf engine.")
 
-    config = Config(model=model_path, enforce_eager=True, llm_engine=llm_engine, hf_config=hf_config)
+    config = Config(model=model_path, enforce_eager=enforce_eager, llm_engine=llm_engine, hf_config=hf_config)
     model = SoulXPodcast(config)
 
     dataset = PodcastInferHandler(model.llm.tokenizer, None, config)
@@ -35,7 +42,17 @@ def initiate_model(seed, model_path, llm_engine, fp16_flow):
     return model, dataset
 
 
-def process_single_input(dataset, target_text_list, prompt_wav_list, prompt_text_list, use_dialect_prompt, dialect_prompt_text_list):
+def process_single_input(
+    dataset,
+    target_text_list,
+    prompt_wav_list,
+    prompt_text_list,
+    use_dialect_prompt,
+    dialect_prompt_text_list,
+    *,
+    restrict_speech_vocab=False,
+    speech_vocab_size=6561,
+):
     spks, texts = [], []
     for target_text in target_text_list:
         pattern = r'(\[S[1-9]\])(.+)'
@@ -65,7 +82,13 @@ def process_single_input(dataset, target_text_list, prompt_wav_list, prompt_text
     text_tokens_for_llm = data["text_tokens"]
     prompt_text_tokens_for_llm = data["prompt_text_tokens"]
     spk_ids = data["spks_list"]
-    sampling_params = SamplingParams(use_ras=True,win_size=25,tau_r=0.2)
+    sampling_params = SamplingParams(
+        use_ras=True,
+        win_size=25,
+        tau_r=0.2,
+        restrict_speech_vocab=restrict_speech_vocab,
+        speech_vocab_size=speech_vocab_size,
+    )
     infos = [data["info"]]
     processed_data = {
         "prompt_mels_for_llm": prompt_mels_for_llm,

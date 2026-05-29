@@ -4,6 +4,8 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 import os
 import time
+import json
+import argparse
 from pathlib import Path
 import torch
 from transformers import RepetitionPenaltyLogitsProcessor
@@ -12,17 +14,34 @@ from soulxpodcast.utils.parser import podcast_format_parser
 from soulxpodcast.utils.infer_utils import process_single_input, initiate_model
 
 def profile():
-    seed = 198964
-    model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-path", default="pretrained_models/SoulX-Podcast-1.7B-dialect")
+    ap.add_argument("--engine", choices=["hf", "vllm"], default="hf")
+    ap.add_argument("--seed", type=int, default=198964)
+    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--restrict-speech-vocab", action="store_true")
+    ap.add_argument("--speech-vocab-size", type=int, default=6561)
+    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--json-output", default=None)
+    args = ap.parse_args()
+
+    seed = args.seed
+    model_path = args.model_path
     
     # Verify model directory exists
     if not os.path.exists(model_path):
         print(f"[Error] Model path {model_path} not found.")
         return
 
-    print("[Profiler] Loading model (hf engine)...")
+    print(f"[Profiler] Loading model ({args.engine} engine)...")
     load_start = time.time()
-    model, dataset = initiate_model(seed, model_path, llm_engine="hf", fp16_flow=True)
+    model, dataset = initiate_model(
+        seed,
+        model_path,
+        llm_engine=args.engine,
+        fp16_flow=True,
+        enforce_eager=args.vllm_enforce_eager,
+    )
     print(f"[Profiler] Model loaded in {time.time() - load_start:.2f}s")
     
     S1_PROMPT_WAV = Path("example/audios/female_mandarin.wav")
@@ -50,7 +69,11 @@ def profile():
         inputs['prompt_text'],
         inputs['use_dialect_prompt'],
         inputs['dialect_prompt_text'],
+        restrict_speech_vocab=args.restrict_speech_vocab,
+        speech_vocab_size=args.speech_vocab_size,
     )
+    if args.max_new_tokens is not None:
+        processed_data["sampling_params"].max_tokens = args.max_new_tokens
     frontend_time = time.time() - frontend_t0
     
     # Profiling variables
@@ -118,6 +141,18 @@ def profile():
     print(f"Frontend Preprocessing : {frontend_time:.3f} s  <-- (Text norm, Spk Embed, Mel)")
     print(f"Total Inference Time   : {total_time:.3f} s")
     print(f"Overall RTF            : {total_time / total_audio_length_sec:.3f}")
+    print(f"Sampler Mode           : restrict_speech_vocab={processed_data['sampling_params'].restrict_speech_vocab}")
+    print(f"vLLM Enforce Eager     : {args.vllm_enforce_eager}")
+    summary = {
+        "engine": args.engine,
+        "vllm_enforce_eager": args.vllm_enforce_eager,
+        "restrict_speech_vocab": processed_data["sampling_params"].restrict_speech_vocab,
+        "speech_vocab_size": processed_data["sampling_params"].speech_vocab_size,
+        "total_audio_sec": total_audio_length_sec,
+        "frontend_time_sec": frontend_time,
+        "total_time_sec": total_time,
+        "rtf": total_time / total_audio_length_sec,
+    }
     
     if len(llm_times) > 0:
         print("\n--- LLM Stage ---")
@@ -131,17 +166,31 @@ def profile():
         print(f"Tokens Generated       : {tot_tokens}")
         print(f"Decode Speed (tok/s)   : {tot_tokens / decode_time if decode_time > 0 else 0:.2f} tok/s")
         print(f"LLM RTF                : {tot_llm / total_audio_length_sec:.3f}")
+        summary["llm"] = {
+            "total_sec": tot_llm,
+            "avg_ttft_sec": tot_ttft / len(llm_times),
+            "avg_decode_sec": decode_time / len(llm_times),
+            "tokens": tot_tokens,
+            "decode_tok_s": tot_tokens / decode_time if decode_time > 0 else 0,
+            "rtf": tot_llm / total_audio_length_sec,
+        }
     
     if len(flow_times) > 0:
         print("\n--- Flow (Diffusion) Stage ---")
         print(f"Total Flow Time        : {sum(flow_times):.3f} s")
         print(f"Flow RTF               : {sum(flow_times) / total_audio_length_sec:.3f}")
+        summary["flow"] = {"total_sec": sum(flow_times), "rtf": sum(flow_times) / total_audio_length_sec}
         
     if len(hift_times) > 0:
         print("\n--- Vocoder (HiFT) Stage ---")
         print(f"Total HiFT Time        : {sum(hift_times):.3f} s")
         print(f"HiFT RTF               : {sum(hift_times) / total_audio_length_sec:.3f}")
+        summary["hift"] = {"total_sec": sum(hift_times), "rtf": sum(hift_times) / total_audio_length_sec}
     print("="*50 + "\n")
+    if args.json_output:
+        out_path = Path(args.json_output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
 
 if __name__ == '__main__':
     profile()
