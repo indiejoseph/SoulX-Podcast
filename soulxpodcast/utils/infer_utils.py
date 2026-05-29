@@ -19,7 +19,7 @@ def initiate_model(
     llm_engine,
     fp16_flow,
     *,
-    enforce_eager=True,
+    enforce_eager=False,
 ):
     set_all_random_seed(seed)
     
@@ -49,9 +49,6 @@ def process_single_input(
     prompt_text_list,
     use_dialect_prompt,
     dialect_prompt_text_list,
-    *,
-    restrict_speech_vocab=False,
-    speech_vocab_size=6561,
 ):
     spks, texts = [], []
     for target_text in target_text_list:
@@ -86,8 +83,6 @@ def process_single_input(
         use_ras=True,
         win_size=25,
         tau_r=0.2,
-        restrict_speech_vocab=restrict_speech_vocab,
-        speech_vocab_size=speech_vocab_size,
     )
     infos = [data["info"]]
     processed_data = {

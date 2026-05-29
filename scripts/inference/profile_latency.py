@@ -19,9 +19,7 @@ def profile():
     ap.add_argument("--engine", choices=["hf", "vllm"], default="hf")
     ap.add_argument("--seed", type=int, default=198964)
     ap.add_argument("--max-new-tokens", type=int, default=None)
-    ap.add_argument("--restrict-speech-vocab", action="store_true")
-    ap.add_argument("--speech-vocab-size", type=int, default=6561)
-    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--json-output", default=None)
     args = ap.parse_args()
 
@@ -69,8 +67,6 @@ def profile():
         inputs['prompt_text'],
         inputs['use_dialect_prompt'],
         inputs['dialect_prompt_text'],
-        restrict_speech_vocab=args.restrict_speech_vocab,
-        speech_vocab_size=args.speech_vocab_size,
     )
     if args.max_new_tokens is not None:
         processed_data["sampling_params"].max_tokens = args.max_new_tokens
@@ -141,13 +137,10 @@ def profile():
     print(f"Frontend Preprocessing : {frontend_time:.3f} s  <-- (Text norm, Spk Embed, Mel)")
     print(f"Total Inference Time   : {total_time:.3f} s")
     print(f"Overall RTF            : {total_time / total_audio_length_sec:.3f}")
-    print(f"Sampler Mode           : restrict_speech_vocab={processed_data['sampling_params'].restrict_speech_vocab}")
     print(f"vLLM Enforce Eager     : {args.vllm_enforce_eager}")
     summary = {
         "engine": args.engine,
         "vllm_enforce_eager": args.vllm_enforce_eager,
-        "restrict_speech_vocab": processed_data["sampling_params"].restrict_speech_vocab,
-        "speech_vocab_size": processed_data["sampling_params"].speech_vocab_size,
         "total_audio_sec": total_audio_length_sec,
         "frontend_time_sec": frontend_time,
         "total_time_sec": total_time,

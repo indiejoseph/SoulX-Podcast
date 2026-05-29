@@ -257,8 +257,6 @@ class SoulXPodcastService:
                     use_ras=True,
                     win_size=25,
                     tau_r=0.2,
-                    restrict_speech_vocab=api_config.restrict_speech_vocab,
-                    speech_vocab_size=api_config.speech_vocab_size,
                 )
 
                 infos = [data["info"]]
@@ -772,8 +770,6 @@ class SoulXPodcastService:
             use_ras=True,
             win_size=25,
             tau_r=0.2,
-            restrict_speech_vocab=api_config.restrict_speech_vocab,
-            speech_vocab_size=api_config.speech_vocab_size,
         )
         return prepared
 
