@@ -29,6 +29,8 @@ class APIConfig:
         "pretrained_models/SoulX-Podcast-1.7B"
     )
     llm_engine: str = os.getenv("LLM_ENGINE", "hf")  # hf or vllm
+    vllm_enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", False)
+    hf_prompt_prefix_cache: bool = _env_bool("HF_PROMPT_PREFIX_CACHE", False)
 
     def validate_llm_engine(self):
         """Validate LLM engine configuration."""
@@ -73,16 +75,14 @@ class APIConfig:
     stream_first_chunk_size: int = int(os.getenv("STREAM_FIRST_CHUNK_SIZE", "4"))
     flow_streaming: bool = os.getenv("FLOW_STREAMING", "true").lower() == "true"
     flow_steps: int = int(os.getenv("FLOW_STEPS", "8"))
-    # vLLM execution mode. enforce_eager=True disables CUDA graphs (safe but slower).
-    # Set VLLM_ENFORCE_EAGER=false to enable CUDA graphs — ~5-10% wall speedup on
-    # repeated requests but adds ~25s cold-start compilation cost on first request.
-    # No effect when LLM_ENGINE=hf or when MTP is enabled (MTP forces hf engine).
-    enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", True)
-
     trt_estimator: bool = os.getenv("TRT_ESTIMATOR", "false").lower() == "true"
     trt_onnx: str = os.getenv("TRT_ONNX", "")
     trt_plan: str = os.getenv("TRT_PLAN", "")
     trt_opt_mel_len: int = int(os.getenv("TRT_OPT_MEL_LEN", "256"))
+
+    # torch.compile optimisation for flow estimator + HiFT vocoder.
+    # First inference triggers JIT compilation (~30-60s); warmup runs at startup.
+    torch_compile: bool = _env_bool("TORCH_COMPILE", False)
 
     # Service configuration
     host: str = os.getenv("API_HOST", "0.0.0.0")

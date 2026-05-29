@@ -5,12 +5,14 @@ import torch
 import torch.nn as nn
 from torch.distributions.uniform import Uniform
 from torch.nn import Conv1d
-from torch.nn.utils import remove_weight_norm
-
 try:
     from torch.nn.utils.parametrizations import weight_norm
+    from torch.nn.utils.parametrize import remove_parametrizations as _remove_param
+    def remove_weight_norm(module):
+        _remove_param(module, 'weight', leave_parametrized=True)
 except ImportError:
     from torch.nn.utils import weight_norm  # noqa
+    from torch.nn.utils import remove_weight_norm  # noqa
 
 
 def get_padding(kernel_size, dilation=1):

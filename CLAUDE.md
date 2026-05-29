@@ -31,20 +31,33 @@ Measured via `scripts/inference/bench_stream.py` against `/generate-stream` endp
 
 Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~30s audio).
 
-| Engine | MTP | CUDA graphs | chunk | Dialogue | TTFA | Wall | RTF | Notes |
-|--------|-----|------------|-------|----------|------|------|-----|-------|
-| HF | on | n/a | 50 | short | 1.32s | 8.38s | 1.332 | |
-| HF | on | n/a | 100 | short | 0.95s | 7.36s | 1.219 | |
-| HF | on | n/a | 150 | short | 0.94s | 7.62s | 1.197 | |
-| HF | on | n/a | 150 | long | 0.97s | 28.56s | 0.904 | old best |
-| vLLM | off | off (eager) | 150 | long | 1.17s¹ | 28.28s | 0.904 | same as HF+MTP |
-| **vLLM** | **off** | **on** | **100** | **short** | **0.88s** | **4.53s** | **0.680** | **RTF < 1 even on short** |
-| **vLLM** | **off** | **on** | **150** | **long** | **0.86s²** | **12.56s** | **🏆 0.418** | **new best** |
+| Engine | MTP | CUDA graphs | flow steps | chunk | Dialogue | TTFA | Wall | RTF | Notes |
+|--------|-----|------------|-----------|-------|----------|------|------|-----|-------|
+| HF | on | n/a | 8 | 50 | short | 1.32s | 8.38s | 1.332 | |
+| HF | on | n/a | 8 | 100 | short | 0.95s | 7.36s | 1.219 | |
+| HF | on | n/a | 8 | 150 | short | 0.94s | 7.62s | 1.197 | |
+| HF | on | n/a | 8 | 150 | long | 0.97s | 28.56s | 0.904 | |
+| vLLM | off | off (eager) | 8 | 150 | long | 1.17s¹ | 28.28s | 0.904 | same as HF+MTP |
+| vLLM | off | on | 8 | 100 | short | 0.88s | 4.53s | 0.680 | RTF < 1 on short |
+| vLLM | off | on | 8 | 150 | long | 0.86s² | 12.56s | 0.418 | |
+| vLLM | off | on | 4 | 150 | short | 0.65s | 3.27s | 0.486 | |
+| **vLLM** | **off** | **on** | **4** | **150** | **long** | **0.65s²** | **11.83s** | **🏆 0.374** | **current best** |
 
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** vLLM with CUDA graphs (`VLLM_ENFORCE_EAGER=false`) is **2.2× faster** than HF+MTP (RTF 0.418 vs 0.904). CUDA graphs eliminate per-step Python/CUDA overhead, making vLLM's LLM throughput so high that flow+HiFT is now the bottleneck. MTP + HF cannot beat this on total wall time. The prior vLLM A/B tests were all hampered by `enforce_eager=True` being hardcoded — they never tested real CUDA-graph mode.
+**Key finding:** vLLM CUDA graphs + FLOW_STEPS=4 is the dominant configuration. RTF=0.374 on long content (2.7× real-time), RTF=0.486 on short (~6s audio). Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+
+### Inference runtime comparison summary
+
+| Configuration | Long RTF | Short RTF | TTFA | Bottleneck |
+|--------------|---------|---------|------|-----------|
+| HF + MTP, 8 steps | 0.904 | ~1.2 | ~0.97s | LLM (HF decode) |
+| vLLM eager, 8 steps | 0.904 | ~1.2 | ~1.17s | LLM (no CUDA graphs) |
+| vLLM CUDA graphs, 8 steps | 0.418 | 0.680 | 0.86s | flow+HiFT |
+| **vLLM CUDA graphs, 4 steps** | **0.374** | **0.486** | **0.65s** | **flow+HiFT (fixed overhead)** |
+
+**Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
 ## Key findings — vLLM CUDA graphs dominate; flow+HiFT is the new bottleneck
 
@@ -62,14 +75,41 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 
 6. **MTP is now optional** — it helps HF-engine RTF (from ~0.9 to ~0.9 on long content), but vLLM+CUDA graphs already achieves RTF=0.418 without MTP. MTP cannot be combined with vLLM (service enforces HF engine when MTP_CHECKPOINT is set).
 
-6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150.
+7. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~0.49 (vLLM CUDA graphs, 4 steps) to ~1.2 (HF). Long dialogues (~30s) reach RTF ~0.90 (HF) or 0.374 (vLLM CUDA graphs, 4 steps).
 
-7. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
+10. **FLOW_STEPS=4 gives ~11% RTF improvement over 8 steps** with no audible quality difference on the test dialogue. Audio quality was A/B checked — both 19s samples identical in content. Halving steps saves only ~0.10s/call on warm flow calls (4% per-call improvement) because flow time is dominated by fixed per-call overhead (encoder, vocoder), not ODE step count. Reducing steps further would give negligible gain. `FLOW_STEPS=4` is now the recommended default.
+
+8. **Restricted speech-vocab sampler (RESTRICT_SPEECH_VOCAB) gives ~1.5% HF speedup — not worth it.** Measured: ~0.56ms/token saving on the lm_head projection (160K→6561 vocab), totalling ~420ms on a 30s dialogue. This is unmeasurable noise relative to backbone computation (~35ms/token). Root cause: Qwen3-1.7B is memory-bandwidth bound; the backbone FFN/attention dominates, not the lm_head. `RESTRICT_SPEECH_VOCAB` is disabled by default.
+
+9. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
+
+11. **`TORCH_COMPILE=true` is NOT beneficial (makes things slower).** `torch.compile(flow.decoder.estimator, mode="default", dynamic=True)` hits two blockers in PyTorch 2.7.1: (a) Inductor bounds analysis crashes on a `torch.bool` tensor of symbolic shape `[s5, s3, s3]` from the streaming attention mask (`TypeError: Invalid NaN comparison`); (b) `LoRACompatibleLinear.attn1.processor` object-identity guards cause 127+ Dynamo recompilations per request until the 128-recompile limit is hit and the estimator permanently falls back to eager. Net result: run-1 RTF ≈ 10 (compilation cost), run-2+ RTF ≈ 0.56 (eager fallback, worse than no-compile 0.486). Root cause: the estimator is only ~5% of total flow+HiFT time (~0.1s of 2.2s), so even a perfect 2× speedup would save 0.05s. Not worth fighting compiler bugs. `TORCH_COMPILE` is set to `false` in both compose files.
+
+## Phase 0 inference optimization — exhausted
+
+All practical vLLM/inference-level speedups have been tried. Summary:
+
+| Optimization | Outcome | Active? |
+|---|---|---|
+| vLLM CUDA graphs (`ENFORCE_EAGER=false`) | RTF 0.90 → 0.42 | ✅ yes |
+| FLOW_STEPS 8→4 | RTF 0.42 → 0.37 | ✅ yes |
+| Dual CUDA streams (B3) | ~7% wall improvement | ✅ always on |
+| MTP removed | No regression, simpler | ✅ done |
+| TRT_ESTIMATOR | Slower (RTF 1.02 vs 0.90) | ❌ disabled |
+| TORCH_COMPILE | Slower (compiler bugs, 128 recompilations) | ❌ disabled |
+| RESTRICT_SPEECH_VOCAB | ~1.5% HF-only, backbone dominates | ❌ disabled |
+| Flow state cache | Multi-day refactor, audio quality risk | ❌ not attempted |
+| FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
+
+**Structural ceiling:** flow+HiFT is the bottleneck at ~2.2s/call. HiFT accounts for ~82% of that, encoder ~9%, ODE steps ~9%. None of these are cheaply optimizable without model architecture changes.
+
+**Current best:** RTF=0.374 (long, ~30s audio) / RTF=0.486 (short, ~6s audio), TTFA=0.65s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
 
 ## Implications for PLAN.md phases
 
-- **Phase 0 is essentially exhausted on the inference side.** Remaining wins (real flow state cache) fight the architecture for diminishing returns.
-- **The path to real-time podcast generation goes through the LLM.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both target the LLM directly. Both require retraining/fine-tuning.
+- **Phase 0 inference optimization is complete.** The RTF=0.374 ceiling is structural — it requires changing the model, not the runtime.
+- **The path to lower RTF goes through reducing flow+HiFT calls or making them cheaper.** Larger chunk sizes (>150) reduce call count at the cost of higher TTFA. Architecture changes (smaller vocoder, fewer mel frames) would be more impactful.
+- **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
 

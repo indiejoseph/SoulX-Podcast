@@ -108,7 +108,7 @@ class SoulXPodcastService:
 
             model_config = Config(
                 model=api_config.model_path,
-                enforce_eager=api_config.enforce_eager,
+                enforce_eager=api_config.vllm_enforce_eager,
                 llm_engine=api_config.llm_engine,
                 hf_config=hf_config
             )
@@ -124,6 +124,10 @@ class SoulXPodcastService:
             self.trt_streaming_mode = None
             if api_config.trt_estimator:
                 self._install_trt_estimator()
+
+            if api_config.torch_compile:
+                self.model.compile_for_inference()
+                self.model.warmup_compiled()
 
             logger.info(f"Model loaded successfully with {api_config.llm_engine} engine!")
 
@@ -256,7 +260,7 @@ class SoulXPodcastService:
                     top_p=top_p,
                     use_ras=True,
                     win_size=25,
-                    tau_r=0.2
+                    tau_r=0.2,
                 )
 
                 infos = [data["info"]]
@@ -732,7 +736,11 @@ class SoulXPodcastService:
             "prompt_prefix_hidden": None,
             "prompt_prefix_len": len(prompt_prefix_ids),
         }
-        if self.mtp is not None and self.config.llm_engine == "hf":
+        should_cache_hf_prefix = (
+            self.config.llm_engine == "hf"
+            and (self.mtp is not None or api_config.hf_prompt_prefix_cache)
+        )
+        if should_cache_hf_prefix:
             prefix_cache, prefix_hidden = self._build_prompt_prefix_kv(prompt_prefix_ids)
             entry["prompt_prefix_cache"] = prefix_cache
             entry["prompt_prefix_hidden"] = prefix_hidden
@@ -1017,6 +1025,52 @@ class SoulXPodcastService:
                 streamer.cancel()
                 mtp_thread.join(timeout=1.0)
 
+    def _generate_speech_pcm_trunk_with_prefix_cache(
+        self,
+        request: SpeechRequest,
+        prepared: Dict[str, Any],
+    ) -> Optional[bytes]:
+        if not api_config.hf_prompt_prefix_cache or self.config.llm_engine != "hf":
+            return None
+
+        prompt_entry = prepared.get("prompt_cache_entry")
+        if prompt_entry is None:
+            return None
+        prefix_cache = prompt_entry.get("prompt_prefix_cache")
+        prefix_len = prompt_entry.get("prompt_prefix_len", 0)
+        if prefix_cache is None or prefix_len <= 0:
+            return None
+
+        prompt_ids, eos_id, offset = self._build_first_turn_prompt(prepared)
+        if prefix_len > len(prompt_ids):
+            raise ValueError("Cached prompt prefix is longer than the generation prompt")
+        target_tail_ids = prompt_ids[prefix_len:]
+        if not target_tail_ids:
+            return None
+
+        sampling_params = prepared["sampling_params"]
+        prefix_cache = self._fork_dynamic_cache(prefix_cache)
+        with torch.no_grad():
+            llm_outputs = self.model.llm.generate(
+                target_tail_ids,
+                sampling_params,
+                past_key_values=prefix_cache,
+            )
+
+        generated_ids = list(llm_outputs["token_ids"])
+        if generated_ids and generated_ids[-1] == eos_id:
+            generated_ids = generated_ids[:-1]
+        generated_speech_tokens = [token - offset for token in generated_ids]
+        synth_state = self._prepare_synth_state(prepared)
+        wav = self._synthesize_chunk(
+            synth_state,
+            generated_speech_tokens,
+            finalize=True,
+            streaming=False,
+            flow_steps=15,
+        )
+        return tensor_to_pcm16_bytes(wav.detach().cpu())
+
     def _generate_speech_pcm_trunk(
         self,
         request: SpeechRequest,
@@ -1026,6 +1080,13 @@ class SoulXPodcastService:
         prepared = prepared or self._build_speech_prepared(request)
         if request.stream:
             yield from self._stream_speech_pcm_trunk(request, prepared)
+            return
+
+        cached_pcm = None
+        if self.config.llm_engine == "hf":
+            cached_pcm = self._generate_speech_pcm_trunk_with_prefix_cache(request, prepared)
+        if cached_pcm is not None:
+            yield cached_pcm
             return
 
         with torch.no_grad():

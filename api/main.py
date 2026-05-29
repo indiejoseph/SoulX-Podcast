@@ -485,13 +485,8 @@ async def download_file(filename: str, _: None = Depends(require_api_key)):
 async def global_exception_handler(request, exc):
     """Global exception handler."""
     logger.error("Unhandled exception: %s", exc, exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content=ErrorResponse(
-            error="InternalServerError",
-            message=str(exc)
-        ).dict()
-    )
+    resp = ErrorResponse(error="InternalServerError", message=str(exc))
+    return JSONResponse(status_code=500, content=resp.model_dump(mode="json"))
 
 
 if __name__ == "__main__":

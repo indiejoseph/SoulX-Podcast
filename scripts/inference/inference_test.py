@@ -13,16 +13,24 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-import sys
 import time
 import json
+import argparse
 from pathlib import Path
 
 import torch
 import torchaudio
 
 
-def run_engine(llm_engine: str, model_path: str, data: dict, seed: int = 198964, fp16_flow: bool = True):
+def run_engine(
+    llm_engine: str,
+    model_path: str,
+    data: dict,
+    seed: int = 198964,
+    fp16_flow: bool = True,
+    max_new_tokens: int | None = None,
+    vllm_enforce_eager: bool = False,
+):
     """Run a single dialogue through the model with the given LLM engine."""
     from soulxpodcast.utils.infer_utils import process_single_input, initiate_model
     from soulxpodcast.utils.parser import podcast_format_parser
@@ -32,7 +40,13 @@ def run_engine(llm_engine: str, model_path: str, data: dict, seed: int = 198964,
     print('='*70)
 
     t_load_start = time.perf_counter()
-    model, dataset = initiate_model(seed, model_path, llm_engine, fp16_flow)
+    model, dataset = initiate_model(
+        seed,
+        model_path,
+        llm_engine,
+        fp16_flow,
+        enforce_eager=vllm_enforce_eager,
+    )
     t_load = time.perf_counter() - t_load_start
     print(f"[engine={llm_engine}]  load time: {t_load:.2f}s")
 
@@ -45,6 +59,8 @@ def run_engine(llm_engine: str, model_path: str, data: dict, seed: int = 198964,
         inputs["use_dialect_prompt"],
         inputs["dialect_prompt_text"],
     )
+    if max_new_tokens is not None:
+        prepared["sampling_params"].max_tokens = max_new_tokens
 
     # Warmup not strictly necessary for end-to-end, but stabilizes cold-cache effects.
     print(f"[engine={llm_engine}]  starting inference ({len(inputs['text'])} turns)")
@@ -75,11 +91,24 @@ def run_engine(llm_engine: str, model_path: str, data: dict, seed: int = 198964,
         "audio_duration_sec": round(total_audio_sec, 3),
         "rtf": round(t_infer / total_audio_sec, 3),
         "num_turns": len(wavs),
+        "max_new_tokens": max_new_tokens,
+        "vllm_enforce_eager": vllm_enforce_eager,
     }
 
 
 def main():
-    model_path = "pretrained_models/SoulX-Podcast-1.7B-dialect"
+    ap = argparse.ArgumentParser()
+    ap.add_argument("engines", nargs="*", choices=["hf", "vllm"], help="Engines to run. Defaults to hf vllm.")
+    ap.add_argument("--engine", action="append", choices=["hf", "vllm"], help="Engine to run; can be repeated.")
+    ap.add_argument("--model-path", default="pretrained_models/SoulX-Podcast-1.7B-dialect")
+    ap.add_argument("--seed", type=int, default=198964)
+    ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--no-dialect-prompt", action="store_true")
+    ap.add_argument("--vllm-enforce-eager", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--json-output", default=None)
+    args = ap.parse_args()
+
+    model_path = args.model_path
 
     # Multi-turn Cantonese dialogue (demo.ipynb dialect path)
     S1_PROMPT_WAV = Path("example/audios/female_mandarin.wav")
@@ -104,14 +133,24 @@ def main():
             ["S2", "<|Yue|>差唔多啦，七八分鐘，點都走得啦。電車喎，可以做到咁快？你咪玩啦。"],
         ],
     }
+    if args.no_dialect_prompt:
+        for speaker in data["speakers"].values():
+            speaker.pop("dialect_prompt", None)
 
-    engines = sys.argv[1:] if len(sys.argv) > 1 else ["hf", "vllm"]
+    engines = args.engine or args.engines or ["hf", "vllm"]
     print(f"\nrunning engines: {engines}\n")
 
     results = []
     for eng in engines:
         try:
-            r = run_engine(eng, model_path, data)
+            r = run_engine(
+                eng,
+                model_path,
+                data,
+                seed=args.seed,
+                max_new_tokens=args.max_new_tokens,
+                vllm_enforce_eager=args.vllm_enforce_eager,
+            )
             results.append(r)
         except Exception as e:
             import traceback
@@ -123,6 +162,10 @@ def main():
     print("SUMMARY")
     print("="*70)
     print(json.dumps(results, indent=2))
+    if args.json_output:
+        out_path = Path(args.json_output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

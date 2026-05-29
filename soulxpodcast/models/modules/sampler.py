@@ -134,21 +134,19 @@ def _ras_sample_hf_engine(
         # Copy is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
         # (the clone itself is always small)
         next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-        
-        
+
         # pre-process distribution
         next_token_scores = logits_processor(input_ids, next_token_logits)
 
-        # Repetition Aware Sampling in VALL-E 2.
-        # Candidate is sampled once; reused when no repetition reset is needed so
-        # we avoid a second multinomial draw that would change the distribution.
+        # Repetition Aware Sampling in VALL-E 2. Candidate sampled once; reused
+        # when no repetition reset is needed to avoid a second multinomial draw.
         ras_candidate = None
         if use_ras:
             probs_candidate = nn.functional.softmax(next_token_scores, dim=-1)
             ras_candidate = torch.multinomial(probs_candidate, num_samples=1).squeeze(1)
-            rep_num = (input_ids[:,-win_size:] == ras_candidate).sum().item() + 1
+            rep_num = (input_ids[:, -win_size:] == ras_candidate).sum().item() + 1
             if rep_num >= win_size * tau_r:
-                # Repetition detected — reset to raw logits and resample.
+                # Repetition detected — reset to raw logits and resample below.
                 next_token_scores = next_token_logits
                 ras_candidate = None
 
@@ -174,7 +172,6 @@ def _ras_sample_hf_engine(
 
         # token selection
         if ras_candidate is not None:
-            # No repetition reset — reuse the candidate to avoid double-sampling.
             next_tokens = ras_candidate
         elif do_sample:
             probs = nn.functional.softmax(next_token_scores, dim=-1)
