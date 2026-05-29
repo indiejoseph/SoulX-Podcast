@@ -386,12 +386,18 @@ class SoulXPodcast(torch.nn.Module):
             # to emit ~40 ms of audio.
             effective_first_chunk_size = first_chunk_size if turn_i == 0 else chunk_size
             try:
-                for chunk in streamer.iter_chunks(
+                for chunk, is_final_partial in streamer.iter_chunks(
                     chunk_size=chunk_size,
                     first_chunk_size=effective_first_chunk_size,
+                    yield_final_flag=True,
                 ):
                     cur_speech_tokens = [t - self.config.hf_config.speech_token_offset for t in chunk]
                     accumulated_speech_tokens.extend(cur_speech_tokens)
+                    # For turns > 0, skip finalize=False on the final partial chunk.
+                    # finalize=True (the flush below) handles those tokens in one call,
+                    # saving one ~0.23s Flow call per turn without losing any audio.
+                    if is_final_partial and turn_i > 0:
+                        break
                     with torch.cuda.stream(flow_stream):
                         audio = self._stream_synth_chunk(
                             spk_prompt_speech_tokens, accumulated_speech_tokens,

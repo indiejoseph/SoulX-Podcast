@@ -103,6 +103,7 @@ class SpeechTokenStreamer(BaseStreamer):
         chunk_size: int,
         final_partial: bool = True,
         first_chunk_size: Optional[int] = None,
+        yield_final_flag: bool = False,
     ) -> Iterator[List[int]]:
         """Yield speech tokens in chunks.
 
@@ -112,6 +113,9 @@ class SpeechTokenStreamer(BaseStreamer):
                 ends mid-chunk. If False, drop the trailing partial chunk.
             first_chunk_size: optional smaller first chunk. This reduces TTFA
                 without forcing every later chunk to pay high flow overhead.
+            yield_final_flag: if True, yield (tokens, is_final_partial) tuples
+                instead of plain token lists. Callers can use this to detect the
+                trailing partial chunk and skip redundant finalize=False flow calls.
         """
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
@@ -124,13 +128,13 @@ class SpeechTokenStreamer(BaseStreamer):
         for tok in self.iter_tokens():
             buf.append(tok)
             if len(buf) >= target:
-                yield buf
+                yield (buf, False) if yield_final_flag else buf
                 buf = []
                 if not yielded_first:
                     yielded_first = True
                     target = chunk_size
         if buf and final_partial:
-            yield buf
+            yield (buf, True) if yield_final_flag else buf
 
 
 def run_llm_in_thread(

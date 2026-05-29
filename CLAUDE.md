@@ -41,12 +41,12 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM | off | on | 8 | 100 | short | 0.88s | 4.53s | 0.680 | RTF < 1 on short |
 | vLLM | off | on | 8 | 150 | long | 0.86s² | 12.56s | 0.418 | |
 | vLLM | off | on | 4 | 150 | short | 0.65s | 3.27s | 0.486 | |
-| **vLLM** | **off** | **on** | **4** | **150** | **long** | **0.65s²** | **11.83s** | **🏆 0.374** | **current best** |
+| vLLM | off | on | 4 | 150 | long | 0.65s² | 11.83s | 0.374 | before turn-0-only first_chunk fix |
 
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** vLLM CUDA graphs + FLOW_STEPS=4 is the dominant configuration. RTF=0.374 on long content (2.7× real-time), RTF=0.486 on short (~6s audio). Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+**Key finding:** vLLM CUDA graphs + FLOW_STEPS=4 + skip-redundant-flow-calls is the dominant configuration. RTF=0.262 on long content (3.8× real-time), RTF=0.391 on short (~6s audio), TTFA=0.64s. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
 
 ### Inference runtime comparison summary
 
@@ -56,7 +56,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM eager, 8 steps | 0.904 | ~1.2 | ~1.17s | LLM (no CUDA graphs) |
 | vLLM CUDA graphs, 8 steps | 0.418 | 0.680 | 0.86s | flow+HiFT |
 | vLLM CUDA graphs, 4 steps | 0.374 | 0.486 | 0.65s | flow+HiFT (fixed overhead) |
-| **vLLM CUDA graphs, 4 steps + skip-tiny-first-chunk** | **0.303** | **0.445** | **0.65s** | **🏆 current best** |
+| vLLM CUDA graphs, 4 steps + turn-0-only first_chunk | 0.303 | 0.445 | 0.65s | intermediate |
+| **vLLM CUDA graphs, 4 steps + skip final-partial finalize=False** | **0.262** | **0.391** | **0.64s** | **🏆 current best** |
 
 **Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
@@ -101,6 +102,8 @@ Measured via `PROFILE_FLOW_STAGES=1` on the 6-turn long dialogue (31s audio, 20 
 
 9. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
 
+13. **Skip `finalize=False` on the final partial chunk for turns > 0.** For any turn whose total tokens are not a multiple of `chunk_size`, `iter_chunks` yields a trailing partial chunk. The loop synthesises it with `finalize=False` (paying a full ~0.23s Flow call for 3-token-lookahead-stripped audio), then immediately the `finalize=True` flush synthesises the same tokens again including the 3 lookahead tokens. Two Flow calls for one partial. Fix: `iter_chunks(yield_final_flag=True)` signals which yield is the trailing partial; for turns > 0 we `break` on the final partial without calling `finalize=False` — `finalize=True` absorbs the partial in one call. Saves ~1 Flow call per turn for turns > 0 whenever tokens % chunk_size ≠ 0. Combined with fix #12: 20→10 Flow calls on a 6-turn long dialogue; RTF 0.374→0.262 (long), 0.486→0.391 (short), TTFA unchanged at 0.64s. See `soulxpodcast/models/soulxpodcast.py` + `soulxpodcast/utils/streaming.py`.
+
 12. **`first_chunk_size` should only apply to turn 0.** With `first_chunk_size=4` applied to every turn, turns 2–N each pay a full Flow call (~0.23s) to emit only 2 mel frames (~40ms audio). These calls are pure waste — later turns are already playing previous-turn audio so there is no TTFA to optimise. Fix: `effective_first_chunk_size = first_chunk_size if turn_i == 0 else chunk_size`. Result: 20→15 Flow calls on a 6-turn long dialogue, RTF 0.374→0.303 (long), 0.486→0.445 (short), TTFA unchanged at 0.65s. Implemented in `forward_longform_streaming`. See `soulxpodcast/models/soulxpodcast.py`.
 
 11. **`TORCH_COMPILE=true` is NOT beneficial (makes things slower).** `torch.compile(flow.decoder.estimator, mode="default", dynamic=True)` hits two blockers in PyTorch 2.7.1: (a) Inductor bounds analysis crashes on a `torch.bool` tensor of symbolic shape `[s5, s3, s3]` from the streaming attention mask (`TypeError: Invalid NaN comparison`); (b) `LoRACompatibleLinear.attn1.processor` object-identity guards cause 127+ Dynamo recompilations per request until the 128-recompile limit is hit and the estimator permanently falls back to eager. Net result: run-1 RTF ≈ 10 (compilation cost), run-2+ RTF ≈ 0.56 (eager fallback, worse than no-compile 0.486). Root cause: the estimator is only ~5% of total flow+HiFT time (~0.1s of 2.2s), so even a perfect 2× speedup would save 0.05s. Not worth fighting compiler bugs. `TORCH_COMPILE` is set to `false` in both compose files.
@@ -119,16 +122,17 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | TORCH_COMPILE | Slower (compiler bugs, 128 recompilations) | ❌ disabled |
 | RESTRICT_SPEECH_VOCAB | ~1.5% HF-only, backbone dominates | ❌ disabled |
 | Skip tiny first-chunk on turns 2+ | RTF 0.374→0.303 long, 0.486→0.445 short | ✅ yes |
+| Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
 | Flow state cache | Multi-day refactor, audio quality risk | ❌ not attempted |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
 **Structural ceiling at chunk=150:** flow+HiFT averages ~0.31s/call (20 calls for a 30s dialogue). Flow is **84%** of that (~0.26s, encoder + CFM); HiFT is **16%** (~0.05s, memory-bandwidth saturated — flat cost regardless of mel frame count). The earlier 82% HiFT figure came from `bistream_test.py` direct-model measurements at chunk=50 where HiFT processes larger mel windows; at the production API chunk=150, flow dominates.
 
-**Current best:** RTF=0.303 (long, ~30s audio) / RTF=0.445 (short, ~6s audio), TTFA=0.65s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+**Current best:** RTF=0.262 (long, ~30s audio) / RTF=0.391 (short, ~6s audio), TTFA=0.64s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
 
 ## Implications for PLAN.md phases
 
-- **Phase 0 inference optimization is complete.** The RTF=0.374 ceiling is structural — it requires changing the model, not the runtime.
+- **Phase 0 inference optimization is complete.** RTF=0.262 (long) / 0.391 (short). The remaining ceiling is structural — it requires changing the model or chunk policy, not the runtime.
 - **Flow (not HiFT) is the bottleneck at chunk=150.** Flow is 84% of per-call time; HiFT is bandwidth-saturated and flat. Optimizing HiFT (fp16, windowed synthesis) targets the 16% share and is not worth the effort. Incremental flow is the high-value target.
 - **The fastest available lever is larger chunks.** chunk=250–400 tokens halves the flow call count, saving ~20–30% wall time at the cost of higher TTFA. No code change needed — just config.
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
