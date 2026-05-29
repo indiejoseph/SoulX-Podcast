@@ -62,9 +62,11 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 
 6. **MTP is now optional** — it helps HF-engine RTF (from ~0.9 to ~0.9 on long content), but vLLM+CUDA graphs already achieves RTF=0.418 without MTP. MTP cannot be combined with vLLM (service enforces HF engine when MTP_CHECKPOINT is set).
 
-6. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150.
+7. **RTF < 1 requires long content to amortise flow overhead.** Short dialogues (~6s) yield RTF ~1.2 regardless of chunk size. Long dialogues (~30s) reach RTF ~0.90 at chunk=150 (HF) or 0.42 (vLLM CUDA graphs).
 
-7. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
+8. **Restricted speech-vocab sampler (RESTRICT_SPEECH_VOCAB) gives ~1.5% HF speedup — not worth it.** Measured: ~0.56ms/token saving on the lm_head projection (160K→6561 vocab), totalling ~420ms on a 30s dialogue. This is unmeasurable noise relative to backbone computation (~35ms/token). Root cause: Qwen3-1.7B is memory-bandwidth bound; the backbone FFN/attention dominates, not the lm_head. `RESTRICT_SPEECH_VOCAB` is disabled by default.
+
+9. **TRT_ESTIMATOR is NOT beneficial for this model.** TRT 11 removed global `FP16`/`EXPLICIT_BATCH` flags; per-layer FP16 insertion adds type-conversion overhead. Measured: TRT TF32 RTF=1.048, TRT FP16 (per-layer) RTF=1.021 — both worse than PyTorch native FP16 (RTF=0.904). 285MB plan, 23.6s build. Root cause: PyTorch's cuBLAS FP16 path is already well-optimised for this network; TRT adds per-call address-binding overhead that dominates for small batch (B=2) inference. `TRT_ESTIMATOR` is disabled in `docker-compose.dev.yml`.
 
 ## Implications for PLAN.md phases
 
