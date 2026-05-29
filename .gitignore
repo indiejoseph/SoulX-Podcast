@@ -216,4 +216,5 @@ tmp
 *.ipynb
 runs
 .DS_Store
-exports/*
+exports/flow_runtime/
+docker-compose.dev.yml
