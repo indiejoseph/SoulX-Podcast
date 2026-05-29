@@ -204,6 +204,73 @@ def test_async(api_url: str, api_key: str):
             file_obj.close()
 
 
+def test_stream(api_url: str, api_key: str):
+    """测试流式生成 - 记录TTFA"""
+    print("\n" + "=" * 60)
+    print("测试: 流式生成 (TTFA)")
+    print("=" * 60)
+
+    audio_files = [
+        "example/audios/female_mandarin.wav",
+        "example/audios/male_mandarin.wav"
+    ]
+    for f in audio_files:
+        if not Path(f).exists():
+            print(f"错误: 找不到音频文件 {f}")
+            return
+
+    files = [
+        ('prompt_audio', open(audio_files[0], 'rb')),
+        ('prompt_audio', open(audio_files[1], 'rb'))
+    ]
+    data = {
+        'prompt_texts': json.dumps([
+            "喜欢攀岩、徒步、滑雪的语言爱好者。",
+            "资深科技播客主持人。"
+        ]),
+        'dialogue_text': '[S1]大家好，欢迎收听今天的节目。[S2]是的，今天我们要聊聊人工智能。[S1]这个话题确实很有趣。',
+        'seed': 1988,
+    }
+
+    print(f"发送流式请求到: {api_url}/generate-stream")
+    start_time = time.perf_counter()
+    ttfa = None
+    total_bytes = 0
+    output_path = "api/outputs/test_stream.wav"
+
+    try:
+        with requests.post(
+            f"{api_url}/generate-stream",
+            files=files,
+            data=data,
+            headers=auth_headers(api_key),
+            stream=True,
+            timeout=300,
+        ) as response:
+            response.raise_for_status()
+            with open(output_path, 'wb') as out:
+                for chunk in response.iter_content(chunk_size=None):
+                    if chunk:
+                        if ttfa is None and total_bytes >= 44:
+                            # First PCM bytes arrived (WAV header is 44 bytes)
+                            ttfa = time.perf_counter() - start_time
+                        out.write(chunk)
+                        total_bytes += len(chunk)
+
+        elapsed = time.perf_counter() - start_time
+        print(f"✓ 流式生成成功!")
+        print(f"  TTFA: {ttfa:.2f}秒" if ttfa else "  TTFA: n/a")
+        print(f"  总耗时: {elapsed:.2f}秒")
+        print(f"  总字节: {total_bytes:,}")
+        print(f"  保存到: {output_path}")
+
+    except requests.exceptions.RequestException as e:
+        print(f"✗ 请求失败: {e}")
+    finally:
+        for _, file_obj in files:
+            file_obj.close()
+
+
 def test_health(api_url: str):
     """测试健康检查"""
     print("\n" + "=" * 60)
@@ -237,7 +304,7 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["health", "sync", "async", "all"],
+        choices=["health", "sync", "async", "stream", "all"],
         default="all",
         help="测试模式（默认: all）"
     )
@@ -265,6 +332,9 @@ def main():
 
     if args.mode in ["async", "all"]:
         test_async(args.url, args.api_key)
+
+    if args.mode in ["stream", "all"]:
+        test_stream(args.url, args.api_key)
 
     print("\n" + "=" * 60)
     print("测试完成!")

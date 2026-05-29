@@ -8,7 +8,13 @@ services:
       args:
         INSTALL_TRT: "${INSTALL_TRT:-true}"
     image: tts:latest
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     shm_size: "16gb"
     ipc: host
     depends_on:

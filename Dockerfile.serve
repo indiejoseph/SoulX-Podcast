@@ -5,7 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 ARG INSTALL_TRT=true
-ARG VLLM_PATCH_REF=df57a93a9e21715f2d46835ff0a049e195fe6af4
+ARG VLLM_PATCH_BRANCH=v0.10.1.1-soulxpodcast
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -16,10 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # SoulX-Podcast uses patched vLLM sampling for RAS compatibility. The MTP
 # serving path still uses the HF trunk directly, but this keeps the image
 # compatible with the repo's vLLM baseline and fallback modes.
-RUN git clone https://github.com/Soul-AILab/vllm.git /tmp/soulx-vllm && \
-    cd /tmp/soulx-vllm && \
-    git checkout "${VLLM_PATCH_REF}" && \
-    VLLM_PATH=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") && \
+# VLLM_PATH must be captured before cd-ing into the clone; otherwise Python
+# picks up the cloned repo's vllm/ as the package and cp fails (same file).
+RUN VLLM_PATH=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") && \
+    git clone --depth 1 --branch "${VLLM_PATCH_BRANCH}" \
+        https://github.com/Soul-AILab/vllm.git /tmp/soulx-vllm && \
     cp /tmp/soulx-vllm/vllm/model_executor/layers/sampler.py "${VLLM_PATH}/model_executor/layers/sampler.py" && \
     cp /tmp/soulx-vllm/vllm/model_executor/layers/utils.py "${VLLM_PATH}/model_executor/layers/utils.py" && \
     cp /tmp/soulx-vllm/vllm/model_executor/sampling_metadata.py "${VLLM_PATH}/model_executor/sampling_metadata.py" && \
@@ -31,7 +32,12 @@ WORKDIR /app
 COPY requirements.txt /tmp/requirements.txt
 COPY api/requirements.txt /tmp/api-requirements.txt
 
-RUN pip3 install -r /tmp/requirements.txt -r /tmp/api-requirements.txt && \
+# Strip torch/torchaudio/triton from requirements: the vllm base image already
+# ships CUDA-enabled builds. Installing from default PyPI would replace them
+# with CPU wheels (PEP 440 strict == doesn't match the +cu* local suffix).
+RUN grep -vE '^(torch|torchaudio|triton)([>=<!]|$)' /tmp/requirements.txt \
+        > /tmp/requirements_notorch.txt && \
+    pip3 install -r /tmp/requirements_notorch.txt -r /tmp/api-requirements.txt && \
     if [ "${INSTALL_TRT}" = "true" ]; then \
         pip3 install --extra-index-url https://pypi.nvidia.com tensorrt; \
     fi
@@ -60,4 +66,5 @@ EXPOSE 8000
 
 USER app
 
-CMD ["python", "run_api.py"]
+ENTRYPOINT ["python3", "run_api.py"]
+CMD []
