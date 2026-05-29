@@ -59,19 +59,36 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 
 **Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
+### Per-chunk flow vs HiFT breakdown (chunk=150, vLLM CUDA graphs, FLOW_STEPS=4)
+
+Measured via `PROFILE_FLOW_STAGES=1` on the 6-turn long dialogue (31s audio, 20 flow calls):
+
+| Component | Avg per call | Share | Notes |
+|-----------|-------------|-------|-------|
+| Flow (encoder + CFM) | 0.260s | **84%** | scales weakly with sequence length |
+| HiFT vocoder | 0.049s | **16%** | **constant regardless of mel_frames** |
+
+**HiFT is memory-bandwidth saturated, not compute-bound.** Measured HiFT time: 0.046–0.049s for 172 mel frames, 0.046–0.048s for 344–390 mel frames — completely flat. The GPU finishes convolutions faster than memory can feed them; doubling input size doesn't double time.
+
+**Implication for next-step strategies:**
+- Windowed/incremental HiFT: saves ~0.046s × 20 calls = ~0.9s total (**9%** of wall) — not worth the complexity
+- HiFT fp16: halving HiFT time saves ~0.023s × 20 calls = ~0.5s (**5%**) — marginal
+- Larger chunk size (250–400 tokens): halves flow call count, saves ~2–3s (**20–30%**) — free config change
+- Incremental flow (encoder KV cache + ODE state reuse): targets the 84% share — high value, architectural risk
+
 ## Key findings — vLLM CUDA graphs dominate; flow+HiFT is the new bottleneck
 
 **vLLM with CUDA graphs (`VLLM_ENFORCE_EAGER=false`) is the dominant mode.** The LLM runs so fast under CUDA graphs that flow+HiFT is the new bottleneck, same as MTP but 2.2× cheaper to achieve.
 
 1. **`VLLM_ENFORCE_EAGER=false` is the key unlock.** All prior vLLM tests had `enforce_eager=True` hardcoded in service.py — they tested vLLM eager mode, not CUDA-graph mode. With graphs enabled, vLLM (no MTP) achieves RTF=0.418 vs HF+MTP RTF=0.904. MTP is no longer needed for RTF < 1.
 
-2. **Bi-streaming reduces TTFA dramatically (3.5×) but adds 7-50% total-wall regression** depending on chunk size. The regression is from per-chunk diffusion overhead (~1s fixed cost per flow call) compounding across chunks.
+2. **Bi-streaming reduces TTFA dramatically (3.5×) but adds 7-50% total-wall regression** depending on chunk size. The regression is from per-chunk flow+HiFT overhead (~0.3s/call at chunk=150) compounding across chunks.
 
 3. **The flow architecture has no inter-call state cache.** The existing `streaming=True` flag only enables chunk-masked attention within a single call. Building true incremental streaming requires modifying `flow.py` + `flow_components/estimator.py` to add encoder KV cache + decoder feature cache + `solve_euler` state — a multi-day refactor with audio-quality risk. Not worth it given the flow call count is already minimised by large chunk sizes.
 
 4. **Separate CUDA streams (B3) give ~7% wall improvement** by letting LLM and flow overlap on the GPU. Win is modest because both are memory-bandwidth bound on the 3090. B3 is always active in `forward_longform_streaming` — no action needed. Would scale better on H100/H200.
 
-5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimises TTFA, chunk=150 minimises wall. Per-chunk flow overhead is roughly constant, so fewer chunks → less total overhead. Default of 100 balances both.
+5. **Chunk size is the main TTFA/wall lever:** chunk=50 minimises TTFA, chunk=150 minimises wall. Flow cost per call is ~0.26s (84% of call time) and grows weakly with sequence length; HiFT is constant at ~0.05s/call regardless of chunk size. Fewer chunks → less total overhead. Default of 100 balances TTFA and wall time.
 
 6. **MTP is now optional** — it helps HF-engine RTF (from ~0.9 to ~0.9 on long content), but vLLM+CUDA graphs already achieves RTF=0.418 without MTP. MTP cannot be combined with vLLM (service enforces HF engine when MTP_CHECKPOINT is set).
 
@@ -101,14 +118,15 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | Flow state cache | Multi-day refactor, audio quality risk | ❌ not attempted |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
-**Structural ceiling:** flow+HiFT is the bottleneck at ~2.2s/call. HiFT accounts for ~82% of that, encoder ~9%, ODE steps ~9%. None of these are cheaply optimizable without model architecture changes.
+**Structural ceiling at chunk=150:** flow+HiFT averages ~0.31s/call (20 calls for a 30s dialogue). Flow is **84%** of that (~0.26s, encoder + CFM); HiFT is **16%** (~0.05s, memory-bandwidth saturated — flat cost regardless of mel frame count). The earlier 82% HiFT figure came from `bistream_test.py` direct-model measurements at chunk=50 where HiFT processes larger mel windows; at the production API chunk=150, flow dominates.
 
 **Current best:** RTF=0.374 (long, ~30s audio) / RTF=0.486 (short, ~6s audio), TTFA=0.65s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
 
 ## Implications for PLAN.md phases
 
 - **Phase 0 inference optimization is complete.** The RTF=0.374 ceiling is structural — it requires changing the model, not the runtime.
-- **The path to lower RTF goes through reducing flow+HiFT calls or making them cheaper.** Larger chunk sizes (>150) reduce call count at the cost of higher TTFA. Architecture changes (smaller vocoder, fewer mel frames) would be more impactful.
+- **Flow (not HiFT) is the bottleneck at chunk=150.** Flow is 84% of per-call time; HiFT is bandwidth-saturated and flat. Optimizing HiFT (fp16, windowed synthesis) targets the 16% share and is not worth the effort. Incremental flow is the high-value target.
+- **The fastest available lever is larger chunks.** chunk=250–400 tokens halves the flow call count, saving ~20–30% wall time at the cost of higher TTFA. No code change needed — just config.
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
