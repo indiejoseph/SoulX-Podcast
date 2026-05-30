@@ -220,8 +220,13 @@ def main() -> None:
             and spec_config.get("parallel_drafting") is not True
         ):
             errors.append("speculative_config parallel_drafting is not true")
+    actual_layers = ckpt_summary.get("eagle_aux_hidden_state_layer_ids")
+    if not isinstance(actual_layers, list) or len(actual_layers) != 3:
+        errors.append(
+            "checkpoint target layers must contain exactly 3 auxiliary layers "
+            f"for the current P-EAGLE data contract; got {actual_layers}"
+        )
     if expected_layers is not None:
-        actual_layers = ckpt_summary.get("eagle_aux_hidden_state_layer_ids")
         if actual_layers != expected_layers:
             errors.append(
                 f"checkpoint target layers {actual_layers} != {expected_layers}"

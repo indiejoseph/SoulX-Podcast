@@ -223,6 +223,13 @@ def validate_checkpoint_config(
                 f"{stats['transformer_layer_model_type']!r}; "
                 f"expected {expected_draft_arch!r}"
             )
+    aux_layer_ids = stats["eagle_aux_hidden_state_layer_ids"]
+    if not isinstance(aux_layer_ids, list) or len(aux_layer_ids) != 3:
+        errors.append(
+            "checkpoint eagle_aux_hidden_state_layer_ids must contain exactly "
+            f"3 auxiliary layers for the current P-EAGLE data contract; got "
+            f"{aux_layer_ids}"
+        )
     if expected_target_layer_ids is not None:
         if stats["eagle_aux_hidden_state_layer_ids"] != expected_target_layer_ids:
             errors.append(

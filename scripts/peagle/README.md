@@ -128,6 +128,11 @@ runtime speculative config:
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
 ```
 
+Optional `TARGET_LAYER_IDS` should list only the three EAGLE auxiliary layers,
+for example `TARGET_LAYER_IDS="2 14 25"`. Do not include the verifier final
+layer; the hidden-state extraction launcher appends it for target logits, while
+the drafter config must keep only the three auxiliary layers.
+
 On this PJM cluster, inline shell assignments such as
 `WANDB=1 pjsub scripts/peagle/submit_peagle_online_h100.pjm` are not propagated
 into the batch job. Treat the PJM file itself as the source of truth for job
@@ -217,6 +222,36 @@ python scripts/peagle/inspect_peagle_runtime_contract.py \
   --expected-num-depths 4 \
   --fail-on-error
 ```
+
+If runtime agreement is far below validation agreement, first verify that the
+checkpoint's training verifier and the deployed verifier are bit-identical for
+the validation head:
+
+```bash
+python scripts/peagle/compare_peagle_verifier_weights.py \
+  --checkpoint outputs/peagle_soulx_h100/checkpoints/checkpoint_best \
+  --runtime-model runs/merged \
+  --fail-on-mismatch
+```
+
+This checks the verifier path recorded in `checkpoint_best/config.json` against
+the runtime model, including `lm_head.weight` and `model.norm.weight`.
+
+If those weights match, compare a few cached training hidden-state files against
+fresh hidden states from the live vLLM extractor:
+
+```bash
+python scripts/peagle/compare_peagle_hidden_state_cache.py \
+  --preprocessed-dir outputs/peagle_soulx_h100/preprocessed \
+  --hidden-states-dir outputs/peagle_soulx_h100/hidden_states \
+  --endpoint http://127.0.0.1:8000/v1 \
+  --num-samples 3 \
+  --fail-on-mismatch
+```
+
+Run it while the same hidden-state vLLM server used for P-EAGLE training is up.
+It requests the exact `input_ids` from the prepared dataset, loads the temporary
+live `.safetensors` file, and compares it with `hs_<index>.safetensors`.
 
 If you previously trained with `DRAFT_VOCAB_SIZE=8192`, use a fresh `WORK_DIR`
 or set `RESET_CHECKPOINTS=1 FORCE_PREPARE=1 DRAFT_VOCAB_SIZE=6562` for the next
