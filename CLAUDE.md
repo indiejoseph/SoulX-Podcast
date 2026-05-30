@@ -76,30 +76,24 @@ Measured via `PROFILE_FLOW_STAGES=1` on the 6-turn long dialogue (31s audio, 20 
 - Windowed/incremental HiFT: saves ~0.046s × 20 calls = ~0.9s total (**9%** of wall) — not worth the complexity
 - HiFT fp16: halving HiFT time saves ~0.023s × 20 calls = ~0.5s (**5%**) — marginal
 - Larger chunk size (250–400 tokens): halves flow call count, saves ~2–3s (**20–30%**) — free config change
-- ~~Incremental flow (encoder KV cache + ODE state reuse): targets the 84% share — high value, architectural risk~~ **DONE.** See "Flow chunk cache" below.
+- Incremental flow (encoder KV cache + ODE state reuse): targets the 84% share — high value, but **attempted and rejected**: introduced ~2.5 dB extra dynamic range on streaming output vs the bidirectional sync path. See [Flow chunk cache experiment, rejected](#flow-chunk-cache-experiment-rejected).
 
-### Flow chunk cache (FLOW_CHUNK_CACHE=1, experimental)
+### Flow chunk cache experiment, rejected
 
-Implements per-chunk K/V + causal-conv caching across the encoder, U-Net decoder, and per-ODE-step estimator so each chunk processes only its **new** tokens instead of re-running flow on the full accumulated sequence. Opt-in via `FLOW_CHUNK_CACHE=1`. Output cosine similarity vs the uncached `streaming=True` path: **0.991** (smoke test, `scripts/inference/test_flow_cache.py`).
+We implemented per-chunk K/V + causal-conv caching across the encoder, U-Net decoder, and per-ODE-step estimator (commits 8aeb00f / 8f78568, reverted by [this rip-out commit]). The standalone flow+HiFT bench showed -50.6% wall on long content. End-to-end gain was only ~6.5% because B3 already overlapped LLM and flow.
 
-Direct flow+HiFT bench (LLM excluded), `chunk_size=150`, `FLOW_STEPS=4`, HF engine, RTX 3090 (`scripts/inference/bench_flow_cache.py`):
+**Audio quality regression discovered after deployment.** A/B comparison of `/generate` (sync, full bidirectional flow) vs `/generate-stream` (chunked + cached) on the same dialogue + seed (`scripts/inference/gen_stream_vs_sync.py`):
 
-| Content | Chunks | Path | TTFA | Wall | RTF (flow+HiFT) |
-|---|---|---|---|---|---|
-| Long (32s audio, 800 tokens) | 6 | uncached | 0.199s | 2.751s | 0.086 |
-| Long (32s audio, 800 tokens) | 6 | **cached** | **0.191s** | **1.362s** | **0.043** |
-| Short (11.5s audio, 288 tokens) | 2 | uncached | 0.198s | 0.442s | 0.038 |
-| Short (11.5s audio, 288 tokens) | 2 | **cached** | **0.193s** | **0.394s** | **0.034** |
+| Path | p90-p10 dB spread | max-min dB |
+|---|---|---|
+| zh_sync | 5.51 | 9.69 |
+| zh_stream (cache **on**) | **8.05** | **14.75** |
+| zh_stream (cache **off**) | 5.72 | 9.52 — matches sync ✓ |
+| yue_sync | 5.45 | 12.05 |
+| yue_stream (cache **on**) | **6.79** | **15.71** |
+| yue_stream (cache **off**) | 5.90 | 12.93 — matches sync ✓ |
 
-**Per-chunk wall (long, chunk=150)** reveals the dynamic:
-- uncached: `0.20 → 0.27 → 0.42 → 0.45 → 0.68 → 0.73s` — linear growth (**O(N²)** total)
-- cached:   `0.19 → 0.21 → 0.22 → 0.23 → 0.25 → 0.26s` — nearly flat (**O(N)** total)
-
-**Key takeaways:**
-- **Long content: -50.6% flow+HiFT wall.** The cache eliminates the per-call sequence-length growth.
-- **TTFA unchanged (~0.19s).** First chunk does the same work in both paths — caching only helps from chunk 2 onward.
-- **Short content: -11% wall.** The win scales with chunk count; <15s audio sees a modest improvement.
-- **End-to-end RTF projection:** flow+HiFT was ~84% of total per-call wall. Halving it should drop end-to-end RTF from 0.303 (long, current best) to roughly **~0.17 long** — pending `bench_stream.py` end-to-end confirmation.
+The cached chunked flow produces mels with ~2.5 dB extra dynamic range vs the bidirectional reference. Root cause: the cached path approximates bidirectional self-attention with chunk-causal K/V accumulation, an attention pattern the model was never trained on. The 0.991 cosine similarity smoke test was vs `streaming=True` (chunk-masked) — both diverge from the actual bidirectional reference. **Trade-off: 6.5% end-to-end RTF win for audibly worse audio is not worth it.** Ripped out.
 
 ## Key findings — vLLM CUDA graphs dominate; flow+HiFT is the new bottleneck
 
@@ -146,32 +140,16 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | RESTRICT_SPEECH_VOCAB | ~1.5% HF-only, backbone dominates | ❌ disabled |
 | Skip tiny first-chunk on turns 2+ | RTF 0.374→0.303 long, 0.486→0.445 short | ✅ yes |
 | Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
-| Flow chunk cache (`FLOW_CHUNK_CACHE=1`) | -50.6% flow+HiFT wall long; TTFA unchanged | ✅ default in `docker-compose.yml` |
+| Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
-**Structural ceiling at chunk=150 (broken by flow chunk cache):** flow+HiFT was averaging ~0.31s/call (20 calls for a 30s dialogue), of which flow is ~84% and HiFT ~16%. With `FLOW_CHUNK_CACHE=1`, per-chunk flow time is nearly constant (~0.21s for chunk=150) instead of growing with accumulated sequence length — direct flow+HiFT wall on a 32s dialogue drops -50.6%. End-to-end RTF improvement pending `bench_stream.py` confirmation.
-
-**Current best (measured end-to-end with FLOW_CHUNK_CACHE=1):** RTF=0.245 (~30s audio), TTFA=0.77s on a 3-turn dialogue. Prior baseline without cache was RTF=0.262 — so end-to-end gain is only **~6.5%**, not the -50.6% the flow-only bench suggested.
-
-**Why the end-to-end gain is small:** LLM (in the worker thread on `llm_stream`) and Flow+HiFT (in the main thread on `flow_stream`) already overlap via B3 dual streams. The wall is bounded by `max(LLM, Flow+HiFT) + serial overhead`. Before the cache, LLM was already ~4.2s and Flow+HiFT was ~3.5s on long content — close enough that LLM was the practical bottleneck. The cache shrinks Flow+HiFT to ~2.9s, but the wall stays pinned to LLM (~4.5s effective).
-
-**Per-stage profile (vLLM CUDA graphs, FLOW_STEPS=4, FLOW_CHUNK_CACHE=1, chunk=150, 3-turn ~30s dialogue, RTX 3090):**
-
-| Stage | Wall | % of wall | Notes |
-|---|---|---|---|
-| LLM (implied = wall − flow+HiFT) | ~4.5s | **~60%** | 🏆 new bottleneck — LLM hides flow via B3 overlap |
-| Flow (cached) | ~2.4s | ~32% | 9 calls × ~280ms avg |
-| HiFT | ~0.4s | ~5% | 6 calls × ~66ms (first ~150ms cold, rest ~50ms) |
-| Frontend (`process_single_input`) | ~0.33s | ~4% | text tokenize + prompt mel extract |
-| Total wall | ~7.3s | 100% | end-to-end on 30s audio |
-
-Measured via `scripts/inference/profile_pipeline.py vllm 150`.
+**Current best:** RTF=0.262 (long, ~30s audio) / RTF=0.391 (short, ~6s audio), TTFA=0.64s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 STREAM_CHUNK_SIZE=150`.
 
 ## Implications for PLAN.md phases
 
-- **Phase 0 inference optimization is LLM-bound.** Flow cache moved the bottleneck from flow to LLM by collapsing flow+HiFT wall O(N²)→O(N). But because B3 already overlapped LLM and flow, the end-to-end win is only ~6.5%. Further flow optimization is now nearly free of end-to-end benefit.
+- **Phase 0 inference optimization has hit a quality floor.** Flow chunk cache was tried and rejected — the standalone -50.6% flow+HiFT win didn't translate (only 6.5% end-to-end because of B3 overlap) and it introduced +2.5 dB extra dynamic range on streaming output. Further flow-side optimizations are unlikely to yield wall savings without quality regression.
 - **LLM is the next high-value lever.** ~60% of wall is LLM-bound, and ~25% of wall is *exclusive* LLM time (after the overlap with flow). The remaining flow share (32%) is already shadowed by LLM, so cutting it further does not reduce wall.
-- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 3.7× regression on current vLLM RTF 0.245 — net loss even after MTP's ~1.8×. The viable moves are:
+- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 3.7× regression on current vLLM RTF 0.262 — net loss even after MTP's ~1.8×. The viable moves are:
   - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B) — vLLM 0.10 supports this natively, no patch needed; typical 1.5–2× on memory-bandwidth-bound decode.
   - **INT4 / AWQ quantization** of Qwen3-1.7B served under vLLM — `scripts/inference/quantize_awq.py` already exists; verify the AWQ checkpoint runs under vLLM CUDA graphs.
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
@@ -221,8 +199,7 @@ All dev scripts live under `scripts/` (organized by topic). Each has a small
     - `multi_turn_bistream_test.py` — full 4-turn Cantonese dialect dialogue with speaker switching.
     - `profile_latency.py` — per-stage latency profiling.
     - `bench_stream.py` — HTTP API streaming benchmark (TTFA/wall/RTF); `--chunk N`, `--first-chunk N`, `--long` flags.
-    - `bench_flow_cache.py` — direct flow+HiFT bench of cached vs uncached chunked streaming (LLM excluded). `python … <chunk> <target_tokens>`.
-    - `test_flow_cache.py` — smoke test verifying cached `forward_chunk_cached` matches uncached `forward(streaming=True)` (cosine similarity, audio sanity).
+    - `gen_stream_vs_sync.py` — A/B `/generate` (sync) vs `/generate-stream` on the same dialogue+seed; flags any streaming-path audio regression (used to detect the flow-cache loudness issue).
 - `scripts/lora/` — LoRA sweep, averaging, and tests
     - `lora_sweep.py` — generate audio for every adapter checkpoint via `set_adapter()` (no merge).
     - `lora_average.py` — element-wise weighted average of N adapter `.safetensors` (incl. `lm_head` from `modules_to_save`).

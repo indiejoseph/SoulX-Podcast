@@ -26,57 +26,6 @@ def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return mask
 
 
-def _self_attention_with_kv_cache(
-    attn: Attention,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    cache: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Run diffusers self-attention while appending cached K/V state.
-
-    Cache layout: ``[B, prev_seq_len, head_dim*heads, 2]`` where the last dim
-    indexes (key, value). The returned cache contains the **accumulated** K/V
-    (past + current); callers persist it back unchanged for the next chunk.
-    This matches the existing SoulX conformer cache contract in
-    ``MultiHeadedAttention.forward`` (cache stores accumulated K/V).
-    """
-    batch_size, q_len, _ = hidden_states.shape
-    if attention_mask is not None and attention_mask.ndim == 3:
-        attention_mask = attention_mask.unsqueeze(dim=1).repeat(1, attn.heads, 1, 1)
-
-    query = attn.to_q(hidden_states)
-    key_current = attn.to_k(hidden_states)
-    value_current = attn.to_v(hidden_states)
-
-    if cache.size(0) != 0:
-        key = torch.concat([cache[:, :, :, 0], key_current], dim=1)
-        value = torch.concat([cache[:, :, :, 1], value_current], dim=1)
-    else:
-        key, value = key_current, value_current
-    new_cache = torch.stack([key, value], dim=3)
-
-    inner_dim = key.shape[-1]
-    head_dim = inner_dim // attn.heads
-    query = query.view(batch_size, q_len, attn.heads, head_dim).transpose(1, 2)
-    key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-    value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-    hidden_states = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=0.0,
-        is_causal=False,
-    )
-    hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, q_len, attn.heads * head_dim)
-    hidden_states = hidden_states.to(query.dtype)
-
-    hidden_states = attn.to_out[0](hidden_states)
-    hidden_states = attn.to_out[1](hidden_states)
-    return hidden_states, new_cache
-
-
 class SnakeBeta(nn.Module):
     """
     A modified Snake function which uses separate parameters for the magnitude of the periodic components
@@ -312,7 +261,6 @@ class BasicTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
-        cache: Optional[torch.Tensor] = None,
     ):
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 1. Self-Attention
@@ -327,21 +275,12 @@ class BasicTransformerBlock(nn.Module):
 
         cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
 
-        new_cache = None
-        if cache is not None and not self.only_cross_attention:
-            attn_output, new_cache = _self_attention_with_kv_cache(
-                self.attn1,
-                norm_hidden_states,
-                attention_mask,
-                cache,
-            )
-        else:
-            attn_output = self.attn1(
-                norm_hidden_states,
-                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-                attention_mask=encoder_attention_mask if self.only_cross_attention else attention_mask,
-                **cross_attention_kwargs,
-            )
+        attn_output = self.attn1(
+            norm_hidden_states,
+            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+            attention_mask=encoder_attention_mask if self.only_cross_attention else attention_mask,
+            **cross_attention_kwargs,
+        )
         if self.use_ada_layer_norm_zero:
             attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = attn_output + hidden_states
@@ -386,8 +325,6 @@ class BasicTransformerBlock(nn.Module):
 
         hidden_states = ff_output + hidden_states
 
-        if cache is not None:
-            return hidden_states, new_cache
         return hidden_states
 
 
@@ -573,19 +510,10 @@ class CausalConv1d(torch.nn.Conv1d):
         assert stride == 1
         self.causal_padding = kernel_size - 1
 
-    def forward(self, x: torch.Tensor, cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
-        if cache is None:
-            x = F.pad(x, (self.causal_padding, 0), value=0.0)
-        elif cache.size(2) == 0:
-            x = F.pad(x, (self.causal_padding, 0), value=0.0)
-        else:
-            assert cache.size(2) == self.causal_padding
-            x = torch.concat([cache, x], dim=2)
-        new_cache = x[:, :, -self.causal_padding:]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.pad(x, (self.causal_padding, 0), value=0.0)
         x = super(CausalConv1d, self).forward(x)
-        if cache is None:
-            return x
-        return x, new_cache
+        return x
 
 
 class CausalBlock1D(Block1D):
@@ -599,14 +527,9 @@ class CausalBlock1D(Block1D):
             nn.Mish(),
         )
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
-        if cache is None:
-            output = self.block(x * mask)
-            return output * mask
-        output, cache = self.block[0](x * mask, cache)
-        for module in self.block[1:]:
-            output = module(output)
-        return output * mask, cache
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        output = self.block(x * mask)
+        return output * mask
 
 
 class CausalResnetBlock1D(ResnetBlock1D):
@@ -614,22 +537,6 @@ class CausalResnetBlock1D(ResnetBlock1D):
         super(CausalResnetBlock1D, self).__init__(dim, dim_out, time_emb_dim, groups)
         self.block1 = CausalBlock1D(dim, dim_out)
         self.block2 = CausalBlock1D(dim_out, dim_out)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        time_emb: torch.Tensor,
-        block1_cache: Optional[torch.Tensor] = None,
-        block2_cache: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, ...]:
-        if block1_cache is None and block2_cache is None:
-            return super().forward(x, mask, time_emb)
-        h, block1_cache = self.block1(x, mask, block1_cache)
-        h += self.mlp(time_emb).unsqueeze(-1)
-        h, block2_cache = self.block2(h, mask, block2_cache)
-        output = h + self.res_conv(x * mask)
-        return output, block1_cache, block2_cache
 
 
 class ConditionalDecoder(nn.Module):
@@ -848,169 +755,6 @@ class ConditionalDecoder(nn.Module):
         x = self.final_block(x, mask_up)
         output = self.final_proj(x * mask_up)
         return output * mask
-
-    @torch.inference_mode()
-    def forward_chunk(self, x, mask, mu, t, spks=None, cond=None, cache: Optional[Dict[str, Any]] = None):
-        """Incremental decoder path with causal conv and self-attention caches."""
-        if not isinstance(self.final_block, CausalBlock1D):
-            raise NotImplementedError("forward_chunk is only valid for CausalConditionalDecoder")
-        cache = cache or {}
-        empty_conv = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
-        empty_kv = torch.zeros((0, 0, 0, 0), dtype=x.dtype, device=x.device)
-
-        t = self.time_embeddings(t).to(t.dtype)
-        t = self.time_mlp(t)
-
-        x = pack([x, mu], "b * t")[0]
-        if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
-        if cond is not None:
-            x = pack([x, cond], "b * t")[0]
-
-        hiddens = []
-        masks = [mask]
-        new_down_cache = []
-        down_cache = cache.get("down", [])
-        for index, (resnet, transformer_blocks, downsample) in enumerate(self.down_blocks):
-            block_cache = down_cache[index] if index < len(down_cache) else {}
-            mask_down = masks[-1]
-            x, res1_cache, res2_cache = resnet(
-                x,
-                mask_down,
-                t,
-                block_cache.get("res1", empty_conv),
-                block_cache.get("res2", empty_conv),
-            )
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            old_kv = block_cache.get("kv", [])
-            new_kv = []
-            for i, transformer_block in enumerate(transformer_blocks):
-                kv_cache = old_kv[i] if i < len(old_kv) else empty_kv
-                prev_len = kv_cache.size(1) if kv_cache.size(0) != 0 else 0
-                attn_mask = torch.ones(
-                    x.size(0),
-                    x.size(1),
-                    x.size(1) + prev_len,
-                    dtype=torch.bool,
-                    device=x.device,
-                )
-                attn_mask = mask_to_bias(attn_mask, x.dtype)
-                x, kv_cache = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                    cache=kv_cache,
-                )
-                new_kv.append(kv_cache)
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            hiddens.append(x)
-            if isinstance(downsample, CausalConv1d):
-                x, downsample_cache = downsample(x * mask_down, block_cache.get("downsample", empty_conv))
-            else:
-                x = downsample(x * mask_down)
-                downsample_cache = None
-            masks.append(mask_down[:, :, ::2])
-            new_down_cache.append({
-                "res1": res1_cache,
-                "res2": res2_cache,
-                "downsample": downsample_cache,
-                "kv": new_kv,
-            })
-        masks = masks[:-1]
-        mask_mid = masks[-1]
-
-        new_mid_cache = []
-        mid_cache = cache.get("mid", [])
-        for index, (resnet, transformer_blocks) in enumerate(self.mid_blocks):
-            block_cache = mid_cache[index] if index < len(mid_cache) else {}
-            x, res1_cache, res2_cache = resnet(
-                x,
-                mask_mid,
-                t,
-                block_cache.get("res1", empty_conv),
-                block_cache.get("res2", empty_conv),
-            )
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            old_kv = block_cache.get("kv", [])
-            new_kv = []
-            for i, transformer_block in enumerate(transformer_blocks):
-                kv_cache = old_kv[i] if i < len(old_kv) else empty_kv
-                prev_len = kv_cache.size(1) if kv_cache.size(0) != 0 else 0
-                attn_mask = torch.ones(
-                    x.size(0),
-                    x.size(1),
-                    x.size(1) + prev_len,
-                    dtype=torch.bool,
-                    device=x.device,
-                )
-                attn_mask = mask_to_bias(attn_mask, x.dtype)
-                x, kv_cache = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                    cache=kv_cache,
-                )
-                new_kv.append(kv_cache)
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            new_mid_cache.append({"res1": res1_cache, "res2": res2_cache, "kv": new_kv})
-
-        new_up_cache = []
-        up_cache = cache.get("up", [])
-        for index, (resnet, transformer_blocks, upsample) in enumerate(self.up_blocks):
-            block_cache = up_cache[index] if index < len(up_cache) else {}
-            mask_up = masks.pop()
-            skip = hiddens.pop()
-            x = pack([x[:, :, :skip.shape[-1]], skip], "b * t")[0]
-            x, res1_cache, res2_cache = resnet(
-                x,
-                mask_up,
-                t,
-                block_cache.get("res1", empty_conv),
-                block_cache.get("res2", empty_conv),
-            )
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            old_kv = block_cache.get("kv", [])
-            new_kv = []
-            for i, transformer_block in enumerate(transformer_blocks):
-                kv_cache = old_kv[i] if i < len(old_kv) else empty_kv
-                prev_len = kv_cache.size(1) if kv_cache.size(0) != 0 else 0
-                attn_mask = torch.ones(
-                    x.size(0),
-                    x.size(1),
-                    x.size(1) + prev_len,
-                    dtype=torch.bool,
-                    device=x.device,
-                )
-                attn_mask = mask_to_bias(attn_mask, x.dtype)
-                x, kv_cache = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                    cache=kv_cache,
-                )
-                new_kv.append(kv_cache)
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            if isinstance(upsample, CausalConv1d):
-                x, upsample_cache = upsample(x * mask_up, block_cache.get("upsample", empty_conv))
-            else:
-                x = upsample(x * mask_up)
-                upsample_cache = None
-            new_up_cache.append({
-                "res1": res1_cache,
-                "res2": res2_cache,
-                "upsample": upsample_cache,
-                "kv": new_kv,
-            })
-
-        x, final_cache = self.final_block(x, mask_up, cache.get("final", empty_conv))
-        output = self.final_proj(x * mask_up)
-        return output * mask, {
-            "down": new_down_cache,
-            "mid": new_mid_cache,
-            "up": new_up_cache,
-            "final": final_cache,
-        }
 
 
 class CausalConditionalDecoder(ConditionalDecoder):

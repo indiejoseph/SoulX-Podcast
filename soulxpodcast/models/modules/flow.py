@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -39,8 +38,7 @@ class CausalConditionalCFM(torch.nn.Module):
         self.estimator = CausalConditionalDecoder() if estimator is None else estimator
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False,
-                cache: Optional[Dict[str, Any]] = None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False):
         """Forward diffusion
 
         Args:
@@ -63,10 +61,6 @@ class CausalConditionalCFM(torch.nn.Module):
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        if cache is not None:
-            return self.solve_euler_cached(
-                z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, cache=cache
-            )
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming=False):
@@ -129,51 +123,6 @@ class CausalConditionalCFM(torch.nn.Module):
                 dt = t_span[step + 1] - t
 
         return sol[-1].float()
-
-    def solve_euler_cached(self, x, t_span, mu, mask, spks, cond, cache):
-        """Euler solver that keeps estimator caches separately per ODE step."""
-        batch_size = x.size(0)
-        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-        sol = []
-
-        x_in = torch.zeros([batch_size * 2, x.size(1), x.size(2)], device=x.device, dtype=x.dtype)
-        mask_in = torch.zeros([batch_size * 2, mask.size(1), mask.size(2)], device=x.device, dtype=x.dtype)
-        mu_in = torch.zeros([batch_size * 2, mu.size(1), mu.size(2)], device=x.device, dtype=x.dtype)
-        t_in = torch.zeros([batch_size * 2], device=x.device, dtype=x.dtype)
-        spks_in = torch.zeros([batch_size * 2, spks.size(1)], device=x.device, dtype=x.dtype)
-        cond_in = torch.zeros([batch_size * 2, cond.size(1), cond.size(2)], device=x.device, dtype=x.dtype)
-
-        old_step_caches = cache.get("steps", [])
-        new_step_caches = []
-        for step in range(1, len(t_span)):
-            x_in[:batch_size] = x
-            x_in[batch_size:] = x
-            mask_in[:batch_size] = mask
-            mask_in[batch_size:] = mask
-            mu_in[:batch_size] = mu
-            mu_in[batch_size:].zero_()
-            t_in.fill_(t)
-            spks_in[:batch_size] = spks
-            spks_in[batch_size:].zero_()
-            cond_in[:batch_size] = cond
-            cond_in[batch_size:].zero_()
-
-            step_cache = old_step_caches[step - 1] if step - 1 < len(old_step_caches) else None
-            dphi_dt, step_cache = self.estimator.forward_chunk(
-                x_in, mask_in, mu_in, t_in, spks_in, cond_in, cache=step_cache
-            )
-            new_step_caches.append(step_cache)
-
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
-            x = x + dt * dphi_dt
-            t = t + dt
-            sol.append(x)
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
-
-        cache["steps"] = new_step_caches
-        return sol[-1].float(), cache
 
 
 class CausalMaskedDiffWithXvec(torch.nn.Module):
@@ -250,75 +199,3 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             streaming=streaming
         )  # [B, num_mels, T]
         return feat.float(), h_lengths
-
-    @torch.inference_mode()
-    def forward_chunk_cached(self,
-                             token,
-                             token_len,
-                             context_token,
-                             prompt_feat,
-                             prompt_feat_len,
-                             embedding,
-                             cache: Optional[Dict[str, Any]] = None,
-                             n_timesteps: int = 15):
-        """Cache-aware Flow chunk inference.
-
-        `token` contains only the newly processable token block. On the first
-        call for an utterance it must include the speaker prompt tokens before
-        the generated block. `context_token` carries the trailing lookahead
-        tokens that should condition the encoder but not be emitted yet.
-        """
-        if n_timesteps <= 0:
-            raise ValueError(f"n_timesteps must be positive, got {n_timesteps}")
-        cache = cache or {}
-        first_chunk = not cache.get("started", False)
-
-        embedding = F.normalize(embedding, dim=1)
-        embedding = self.spk_embed_affine_layer(embedding)
-
-        mask = (~make_pad_mask(token_len, max_len=token.shape[1])).unsqueeze(-1).to(embedding)
-        token = self.input_embedding(torch.clamp(token, min=0)) * mask
-        if context_token.numel() > 0:
-            context = self.input_embedding(torch.clamp(context_token, min=0))
-        else:
-            context = torch.zeros(0, 0, 0, device=token.device, dtype=token.dtype)
-
-        encoder_cache = cache.get("encoder_cache", {})
-        h, masks, encoder_cache_tuple = self.encoder.forward_chunk(
-            token,
-            token_len,
-            context=context,
-            **encoder_cache,
-        )
-        cache["encoder_cache"] = {
-            "offset": encoder_cache_tuple[0],
-            "pre_lookahead_layer_conv2_cache": encoder_cache_tuple[1],
-            "encoders_kv_cache": encoder_cache_tuple[2],
-            "upsample_offset": encoder_cache_tuple[3],
-            "upsample_conv_cache": encoder_cache_tuple[4],
-            "upsample_kv_cache": encoder_cache_tuple[5],
-        }
-
-        h = self.encoder_proj(h)
-        conds = torch.zeros_like(h, device=token.device)
-        prompt_mel_len = 0
-        if first_chunk:
-            prompt_mel_len = int(prompt_feat_len[0].item())
-            prompt_mel_len = min(prompt_mel_len, h.shape[1])
-            conds[:, :prompt_mel_len] = prompt_feat[:, :prompt_mel_len]
-        conds = conds.transpose(1, 2)
-
-        h_lengths = masks.sum(dim=-1).squeeze(dim=1)
-        decoder_mask = masks.to(h)
-        feat, cache["decoder_cache"] = self.decoder(
-            mu=h.transpose(1, 2).contiguous(),
-            mask=decoder_mask,
-            spks=embedding,
-            cond=conds,
-            n_timesteps=n_timesteps,
-            cache=cache.get("decoder_cache", {}),
-        )
-        if first_chunk:
-            feat = feat[:, :, prompt_mel_len:]
-        cache["started"] = True
-        return feat.float(), h_lengths, cache

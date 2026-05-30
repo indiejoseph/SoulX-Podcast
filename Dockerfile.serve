@@ -57,7 +57,6 @@ ENV MODEL_PATH=/app/runs/merged \
     ENABLE_MTP=false \
     FLOW_STREAMING=true \
     FLOW_STEPS=4 \
-    FLOW_CHUNK_CACHE=true \
     STREAM_CHUNK_SIZE=150 \
     STREAM_FIRST_CHUNK_SIZE=4 \
     PROMPT_AUDIO_ROOT=/app \

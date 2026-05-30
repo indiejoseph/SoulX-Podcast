@@ -392,28 +392,12 @@ class SoulXPodcast(torch.nn.Module):
             accumulated_speech_tokens = []
             prev_audio_len = 0
             chunk_idx = 0
-            # FLOW_CHUNK_CACHE=1 enables the experimental cached-flow path
-            # (see flow.py:forward_chunk_cached). It is approximate vs. the
-            # default streaming=True path because per-chunk attention uses an
-            # all-ones mask rather than the static-chunk-mask used at training;
-            # we keep this path opt-in until quality has been validated.
-            use_flow_chunk_cache = (
-                flow_streaming
-                and os.getenv("FLOW_CHUNK_CACHE", "").lower() in {"1", "true", "yes", "on"}
-            )
-            flow_cache = None
-            flow_processed_tokens = 0
-            # HiFT is bandwidth-bound and per-call wall time is roughly flat
-            # across mel length (CLAUDE.md), so re-running it on the full
-            # accumulated mel each chunk costs ~0.05s/call regardless. Adding
-            # HiFT caching would target the smallest share of the per-call
-            # budget; skip it until flow caching itself is verified.
-            cached_mel_chunks = []
             # Low first_chunk_size is only useful for turn 0 (user is waiting for
             # first audio). For later turns the previous turn's audio is already
             # playing, so a tiny first chunk just wastes a full Flow call (~0.23s)
             # to emit ~40 ms of audio.
             effective_first_chunk_size = first_chunk_size if turn_i == 0 else chunk_size
+            audio = None
             try:
                 for chunk, is_final_partial in streamer.iter_chunks(
                     chunk_size=chunk_size,
@@ -427,47 +411,17 @@ class SoulXPodcast(torch.nn.Module):
                     # saving one ~0.23s Flow call per turn without losing any audio.
                     if is_final_partial and turn_i > 0:
                         break
-                    if use_flow_chunk_cache:
-                        process_until = max(0, len(accumulated_speech_tokens) - self.flow.pre_lookahead_len)
-                        new_tokens = accumulated_speech_tokens[flow_processed_tokens:process_until]
-                        context_tokens = accumulated_speech_tokens[process_until:]
-                        if not new_tokens:
-                            continue
-                        with torch.cuda.stream(flow_stream):
-                            mel_chunk, flow_cache = self._stream_synth_mel_chunk_cached(
-                                spk_prompt_speech_tokens,
-                                new_tokens,
-                                context_tokens,
-                                spk_prompt_mel,
-                                spk_prompt_mel_len_t,
-                                spk_emb,
-                                flow_cache=flow_cache,
-                                flow_steps=flow_steps,
-                            )
-                            cached_mel_chunks.append(mel_chunk)
-                            mel = torch.cat(cached_mel_chunks, dim=-1)
-                            if os.getenv("PROFILE_FLOW_STAGES"):
-                                torch.cuda.synchronize()
-                                _hift_t0 = time.perf_counter()
-                            audio, _ = self.hift(speech_feat=mel)
-                            if os.getenv("PROFILE_FLOW_STAGES"):
-                                torch.cuda.synchronize()
-                                tqdm.write(f"[PROFILE] cached_hift={time.perf_counter()-_hift_t0:.3f}s  mel_frames={mel.shape[-1]}")
-                        flow_processed_tokens = process_until
-                        new_audio = audio[:, prev_audio_len:].detach().cpu()
-                        prev_audio_len = audio.shape[-1]
-                    else:
-                        with torch.cuda.stream(flow_stream):
-                            audio = self._stream_synth_chunk(
-                                spk_prompt_speech_tokens, accumulated_speech_tokens,
-                                spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
-                                finalize=False,
-                                streaming=flow_streaming,
-                                flow_steps=flow_steps,
-                            )
-                        # `.detach().cpu()` syncs flow_stream — gives us the wav.
-                        new_audio = audio[:, prev_audio_len:].detach().cpu()
-                        prev_audio_len = audio.shape[-1]
+                    with torch.cuda.stream(flow_stream):
+                        audio = self._stream_synth_chunk(
+                            spk_prompt_speech_tokens, accumulated_speech_tokens,
+                            spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
+                            finalize=False,
+                            streaming=flow_streaming,
+                            flow_steps=flow_steps,
+                        )
+                    # `.detach().cpu()` syncs flow_stream — gives us the wav.
+                    new_audio = audio[:, prev_audio_len:].detach().cpu()
+                    prev_audio_len = audio.shape[-1]
                     yield {
                         "turn": turn_i,
                         "speaker": turn_spk,
@@ -479,59 +433,22 @@ class SoulXPodcast(torch.nn.Module):
                     chunk_idx += 1
 
                 # Final finalize=True flush to emit audio for trailing lookahead.
-                if use_flow_chunk_cache:
-                    remaining_tokens = accumulated_speech_tokens[flow_processed_tokens:]
-                    if remaining_tokens:
-                        with torch.cuda.stream(flow_stream):
-                            mel_chunk, flow_cache = self._stream_synth_mel_chunk_cached(
-                                spk_prompt_speech_tokens,
-                                remaining_tokens,
-                                [],
-                                spk_prompt_mel,
-                                spk_prompt_mel_len_t,
-                                spk_emb,
-                                flow_cache=flow_cache,
-                                flow_steps=flow_steps,
-                            )
-                            cached_mel_chunks.append(mel_chunk)
-                            mel = torch.cat(cached_mel_chunks, dim=-1)
-                            audio, _ = self.hift(speech_feat=mel)
-                        final_audio = audio[:, prev_audio_len:].detach().cpu()
-                    else:
-                        final_audio = torch.zeros(1, 0)
-                else:
-                    with torch.cuda.stream(flow_stream):
-                        audio = self._stream_synth_chunk(
-                            spk_prompt_speech_tokens, accumulated_speech_tokens,
-                            spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
-                            finalize=True,
-                            streaming=flow_streaming,
-                            flow_steps=flow_steps,
-                        )
-                    final_audio = audio[:, prev_audio_len:].detach().cpu()
-                if os.getenv("PROFILE_TURN_MEL"):
-                    # The cached path has the full turn mel already; for the
-                    # uncached path we slice from audio backward by mel_frames.
-                    if use_flow_chunk_cache and cached_mel_chunks:
-                        _full_mel = torch.cat(cached_mel_chunks, dim=-1).float()
-                        _mel_rms = _full_mel.pow(2).mean().sqrt().item()
-                        _mel_peak = _full_mel.abs().max().item()
-                        _mel_frames = _full_mel.shape[-1]
-                    else:
-                        _mel_rms = float("nan")
-                        _mel_peak = float("nan")
-                        _mel_frames = 0
-                    _full_audio = audio.float() if audio is not None else None
-                    if _full_audio is not None:
-                        _audio_rms = _full_audio.pow(2).mean().sqrt().item()
-                        _audio_peak = _full_audio.abs().max().item()
-                        _audio_samples = _full_audio.shape[-1]
-                    else:
-                        _audio_rms = float("nan"); _audio_peak = float("nan"); _audio_samples = 0
+                with torch.cuda.stream(flow_stream):
+                    audio = self._stream_synth_chunk(
+                        spk_prompt_speech_tokens, accumulated_speech_tokens,
+                        spk_prompt_mel, spk_prompt_mel_len_t, spk_emb,
+                        finalize=True,
+                        streaming=flow_streaming,
+                        flow_steps=flow_steps,
+                    )
+                final_audio = audio[:, prev_audio_len:].detach().cpu()
+                if os.getenv("PROFILE_TURN_MEL") and audio is not None:
+                    _a = audio.float()
                     tqdm.write(
                         f"[PROFILE-TURN] turn={turn_i} spk={turn_spk} "
-                        f"mel_frames={_mel_frames} mel_rms={_mel_rms:.4f} mel_peak={_mel_peak:.4f} "
-                        f"audio_samples={_audio_samples} audio_rms={_audio_rms:.4f} audio_peak={_audio_peak:.4f}"
+                        f"audio_samples={_a.shape[-1]} "
+                        f"audio_rms={_a.pow(2).mean().sqrt().item():.4f} "
+                        f"audio_peak={_a.abs().max().item():.4f}"
                     )
                 yield {
                     "turn": turn_i,
@@ -592,37 +509,3 @@ class SoulXPodcast(torch.nn.Module):
             mel_frames = mel.shape[-1]
             tqdm.write(f"[PROFILE] flow={_t1-_t0:.3f}s  hift={_t2-_t1:.3f}s  mel_frames={mel_frames}")
         return wav
-
-    def _stream_synth_mel_chunk_cached(self, prompt_speech_tokens, new_speech_tokens,
-                                       context_speech_tokens, prompt_mel,
-                                       prompt_mel_len_t, spk_emb, flow_cache,
-                                       flow_steps: int):
-        """Run cache-aware Flow on only the newly processable speech tokens."""
-        _time_stages = os.getenv("PROFILE_FLOW_STAGES")
-        device = prompt_mel.device
-        first_chunk = flow_cache is None or not flow_cache.get("started", False)
-        token_block = (prompt_speech_tokens + new_speech_tokens) if first_chunk else new_speech_tokens
-        flow_input = torch.tensor([token_block], device=device)
-        flow_input_len = torch.tensor([flow_input.shape[1]], device=device)
-        context_input = torch.tensor([context_speech_tokens], device=device)
-
-        if _time_stages:
-            torch.cuda.synchronize()
-            _t0 = time.perf_counter()
-        with torch.amp.autocast("cuda",
-                dtype=torch.float16 if self.config.hf_config.fp16_flow else torch.float32):
-            mel, _mel_lens, flow_cache = self.flow.forward_chunk_cached(
-                flow_input,
-                flow_input_len,
-                context_input,
-                prompt_mel,
-                prompt_mel_len_t,
-                spk_emb,
-                cache=flow_cache,
-                n_timesteps=flow_steps,
-            )
-        if _time_stages:
-            torch.cuda.synchronize()
-            _t1 = time.perf_counter()
-            tqdm.write(f"[PROFILE] cached_flow={_t1-_t0:.3f}s  mel_frames={mel.shape[-1]}")
-        return mel, flow_cache
