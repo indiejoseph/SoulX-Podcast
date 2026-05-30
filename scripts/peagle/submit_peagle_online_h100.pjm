@@ -43,6 +43,10 @@ SAVE_BEST="${SAVE_BEST:-1}"
 ON_GENERATE="${ON_GENERATE:-cache}"  # cache = generate once and reuse; delete = pure online
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
+WANDB="${WANDB:-0}"
+LOGGER="${LOGGER:-}"
+LOG_DIR="${LOG_DIR:-${WORK_DIR}/train_logs}"
+RUN_NAME="${RUN_NAME:-}"
 SEED="${SEED:-42}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 
@@ -123,6 +127,24 @@ fi
 SAVE_BEST_ARGS=()
 if [[ "${SAVE_BEST}" == "1" || "${SAVE_BEST}" == "true" ]]; then
   SAVE_BEST_ARGS=(--save-best)
+fi
+
+LOGGER_ARGS=()
+if [[ "${WANDB}" == "1" || "${WANDB}" == "true" ]]; then
+  LOGGER_ARGS+=(--wandb)
+  if [[ -z "${RUN_NAME}" ]]; then
+    RUN_NAME="peagle_soulx_h100_${JOB_ID}"
+  fi
+fi
+if [[ -n "${LOGGER}" ]]; then
+  LOGGER_ARGS+=(--logger "${LOGGER}")
+fi
+if [[ -n "${RUN_NAME}" ]]; then
+  LOGGER_ARGS+=(--run-name "${RUN_NAME}")
+fi
+if [[ ${#LOGGER_ARGS[@]} -gt 0 && -n "${LOG_DIR}" ]]; then
+  mkdir -p "${LOG_DIR}"
+  LOGGER_ARGS+=(--log-dir "${LOG_DIR}")
 fi
 
 cleanup() {
@@ -258,6 +280,7 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
   --prefetch-factor "${PREFETCH_FACTOR}" \
   --seed "${SEED}" \
   "${TARGET_LAYER_ARGS[@]}" \
+  "${LOGGER_ARGS[@]}" \
   "${SAVE_BEST_ARGS[@]}"
 
 echo "Writing vLLM speculative config"

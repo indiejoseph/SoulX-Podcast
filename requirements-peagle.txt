@@ -13,3 +13,4 @@
 
 speculators>=0.5.0
 vllm>=0.18
+wandb>=0.19

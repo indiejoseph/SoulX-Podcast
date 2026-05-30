@@ -79,6 +79,13 @@ def patch_speculators_checkout(args: argparse.Namespace) -> None:
     )
 
 
+def logger_arg(args: argparse.Namespace) -> str:
+    loggers = [item.strip() for item in args.logger.split(",") if item.strip()]
+    if args.wandb and "wandb" not in loggers:
+        loggers.append("wandb")
+    return ",".join(loggers)
+
+
 def prepare(args: argparse.Namespace) -> None:
     paths = common_paths(args)
     cmd = [
@@ -244,6 +251,13 @@ def train(args: argparse.Namespace) -> None:
     )
     if args.save_best:
         base_cmd.append("--save-best")
+    logger = logger_arg(args)
+    if logger:
+        base_cmd += ["--logger", logger]
+    if args.log_dir:
+        base_cmd += ["--log-dir", args.log_dir]
+    if args.run_name:
+        base_cmd += ["--run-name", args.run_name]
     for extra in args.extra_train_arg:
         base_cmd.append(extra)
 
@@ -366,6 +380,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--save-best", action="store_true")
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging via upstream Speculators --logger wandb.",
+    )
+    parser.add_argument(
+        "--logger",
+        default="",
+        help=(
+            "Upstream Speculators logger backend(s), e.g. 'wandb' or "
+            "'tensorboard,wandb'. --wandb appends wandb to this list."
+        ),
+    )
+    parser.add_argument("--log-dir", default=None)
+    parser.add_argument("--run-name", default=None)
     parser.add_argument("--extra-train-arg", action="append", default=[])
     parser.add_argument("--num-speculative-tokens", type=int, default=3)
     return parser.parse_args()

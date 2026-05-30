@@ -83,7 +83,9 @@ prepends `SPECULATORS_ROOT/src` and `SPECULATORS_ROOT` to `PYTHONPATH` so those
 scripts import matching source modules instead of a stale PyPI package.
 It also applies an idempotent local compatibility patch for online hidden-state
 training: PyTorch samplers can pass `numpy.int64` indices, while Hugging Face
-`Dataset.__getitem__` requires a plain Python `int`.
+`Dataset.__getitem__` requires a plain Python `int`, and the vLLM hidden-state
+connector can return a temporary `.safetensors` path before it is visible to
+the training worker.
 
 The implemented offline path is:
 
@@ -130,6 +132,20 @@ PREPARE_NUM_PROC=16 \
 VLLM_GPU_MEMORY_UTILIZATION=0.45 \
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
 ```
+
+Enable Weights & Biases logging with the PJM wrapper by setting `WANDB=1`.
+The wrapper maps this to Speculators' `--logger wandb` option:
+
+```bash
+WANDB=1 \
+WANDB_PROJECT=soulx-peagle \
+RUN_NAME=peagle-soulx-h100-v1 \
+pjsub scripts/peagle/submit_peagle_online_h100.pjm
+```
+
+Use `LOGGER=tensorboard,wandb` if you want to pass multiple Speculators logger
+backends. `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE=offline`, and
+`WANDB_API_KEY` are read by the `wandb` package from the environment.
 
 The prepare stage uses a batched `datasets.map` path when the input dataset
 already has `speech_tokens`. If `outputs/peagle_soulx_h100/preprocessed`
