@@ -1,0 +1,6 @@
+{
+  "method": "eagle3",
+  "model": "/app/peagle",
+  "num_speculative_tokens": 4,
+  "parallel_drafting": true
+}

@@ -1,0 +1,78 @@
+# SoulX-Podcast serving image with P-EAGLE speculative decoding.
+#
+# Requires vLLM >= 0.22.0 — that's where P-EAGLE inference support landed
+# (vllm-project/vllm#41826). vLLM auto-translates the speculators
+# `speculators_model_type: "peagle"` checkpoint into eagle3 + parallel_drafting
+# internally, so configs/peagle_speculative.json only points at the drafter
+# path. The speculators 0.5.0 PyPI package is kept for the
+# PEagleSpeculatorConfig auto_map; no peagle inference logic ships there.
+#
+# This image does NOT apply the Soul-AILab vLLM 0.10.1 RAS C++ patch
+# (incompatible with 0.22 internals); RAS runs via the V1 model-owned sampler
+# hook (soulxpodcast.engine.vllm_ras.install_soulx_vllm_ras_sampler).
+FROM vllm/vllm-openai:v0.22.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1
+
+ARG INSTALL_TRT=true
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+COPY api/requirements.txt /tmp/api-requirements.txt
+
+# vLLM 0.18 ships its own torch / triton; do not let pip downgrade them.
+# transformers is also bumped by vLLM 0.18 — drop the 4.57.1 pin so pip keeps
+# vllm's compatible version. Same for accelerate.
+RUN grep -vE '^(torch|torchaudio|triton|transformers|accelerate)([>=<!]|$)' /tmp/requirements.txt \
+        > /tmp/requirements_notorch.txt && \
+    pip3 install -r /tmp/requirements_notorch.txt -r /tmp/api-requirements.txt && \
+    pip3 install 'speculators>=0.5.0' && \
+    # speculators pulls datasets>=4.0, which replaces soundfile with torchcodec
+    # for audio decoding. The SoulX dataloader's prompt audio path goes through
+    # this code, so torchcodec must be installed.
+    pip3 install torchcodec && \
+    if [ "${INSTALL_TRT}" = "true" ]; then \
+        pip3 install --extra-index-url https://pypi.nvidia.com tensorrt; \
+    fi
+
+COPY . /app
+
+RUN groupadd --system app && \
+    useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app && \
+    mkdir -p /app/api/temp /app/api/outputs && \
+    chown -R app:app /app
+
+# vLLM V1 is mandatory for P-EAGLE speculative decoding.
+# The model-owned RAS sampler hook substitutes for the V0 source patch.
+ENV MODEL_PATH=/app/runs/merged \
+    LLM_ENGINE=vllm \
+    VLLM_USE_V1=1 \
+    VLLM_ENFORCE_EAGER=false \
+    VLLM_SPECULATIVE_CONFIG=/app/configs/peagle_speculative.json \
+    SOULX_VLLM_MODEL_RAS=1 \
+    ENABLE_MTP=false \
+    FP16_FLOW=true \
+    FLOW_STREAMING=true \
+    FLOW_STEPS=4 \
+    STREAM_CHUNK_SIZE=100 \
+    STREAM_FIRST_CHUNK_SIZE=4 \
+    PROMPT_AUDIO_ROOT=/app \
+    PROMPT_CACHE_SIZE=16 \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000
+
+EXPOSE 8000
+
+USER app
+
+ENTRYPOINT ["python3", "run_api.py"]
+CMD []

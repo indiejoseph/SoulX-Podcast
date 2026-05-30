@@ -143,7 +143,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 
 3. **Two different mel dims:** `prompt_mels_for_llm` is 128-dim (LLM prefix), `prompt_mels_for_flow_ori` is 80-dim (flow conditioning). Never swap them.
 
-4. **Speech token offset math:** s3tokenizer outputs are 0-based; LLM inputs/outputs are offset by `speech_token_offset` (152,927). Apply/strip the offset at every text↔speech boundary.
+4. **Speech token offset math:** s3tokenizer outputs are 0-based; LLM inputs/outputs are offset by `speech_token_offset` (153,595 — the tokenizer ID of `<|0|>`; see `soulxpodcast/config.py:42`, overridable via `soulxpodcast_config.json`). Apply/strip the offset at every text↔speech boundary. Speech tokens span IDs 153,595..160,155 (`<|0|>`..`<|6560|>`).
 
 5. **vLLM streaming is a post-hoc replay** in `VLLMEngine.generate` — tokens stream out only after `model.generate()` returns. True vLLM token streaming would require the async vLLM API.
 

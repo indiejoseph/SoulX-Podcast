@@ -66,6 +66,81 @@ services:
       retries: 5
       start_period: 120s
 
+  # P-EAGLE serving variant — vLLM 0.18 + speculators 0.5.0.
+  # Start with: docker compose --profile peagle up tts-peagle
+  # (Stop tts first; both services bind the same GPU and port.)
+  tts-peagle:
+    profiles: ["peagle"]
+    build:
+      context: .
+      dockerfile: Dockerfile.serve-peagle
+      args:
+        INSTALL_TRT: "${INSTALL_TRT:-true}"
+    image: tts-peagle:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "16gb"
+    ipc: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    environment:
+      MODEL_PATH: "${MODEL_PATH:-/app/runs/merged}"
+      LLM_ENGINE: vllm
+      VLLM_USE_V1: "1"
+      VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-false}"
+      VLLM_SPECULATIVE_CONFIG: "${VLLM_SPECULATIVE_CONFIG:-/app/configs/peagle_speculative.json}"
+      SOULX_VLLM_MODEL_RAS: "${SOULX_VLLM_MODEL_RAS:-1}"
+      HF_PROMPT_PREFIX_CACHE: "${HF_PROMPT_PREFIX_CACHE:-false}"
+      FP16_FLOW: "${FP16_FLOW:-true}"
+      ENABLE_MTP: "false"
+      FLOW_STREAMING: "${FLOW_STREAMING:-true}"
+      FLOW_STEPS: "${FLOW_STEPS:-4}"
+      TORCH_COMPILE: "${TORCH_COMPILE:-false}"
+      STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-100}"
+      STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"
+      TRT_ESTIMATOR: "${TRT_ESTIMATOR:-false}"
+      TRT_ONNX: "${TRT_ONNX:-/app/exports/flow_runtime/flow.decoder.estimator.fp32.streaming.onnx}"
+      TRT_PLAN: "${TRT_PLAN:-/app/exports/flow_runtime/flow.decoder.estimator.fp16.streaming.plan}"
+      TRT_OPT_MEL_LEN: "${TRT_OPT_MEL_LEN:-256}"
+      PROMPT_AUDIO_ROOT: "${PROMPT_AUDIO_ROOT:-/app}"
+      PROMPT_CACHE_SIZE: "${PROMPT_CACHE_SIZE:-16}"
+      PROMPT_CACHE_TTL_SECONDS: "${PROMPT_CACHE_TTL_SECONDS:-3600}"
+      PROMPT_CACHE_STORE_INLINE_AUDIO: "${PROMPT_CACHE_STORE_INLINE_AUDIO:-false}"
+      API_KEY: "${API_KEY:?API_KEY must be set}"
+      REQUIRE_API_KEY: "${REQUIRE_API_KEY:-true}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
+      CORS_ALLOW_CREDENTIALS: "${CORS_ALLOW_CREDENTIALS:-false}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-tts}"
+      TASK_TTL_SECONDS: "${TASK_TTL_SECONDS:-86400}"
+    volumes:
+      - ./pretrained_models:/app/pretrained_models:ro
+      - ./runs:/app/runs:ro
+      - ./exports:/app/exports
+      - ./example:/app/example:ro
+      - ./api/outputs:/app/api/outputs
+      - ./api/temp:/app/api/temp
+      - ./configs:/app/configs:ro
+      # Mount the trained P-EAGLE drafter at the path referenced by
+      # peagle_speculative.json. Override PEAGLE_DRAFTER to point at a
+      # different checkpoint. Kept outside /app/runs because that mount
+      # is read-only, which blocks nested bind mounts.
+      - "${PEAGLE_DRAFTER:-./outputs/4}:/app/peagle:ro"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); assert data['status'] == 'healthy'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
