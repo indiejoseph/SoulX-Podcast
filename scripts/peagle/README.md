@@ -130,6 +130,10 @@ already has `speech_tokens`. If `outputs/peagle_soulx_h100/preprocessed`
 already contains `token_freq.pt` and `soulx_peagle_prepare_summary.json`, the
 PJM script reuses it. Set `FORCE_PREPARE=1` to rebuild.
 
+The hidden-state vLLM server is launched with `--no-enable-chunked-prefill`
+because Speculators' `ExampleHiddenStatesConnector` rejects chunked prefill in
+vLLM `0.22.x`.
+
 Prepare the dataset:
 
 ```bash

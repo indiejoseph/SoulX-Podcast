@@ -203,6 +203,7 @@ echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
   --vllm-arg=--data-parallel-size --vllm-arg=1 \
   --vllm-arg=--gpu-memory-utilization --vllm-arg="${VLLM_GPU_MEMORY_UTILIZATION}" \
   --vllm-arg=--max-model-len --vllm-arg="${VLLM_MAX_MODEL_LEN}" \
+  --vllm-arg=--no-enable-chunked-prefill \
   > "${VLLM_LOG}" 2>&1 &
 VLLM_PID=$!
 
