@@ -64,6 +64,21 @@ def speculators_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+def patch_speculators_checkout(args: argparse.Namespace) -> None:
+    if args.dry_run:
+        return
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "peagle" / "patch_speculators_checkout.py"),
+            "--speculators-root",
+            args.speculators_root,
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+
 def prepare(args: argparse.Namespace) -> None:
     paths = common_paths(args)
     cmd = [
@@ -161,6 +176,7 @@ def generate_hidden_states(args: argparse.Namespace) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
+    patch_speculators_checkout(args)
     paths = common_paths(args)
     spec_root = Path(args.speculators_root)
     train_script = script_path(spec_root, "train.py", require=not args.dry_run)

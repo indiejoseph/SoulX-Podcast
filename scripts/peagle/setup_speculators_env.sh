@@ -15,6 +15,9 @@ else
   git -C "${SPECULATORS_ROOT}" fetch --all --tags --prune
 fi
 
+python3 scripts/peagle/patch_speculators_checkout.py \
+  --speculators-root "${SPECULATORS_ROOT}"
+
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required. Install uv or create ${SPECULATORS_VENV} manually." >&2
   exit 1

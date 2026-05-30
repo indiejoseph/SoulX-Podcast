@@ -106,6 +106,9 @@ PYTHON_BIN="$(command -v python)"
 JOB_ID="${PJM_JOBID:-manual}"
 VLLM_LOG="${PROJECT_DIR}/logs/peagle_vllm_${JOB_ID}.log"
 
+"${PYTHON_BIN}" scripts/peagle/patch_speculators_checkout.py \
+  --speculators-root "${SPECULATORS_ROOT}"
+
 TARGET_LAYER_ARGS=()
 if [[ -n "${TARGET_LAYER_IDS}" ]]; then
   read -r -a TARGET_LAYER_ARRAY <<< "${TARGET_LAYER_IDS}"

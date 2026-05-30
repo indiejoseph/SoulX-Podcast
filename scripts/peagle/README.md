@@ -81,6 +81,9 @@ checkout is needed because the wrapper calls `scripts/launch_vllm.py`,
 The setup helper installs the checkout in editable mode and the wrapper
 prepends `SPECULATORS_ROOT/src` and `SPECULATORS_ROOT` to `PYTHONPATH` so those
 scripts import matching source modules instead of a stale PyPI package.
+It also applies an idempotent local compatibility patch for online hidden-state
+training: PyTorch samplers can pass `numpy.int64` indices, while Hugging Face
+`Dataset.__getitem__` requires a plain Python `int`.
 
 The implemented offline path is:
 
@@ -142,6 +145,9 @@ The PJM script also disables optional DeepGEMM FP8 kernel paths by default:
 `VLLM_USE_DEEP_GEMM_E8M0=0`, and `VLLM_DEEP_GEMM_WARMUP=skip`. This avoids
 startup failures on H100 nodes where vLLM `0.22.x` detects DeepGEMM support but
 the installed `deep_gemm` package is missing or too old.
+Before training, the PJM script applies the same Speculators index patch as the
+setup helper, so resubmitted jobs do not need a manual edit inside
+`third_party/speculators`.
 
 Prepare the dataset:
 
