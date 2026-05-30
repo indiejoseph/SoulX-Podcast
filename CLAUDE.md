@@ -151,14 +151,31 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 
 **Structural ceiling at chunk=150 (broken by flow chunk cache):** flow+HiFT was averaging ~0.31s/call (20 calls for a 30s dialogue), of which flow is ~84% and HiFT ~16%. With `FLOW_CHUNK_CACHE=1`, per-chunk flow time is nearly constant (~0.21s for chunk=150) instead of growing with accumulated sequence length — direct flow+HiFT wall on a 32s dialogue drops -50.6%. End-to-end RTF improvement pending `bench_stream.py` confirmation.
 
-**Current best (measured end-to-end without flow cache):** RTF=0.262 (long, ~30s audio) / RTF=0.391 (short, ~6s audio), TTFA=0.64s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+**Current best (measured end-to-end with FLOW_CHUNK_CACHE=1):** RTF=0.245 (~30s audio), TTFA=0.77s on a 3-turn dialogue. Prior baseline without cache was RTF=0.262 — so end-to-end gain is only **~6.5%**, not the -50.6% the flow-only bench suggested.
 
-**With `FLOW_CHUNK_CACHE=1` (now docker default; flow+HiFT bench only — pending end-to-end `bench_stream.py` confirmation):** direct flow+HiFT wall drops -50.6% on long content. Projected end-to-end long RTF in the ~0.15–0.20 range depending on how much of the 0.262 baseline was flow+HiFT vs LLM.
+**Why the end-to-end gain is small:** LLM (in the worker thread on `llm_stream`) and Flow+HiFT (in the main thread on `flow_stream`) already overlap via B3 dual streams. The wall is bounded by `max(LLM, Flow+HiFT) + serial overhead`. Before the cache, LLM was already ~4.2s and Flow+HiFT was ~3.5s on long content — close enough that LLM was the practical bottleneck. The cache shrinks Flow+HiFT to ~2.9s, but the wall stays pinned to LLM (~4.5s effective).
+
+**Per-stage profile (vLLM CUDA graphs, FLOW_STEPS=4, FLOW_CHUNK_CACHE=1, chunk=150, 3-turn ~30s dialogue, RTX 3090):**
+
+| Stage | Wall | % of wall | Notes |
+|---|---|---|---|
+| LLM (implied = wall − flow+HiFT) | ~4.5s | **~60%** | 🏆 new bottleneck — LLM hides flow via B3 overlap |
+| Flow (cached) | ~2.4s | ~32% | 9 calls × ~280ms avg |
+| HiFT | ~0.4s | ~5% | 6 calls × ~66ms (first ~150ms cold, rest ~50ms) |
+| Frontend (`process_single_input`) | ~0.33s | ~4% | text tokenize + prompt mel extract |
+| Total wall | ~7.3s | 100% | end-to-end on 30s audio |
+
+Measured via `scripts/inference/profile_pipeline.py vllm 150`.
 
 ## Implications for PLAN.md phases
 
-- **Phase 0 inference optimization is now flow-cache-bound.** RTF=0.262 (long) / 0.391 (short) was the prior ceiling. `FLOW_CHUNK_CACHE=1` collapsed flow+HiFT wall O(N²)→O(N) on long content (-50.6%). End-to-end confirmation pending.
-- **Flow (not HiFT) was the bottleneck at chunk=150** — flow was 84% of per-call time. Flow caching now amortises that 84% across chunks, so the LLM and HiFT fixed costs become the next shares to investigate.
+- **Phase 0 inference optimization is LLM-bound.** Flow cache moved the bottleneck from flow to LLM by collapsing flow+HiFT wall O(N²)→O(N). But because B3 already overlapped LLM and flow, the end-to-end win is only ~6.5%. Further flow optimization is now nearly free of end-to-end benefit.
+- **LLM is the next high-value lever.** ~60% of wall is LLM-bound, and ~25% of wall is *exclusive* LLM time (after the overlap with flow). The remaining flow share (32%) is already shadowed by LLM, so cutting it further does not reduce wall.
+- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 3.7× regression on current vLLM RTF 0.245 — net loss even after MTP's ~1.8×. The viable moves are:
+  - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B) — vLLM 0.10 supports this natively, no patch needed; typical 1.5–2× on memory-bandwidth-bound decode.
+  - **INT4 / AWQ quantization** of Qwen3-1.7B served under vLLM — `scripts/inference/quantize_awq.py` already exists; verify the AWQ checkpoint runs under vLLM CUDA graphs.
+  - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
+  - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
 - **The fastest available lever is larger chunks.** chunk=250–400 tokens halves the flow call count, saving ~20–30% wall time at the cost of higher TTFA. No code change needed — just config.
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved.

@@ -158,6 +158,7 @@ class SoulXPodcast(torch.nn.Module):
             prompt_mel_len = prompt_mel.shape[0]
             if prompt_speech_token_len * 2 > prompt_mel_len:
                 prompt_speech_token = prompt_speech_token[:int(prompt_mel_len/2)]
+                prompt_mel = prompt_mel.detach().clone().cuda()
                 prompt_mel_len = torch.tensor([prompt_mel_len]).cuda()
             else:
                 prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].cuda()
@@ -298,6 +299,7 @@ class SoulXPodcast(torch.nn.Module):
             prompt_mel_len = prompt_mel.shape[0]
             if prompt_speech_token_len * 2 > prompt_mel_len:
                 prompt_speech_token = prompt_speech_token[:int(prompt_mel_len/2)]
+                prompt_mel = prompt_mel.detach().clone().cuda()
                 prompt_mel_len = torch.tensor([prompt_mel_len]).cuda()
             else:
                 prompt_mel = prompt_mel.detach().clone()[:prompt_speech_token_len * 2].cuda()
@@ -435,7 +437,13 @@ class SoulXPodcast(torch.nn.Module):
                             )
                             cached_mel_chunks.append(mel_chunk)
                             mel = torch.cat(cached_mel_chunks, dim=-1)
+                            if os.getenv("PROFILE_FLOW_STAGES"):
+                                torch.cuda.synchronize()
+                                _hift_t0 = time.perf_counter()
                             audio, _ = self.hift(speech_feat=mel)
+                            if os.getenv("PROFILE_FLOW_STAGES"):
+                                torch.cuda.synchronize()
+                                tqdm.write(f"[PROFILE] cached_hift={time.perf_counter()-_hift_t0:.3f}s  mel_frames={mel.shape[-1]}")
                         flow_processed_tokens = process_until
                         new_audio = audio[:, prev_audio_len:].detach().cpu()
                         prev_audio_len = audio.shape[-1]
