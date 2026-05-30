@@ -138,18 +138,17 @@ def _ras_sample_hf_engine(
         # pre-process distribution
         next_token_scores = logits_processor(input_ids, next_token_logits)
 
-        # Repetition Aware Sampling in VALL-E 2. Reuse the first sampled
-        # candidate in the common non-repetition case instead of sampling twice.
-        reused_ras_candidate = False
+        # Repetition Aware Sampling in VALL-E 2. Candidate sampled once; reused
+        # when no repetition reset is needed to avoid a second multinomial draw.
+        ras_candidate = None
         if use_ras:
             probs_candidate = nn.functional.softmax(next_token_scores, dim=-1)
-            next_tokens_candidate = torch.multinomial(probs_candidate, num_samples=1).squeeze(1)
-            rep_num = (input_ids[:, -win_size:] == next_tokens_candidate).sum().item() + 1
-            if rep_num < win_size * tau_r:
-                next_tokens = next_tokens_candidate
-                reused_ras_candidate = True
-            else:
+            ras_candidate = torch.multinomial(probs_candidate, num_samples=1).squeeze(1)
+            rep_num = (input_ids[:, -win_size:] == ras_candidate).sum().item() + 1
+            if rep_num >= win_size * tau_r:
+                # Repetition detected — reset to raw logits and resample below.
                 next_token_scores = next_token_logits
+                ras_candidate = None
 
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate:
@@ -172,13 +171,14 @@ def _ras_sample_hf_engine(
                 )
 
         # token selection
-        if not reused_ras_candidate:
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+        if ras_candidate is not None:
+            next_tokens = ras_candidate
+        elif do_sample:
+            probs = nn.functional.softmax(next_token_scores, dim=-1)
+            # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        else:
+            next_tokens = torch.argmax(next_token_scores, dim=-1)
 
         # finished sentences should have their next token be a padding token
         if has_eos_stopping_criteria:

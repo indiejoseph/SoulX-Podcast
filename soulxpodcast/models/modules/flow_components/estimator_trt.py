@@ -49,9 +49,14 @@ def build_or_load_engine(
 
     print(f"[trt] building engine from {onnx_path} (fp16={fp16}, opt={opt_mel_len})...")
     builder = trt.Builder(logger)
-    network = builder.create_network(
-        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    )
+    # EXPLICIT_BATCH removed in TRT 10+ (always-on); flag only needed for TRT < 10
+    trt_major = int(trt.__version__.split(".")[0])
+    if trt_major < 10:
+        network = builder.create_network(
+            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+        )
+    else:
+        network = builder.create_network()
     parser = trt.OnnxParser(network, logger)
     with open(onnx_path, "rb") as f:
         if not parser.parse(f.read()):
@@ -63,8 +68,20 @@ def build_or_load_engine(
     config.set_memory_pool_limit(
         trt.MemoryPoolType.WORKSPACE, int(workspace_gb * 1024 ** 3)
     )
+    # TRT 10+ removed the global FP16 BuilderFlag — set precision per-layer instead.
+    # TRT < 10: use the global FP16 permissive flag.
     if fp16:
-        config.set_flag(trt.BuilderFlag.FP16)
+        if trt_major < 10 and hasattr(trt.BuilderFlag, "FP16"):
+            config.set_flag(trt.BuilderFlag.FP16)
+        else:
+            for i in range(network.num_layers):
+                layer = network.get_layer(i)
+                try:
+                    layer.precision = trt.DataType.HALF
+                    for j in range(layer.num_outputs):
+                        layer.set_output_type(j, trt.DataType.HALF)
+                except Exception:
+                    pass  # some layers don't support FP16 — skip silently
 
     profile = builder.create_optimization_profile()
     profile.set_shape("x",    (2, 80, min_mel_len), (2, 80, opt_mel_len), (2, 80, max_mel_len))
@@ -103,7 +120,14 @@ class FlowEstimatorTRT(torch.nn.Module):
         super().__init__()
         self.engine = engine
         self.context = engine.create_execution_context()
-        # No torch parameters — just a runtime adapter. eval() is a no-op.
+        # Discover output tensor name from the engine (varies by ONNX exporter version).
+        n = engine.num_io_tensors
+        import tensorrt as trt
+        self._output_name = next(
+            engine.get_tensor_name(i) for i in range(n)
+            if engine.get_tensor_mode(engine.get_tensor_name(i)) == trt.TensorIOMode.OUTPUT
+        )
+        print(f"[trt] engine output tensor: {self._output_name}")
 
     def forward(self, x, mask, mu, t, spks, cond, streaming):
         # Cast everything to fp32 for the engine. The engine internally uses
@@ -130,7 +154,7 @@ class FlowEstimatorTRT(torch.nn.Module):
         self.context.set_tensor_address("t", t32.data_ptr())
         self.context.set_tensor_address("spks", spks32.data_ptr())
         self.context.set_tensor_address("cond", cond32.data_ptr())
-        self.context.set_tensor_address("dphi_dt", out.data_ptr())
+        self.context.set_tensor_address(self._output_name, out.data_ptr())
 
         stream = torch.cuda.current_stream()
         ok = self.context.execute_async_v3(stream.cuda_stream)
