@@ -52,6 +52,14 @@ def common_paths(args: argparse.Namespace) -> dict[str, Path]:
     }
 
 
+def speculators_env(args: argparse.Namespace) -> dict[str, str]:
+    env = os.environ.copy()
+    spec_root = str(Path(args.speculators_root).resolve())
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = spec_root if not existing else spec_root + os.pathsep + existing
+    return env
+
+
 def prepare(args: argparse.Namespace) -> None:
     paths = common_paths(args)
     cmd = [
@@ -109,7 +117,7 @@ def launch_vllm(args: argparse.Namespace) -> None:
     if target_layer_ids:
         cmd += ["--target-layer-ids", *target_layer_ids]
     cmd += ["--", *args.vllm_arg]
-    run(cmd, dry_run=args.dry_run)
+    run(cmd, dry_run=args.dry_run, env=speculators_env(args))
 
 
 def generate_hidden_states(args: argparse.Namespace) -> None:
@@ -145,7 +153,7 @@ def generate_hidden_states(args: argparse.Namespace) -> None:
         cmd.append("--validate-outputs")
     if args.fail_on_error:
         cmd.append("--fail-on-error")
-    run(cmd, dry_run=args.dry_run)
+    run(cmd, dry_run=args.dry_run, env=speculators_env(args))
 
 
 def train(args: argparse.Namespace) -> None:
@@ -231,7 +239,7 @@ def train(args: argparse.Namespace) -> None:
         ]
     else:
         cmd = [args.speculators_python, *base_cmd]
-    run(cmd, dry_run=args.dry_run)
+    run(cmd, dry_run=args.dry_run, env=speculators_env(args))
 
 
 def write_config(args: argparse.Namespace) -> None:

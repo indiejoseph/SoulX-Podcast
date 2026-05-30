@@ -78,6 +78,9 @@ This creates `${PROJECT_DIR}/third_party/speculators` and
 Python package alone is not enough for this wrapper; the upstream source
 checkout is needed because the wrapper calls `scripts/launch_vllm.py`,
 `scripts/data_generation_offline.py`, and `scripts/train.py` from that checkout.
+The setup helper installs the checkout in editable mode and the wrapper
+prepends `SPECULATORS_ROOT` to `PYTHONPATH` so those scripts import matching
+source modules instead of a stale PyPI package.
 
 The implemented offline path is:
 

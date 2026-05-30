@@ -98,6 +98,7 @@ export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
 export VLLM_USE_DEEP_GEMM_E8M0="${VLLM_USE_DEEP_GEMM_E8M0:-0}"
 export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+export PYTHONPATH="${SPECULATORS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 mkdir -p "${WORK_DIR}" "${PROJECT_DIR}/logs" "$(dirname "${SPEC_CONFIG_OUTPUT}")"
 
@@ -165,6 +166,19 @@ PY
 
 echo "Checking P-EAGLE/vLLM environment"
 "${PYTHON_BIN}" scripts/peagle/check_vllm_speculative_support.py
+"${PYTHON_BIN}" - <<'PY'
+import importlib.util
+import speculators
+
+print(f"speculators package: {speculators.__file__}")
+missing = [
+    name
+    for name in ("speculators.models.metrics", "speculators.models.peagle")
+    if importlib.util.find_spec(name) is None
+]
+if missing:
+    raise SystemExit(f"missing required speculators modules: {missing}")
+PY
 
 echo "Preparing SoulX P-EAGLE dataset"
 if [[ "${FORCE_PREPARE}" != "1" \

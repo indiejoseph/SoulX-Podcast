@@ -23,8 +23,23 @@ fi
 uv venv "${SPECULATORS_VENV}"
 source "${SPECULATORS_VENV}/bin/activate"
 uv pip install -r requirements-peagle.txt
+uv pip install -e "${SPECULATORS_ROOT}"
 
+export PYTHONPATH="${SPECULATORS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 python scripts/peagle/check_vllm_speculative_support.py
+python - <<'PY'
+import importlib.util
+import speculators
+
+print(f"speculators package: {speculators.__file__}")
+missing = [
+    name
+    for name in ("speculators.models.metrics", "speculators.models.peagle")
+    if importlib.util.find_spec(name) is None
+]
+if missing:
+    raise SystemExit(f"missing required speculators modules: {missing}")
+PY
 
 echo "Speculators root: ${SPECULATORS_ROOT}"
 echo "Speculators venv: ${SPECULATORS_VENV}"
