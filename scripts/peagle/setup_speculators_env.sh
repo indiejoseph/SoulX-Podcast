@@ -4,7 +4,7 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
-SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/speculators_venv}"
+SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/.speculators_venv}"
 
 cd "${PROJECT_DIR}"
 

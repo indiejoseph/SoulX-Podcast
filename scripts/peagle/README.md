@@ -73,6 +73,12 @@ Clone Speculators and install the separate requirements:
 scripts/peagle/setup_speculators_env.sh
 ```
 
+This creates `${PROJECT_DIR}/third_party/speculators` and
+`${PROJECT_DIR}/.speculators_venv` by default. Installing the `speculators`
+Python package alone is not enough for this wrapper; the upstream source
+checkout is needed because the wrapper calls `scripts/launch_vllm.py`,
+`scripts/data_generation_offline.py`, and `scripts/train.py` from that checkout.
+
 The implemented offline path is:
 
 1. Prepare SoulX `text` / `speech_tokens` / `lang` rows into Speculators Arrow format.

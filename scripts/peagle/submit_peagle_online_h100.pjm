@@ -13,7 +13,7 @@ PROJECT_DIR="${PROJECT_DIR:-/home/pj24001684/ku40000295/jc/projects/SoulX-Podcas
 DATASET_PATH="${DATASET_PATH:-/home/pj24001684/ku40000295/jc/projects/tts202509/dataset_with_tokens_16khz}"
 MODEL_PATH="${MODEL_PATH:-${PROJECT_DIR}/runs/merged}"
 SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
-SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/speculators_venv}"
+SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/.speculators_venv}"
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100}"
 SPEC_CONFIG_OUTPUT="${SPEC_CONFIG_OUTPUT:-${PROJECT_DIR}/exports/peagle/speculative_config.json}"
 PREPROCESSED_DIR="${WORK_DIR}/preprocessed"
@@ -52,6 +52,12 @@ TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-}"
 
 cd "${PROJECT_DIR}"
 
+echo "Resolved P-EAGLE paths:"
+echo "  PROJECT_DIR=${PROJECT_DIR}"
+echo "  SPECULATORS_ROOT=${SPECULATORS_ROOT}"
+echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
+echo "  WORK_DIR=${WORK_DIR}"
+
 if [[ ! -f "${SPECULATORS_ROOT}/scripts/launch_vllm.py" \
       || ! -f "${SPECULATORS_ROOT}/scripts/train.py" ]]; then
   cat >&2 <<EOF
@@ -60,10 +66,7 @@ Speculators checkout is missing or incomplete:
 
 Install it before submitting:
   cd ${PROJECT_DIR}
-  git clone https://github.com/vllm-project/speculators.git ${SPECULATORS_ROOT}
-  uv venv ${SPECULATORS_VENV}
-  source ${SPECULATORS_VENV}/bin/activate
-  uv pip install -r requirements-peagle.txt
+  SPECULATORS_ROOT=${SPECULATORS_ROOT} SPECULATORS_VENV=${SPECULATORS_VENV} scripts/peagle/setup_speculators_env.sh
 
 Or submit with SPECULATORS_ROOT=/path/to/speculators.
 EOF
@@ -77,9 +80,7 @@ Speculators virtualenv is missing:
 
 Create it before submitting:
   cd ${PROJECT_DIR}
-  uv venv ${SPECULATORS_VENV}
-  source ${SPECULATORS_VENV}/bin/activate
-  uv pip install -r requirements-peagle.txt
+  SPECULATORS_ROOT=${SPECULATORS_ROOT} SPECULATORS_VENV=${SPECULATORS_VENV} scripts/peagle/setup_speculators_env.sh
 EOF
   exit 2
 fi
