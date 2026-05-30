@@ -91,6 +91,13 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export VLLM_USE_V1=1
 export SOULX_VLLM_MODEL_RAS=1
+# vLLM 0.22 may try to warm up optional DeepGEMM FP8 kernels on H100 and
+# crash when the bundled/external deep_gemm package is missing or outdated.
+# The hidden-state verifier is Qwen3 dense BF16, so keep this path disabled.
+export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
+export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
+export VLLM_USE_DEEP_GEMM_E8M0="${VLLM_USE_DEEP_GEMM_E8M0:-0}"
+export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
 
 mkdir -p "${WORK_DIR}" "${PROJECT_DIR}/logs" "$(dirname "${SPEC_CONFIG_OUTPUT}")"
 

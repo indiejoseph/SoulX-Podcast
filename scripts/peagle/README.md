@@ -134,6 +134,12 @@ The hidden-state vLLM server is launched with `--no-enable-chunked-prefill`
 because Speculators' `ExampleHiddenStatesConnector` rejects chunked prefill in
 vLLM `0.22.x`.
 
+The PJM script also disables optional DeepGEMM FP8 kernel paths by default:
+`VLLM_USE_DEEP_GEMM=0`, `VLLM_MOE_USE_DEEP_GEMM=0`,
+`VLLM_USE_DEEP_GEMM_E8M0=0`, and `VLLM_DEEP_GEMM_WARMUP=skip`. This avoids
+startup failures on H100 nodes where vLLM `0.22.x` detects DeepGEMM support but
+the installed `deep_gemm` package is missing or too old.
+
 Prepare the dataset:
 
 ```bash
