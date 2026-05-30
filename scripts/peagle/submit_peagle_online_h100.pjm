@@ -39,6 +39,7 @@ SPEECH_VOCAB_SIZE="${SPEECH_VOCAB_SIZE:-6561}"
 MIN_SPEECH_DRAFT_TOKENS="${MIN_SPEECH_DRAFT_TOKENS:-6000}"
 MAX_NON_SPEECH_DRAFT_TOKENS="${MAX_NON_SPEECH_DRAFT_TOKENS:-16}"
 RESET_CHECKPOINTS="${RESET_CHECKPOINTS:-0}"
+AUTO_RESET_INCOMPATIBLE_CHECKPOINTS="${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS:-1}"
 ALLOW_OVERLARGE_DRAFT_VOCAB="${ALLOW_OVERLARGE_DRAFT_VOCAB:-0}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-6e-4}"
@@ -70,6 +71,7 @@ echo "  DRAFT_VOCAB_SIZE=${DRAFT_VOCAB_SIZE}"
 echo "  SPEECH_VOCAB_SIZE=${SPEECH_VOCAB_SIZE}"
 echo "  FORCE_PREPARE=${FORCE_PREPARE}"
 echo "  RESET_CHECKPOINTS=${RESET_CHECKPOINTS}"
+echo "  AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}"
 
 MAX_SAFE_DRAFT_VOCAB_SIZE=$((SPEECH_VOCAB_SIZE + 1 + MAX_NON_SPEECH_DRAFT_TOKENS))
 if [[ "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "1" \
@@ -293,11 +295,20 @@ if [[ "${RESET_CHECKPOINTS}" == "1" || "${RESET_CHECKPOINTS}" == "true" ]]; then
 elif [[ -d "${WORK_DIR}/checkpoints/checkpoint_best" ]]; then
   echo "Validating existing checkpoint_best before possible resume"
   if ! validate_checkpoint; then
-    cat >&2 <<EOF
+    if [[ "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "1" \
+          || "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "true" ]]; then
+      BAD_CHECKPOINTS_DIR="${WORK_DIR}/checkpoints.incompatible_${JOB_ID}_$(date +%Y%m%d%H%M%S)"
+      echo "Existing checkpoint_best is incompatible; moving checkpoints to ${BAD_CHECKPOINTS_DIR}"
+      mv "${WORK_DIR}/checkpoints" "${BAD_CHECKPOINTS_DIR}"
+      rm -rf "${WORK_DIR}/vocab_mapping"
+    else
+      cat >&2 <<EOF
 Existing checkpoint_best is incompatible with the current SoulX P-EAGLE vocab
-settings. Use a fresh WORK_DIR or resubmit with RESET_CHECKPOINTS=1.
+settings. Use a fresh WORK_DIR, set RESET_CHECKPOINTS=1, or leave
+AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1.
 EOF
-    exit 2
+      exit 2
+    fi
   fi
 fi
 

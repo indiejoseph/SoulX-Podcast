@@ -184,8 +184,10 @@ python scripts/peagle/validate_soulx_peagle_artifacts.py \
 
 If you previously trained with `DRAFT_VOCAB_SIZE=8192`, use a fresh `WORK_DIR`
 or set `RESET_CHECKPOINTS=1 FORCE_PREPARE=1 DRAFT_VOCAB_SIZE=6562` for the next
-PJM submission. The new script intentionally refuses to resume from a checkpoint
-whose effective draft vocabulary contains too many non-speech tokens.
+PJM submission. The PJM script also defaults
+`AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1`: if the old checkpoint fails the vocab
+validator, it is moved aside to `checkpoints.incompatible_*` and training starts
+fresh with the validated 6562-token mapping.
 
 The hidden-state vLLM server is launched with `--no-enable-chunked-prefill`
 because Speculators' `ExampleHiddenStatesConnector` rejects chunked prefill in
