@@ -70,11 +70,7 @@ behavior.
 Clone Speculators and install the separate requirements:
 
 ```bash
-git clone https://github.com/vllm-project/speculators.git third_party/speculators
-
-uv venv speculators_venv
-source speculators_venv/bin/activate
-uv pip install -r requirements-peagle.txt
+scripts/peagle/setup_speculators_env.sh
 ```
 
 The implemented offline path is:

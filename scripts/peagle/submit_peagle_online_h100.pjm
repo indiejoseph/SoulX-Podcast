@@ -52,6 +52,38 @@ TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-}"
 
 cd "${PROJECT_DIR}"
 
+if [[ ! -f "${SPECULATORS_ROOT}/scripts/launch_vllm.py" \
+      || ! -f "${SPECULATORS_ROOT}/scripts/train.py" ]]; then
+  cat >&2 <<EOF
+Speculators checkout is missing or incomplete:
+  ${SPECULATORS_ROOT}
+
+Install it before submitting:
+  cd ${PROJECT_DIR}
+  git clone https://github.com/vllm-project/speculators.git ${SPECULATORS_ROOT}
+  uv venv ${SPECULATORS_VENV}
+  source ${SPECULATORS_VENV}/bin/activate
+  uv pip install -r requirements-peagle.txt
+
+Or submit with SPECULATORS_ROOT=/path/to/speculators.
+EOF
+  exit 2
+fi
+
+if [[ ! -f "${SPECULATORS_VENV}/bin/activate" ]]; then
+  cat >&2 <<EOF
+Speculators virtualenv is missing:
+  ${SPECULATORS_VENV}
+
+Create it before submitting:
+  cd ${PROJECT_DIR}
+  uv venv ${SPECULATORS_VENV}
+  source ${SPECULATORS_VENV}/bin/activate
+  uv pip install -r requirements-peagle.txt
+EOF
+  exit 2
+fi
+
 source "${SPECULATORS_VENV}/bin/activate"
 
 export PYTHONUNBUFFERED=1
