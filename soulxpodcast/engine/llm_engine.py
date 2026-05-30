@@ -5,6 +5,7 @@ import types
 import atexit
 import inspect
 import json
+import logging
 import queue
 import threading
 import uuid
@@ -30,7 +31,10 @@ except ImportError:
     SUPPORT_VLLM = False
 
 from soulxpodcast.config import Config, SamplingParams
+from soulxpodcast.engine.vllm_ras import install_soulx_vllm_ras_sampler
 from soulxpodcast.models.modules.sampler import _ras_sample_hf_engine
+
+log = logging.getLogger(__name__)
 
 # Fields accepted by stock vLLM 0.10.x SamplingParams.
 _VLLM_BASE_FIELDS = frozenset({
@@ -39,6 +43,14 @@ _VLLM_BASE_FIELDS = frozenset({
 })
 # Extra fields from the Soul-AILab RAS patch (vllm@v0.10.1.1-soulxpodcast).
 _VLLM_RAS_FIELDS = frozenset({"use_ras", "win_size", "tau_r"})
+_FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in _FALSE_VALUES
 
 
 def _load_json_value_or_path(value: str, *, name: str) -> dict:
@@ -193,6 +205,23 @@ class VLLMEngine:
                     # AWQ packs in fp16, not bf16 — vLLM requires matching dtype.
                     engine_kwargs["dtype"] = "float16"
             speculative_requested = bool(config.vllm_speculative_config.strip())
+            model_ras_requested = _env_flag(
+                "SOULX_VLLM_MODEL_RAS",
+                default=speculative_requested,
+            )
+            if model_ras_requested:
+                try:
+                    install_soulx_vllm_ras_sampler()
+                    log.info("Installed SoulX vLLM V1 model-owned RAS sampler")
+                except Exception as exc:
+                    if speculative_requested:
+                        raise RuntimeError(
+                            "VLLM_SPECULATIVE_CONFIG was set and SoulX model-owned "
+                            "RAS was requested, but the installed vLLM runtime does "
+                            "not expose the Qwen3 V1 model sampler hook. Disable "
+                            "SOULX_VLLM_MODEL_RAS or use a newer vLLM/V1 runtime."
+                        ) from exc
+                    log.warning("SoulX vLLM model-owned RAS sampler unavailable: %s", exc)
             if speculative_requested:
                 engine_kwargs["speculative_config"] = _load_json_value_or_path(
                     config.vllm_speculative_config,

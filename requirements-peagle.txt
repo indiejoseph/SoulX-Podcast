@@ -1,0 +1,15 @@
+# Experimental P-EAGLE / Speculators training environment.
+#
+# Install this in a separate venv from the main SoulX serving runtime:
+#
+#   uv venv speculators_venv
+#   source speculators_venv/bin/activate
+#   uv pip install -r requirements-peagle.txt
+#
+# The main requirements.txt is pinned to torch 2.7.1 and the patched vLLM
+# 0.10.1 serving image. P-EAGLE requires a newer Speculators/vLLM stack, so
+# mixing these requirements with the production image will break the vLLM RAS
+# patch path.
+
+speculators>=0.5.0
+vllm>=0.18

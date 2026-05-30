@@ -127,6 +127,16 @@ current HF-only Sequential MTP implementation.
   `input_ids`, `loss_mask`, and `seq_len`.
 - `scripts/peagle/train_soulx_peagle.py` wraps the upstream Speculators
   launch, hidden-state generation, P-EAGLE train, and config-writing stages.
+- Newer vLLM/P-EAGLE runtimes preserve RAS through
+  `soulxpodcast.engine.vllm_ras`: when speculative config is requested, the
+  engine installs a vLLM V1 Qwen3 model-owned sampler hook based on the
+  vllm-omni CosyVoice3 pattern. `SOULX_VLLM_MODEL_RAS=0` disables it for
+  ablations.
+- `scripts/peagle/train_soulx_peagle.py --stage online` now supports
+  Speculators on-demand teacher hidden-state generation during training. It
+  skips the separate `generate-hidden-states` stage and passes
+  `--on-missing generate --on-generate delete --vllm-endpoint ...` to upstream
+  `train.py`.
 
 **Caveat:** the default patched vLLM `0.10.1` runtime is still the production
 runtime for RAS and is not expected to support P-EAGLE. This experiment requires

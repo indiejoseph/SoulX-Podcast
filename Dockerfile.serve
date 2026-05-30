@@ -52,6 +52,7 @@ RUN groupadd --system app && \
 ENV MODEL_PATH=/app/runs/merged \
     LLM_ENGINE=hf \
     VLLM_SPECULATIVE_CONFIG= \
+    SOULX_VLLM_MODEL_RAS= \
     FP16_FLOW=true \
     ENABLE_MTP=true \
     FLOW_STREAMING=true \
