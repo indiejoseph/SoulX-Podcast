@@ -34,7 +34,9 @@ python scripts/peagle/write_speculative_config.py \
 ```
 
 Set `--num-speculative-tokens` to the P-EAGLE `num_depths` used for training.
-The H100 PJM defaults use `NUM_DEPTHS=4`.
+The H100 PJM defaults use `NUM_DEPTHS=4`. The generated config defaults to
+`method=eagle3` and `parallel_drafting=true`, matching the vLLM 0.22 serving
+image.
 
 Run the non-MTP vLLM path against a vLLM/speculators runtime that supports
 `speculative_config`:
@@ -196,6 +198,9 @@ python scripts/peagle/validate_soulx_peagle_artifacts.py \
   --preprocessed-dir outputs/peagle_soulx_h100/preprocessed \
   --model-path runs/merged \
   --draft-vocab-size 6562 \
+  --expected-num-depths 4 \
+  --expected-num-layers 4 \
+  --expected-draft-arch llama \
   --checkpoint outputs/peagle_soulx_h100/checkpoints/checkpoint_best
 ```
 
@@ -283,7 +288,8 @@ python scripts/peagle/train_soulx_peagle.py \
   --stage write-config \
   --model-path pretrained_models/SoulX-Podcast-1.7B-dialect \
   --work-dir outputs/peagle_soulx \
-  --num-speculative-tokens 4
+  --num-layers 2 \
+  --num-depths 2
 ```
 
 The wrapper defaults to a conservative 3090-oriented run:

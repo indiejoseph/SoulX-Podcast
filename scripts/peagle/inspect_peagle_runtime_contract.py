@@ -165,6 +165,12 @@ def main() -> None:
     parser.add_argument("--expected-draft-vocab-size", type=int, default=None)
     parser.add_argument("--expected-num-depths", type=int, default=None)
     parser.add_argument("--expected-target-layer-ids", default=None)
+    parser.add_argument("--expected-method", default="eagle3")
+    parser.add_argument(
+        "--expect-parallel-drafting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--max-hidden-state-files", type=int, default=2)
     parser.add_argument("--hash-large-files", action="store_true")
     parser.add_argument("--fail-on-error", action="store_true")
@@ -203,6 +209,17 @@ def main() -> None:
                 "speculative_config num_speculative_tokens "
                 f"{spec_config.get('num_speculative_tokens')} != {args.expected_num_depths}"
             )
+    if spec_config is not None:
+        if args.expected_method and spec_config.get("method") != args.expected_method:
+            errors.append(
+                f"speculative_config method {spec_config.get('method')!r} != "
+                f"{args.expected_method!r}"
+            )
+        if (
+            args.expect_parallel_drafting
+            and spec_config.get("parallel_drafting") is not True
+        ):
+            errors.append("speculative_config parallel_drafting is not true")
     if expected_layers is not None:
         actual_layers = ckpt_summary.get("eagle_aux_hidden_state_layer_ids")
         if actual_layers != expected_layers:

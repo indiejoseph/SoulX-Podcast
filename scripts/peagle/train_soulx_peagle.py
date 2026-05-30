@@ -150,7 +150,16 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
         str(args.max_non_speech_draft_tokens),
         "--checkpoint",
         str(checkpoint),
+        "--expected-num-depths",
+        str(args.num_depths),
+        "--expected-num-layers",
+        str(args.num_layers),
+        "--expected-draft-arch",
+        args.draft_arch,
     ]
+    target_layer_ids = parse_int_list(args.target_layer_ids)
+    if target_layer_ids:
+        cmd += ["--expected-target-layer-ids", *target_layer_ids]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -271,6 +280,8 @@ def train(args: argparse.Namespace) -> None:
         "peagle",
         "--num-layers",
         str(args.num_layers),
+        "--draft-arch",
+        args.draft_arch,
         "--num-depths",
         str(args.num_depths),
         "--down-sample-ratio",
@@ -358,16 +369,23 @@ def write_config(args: argparse.Namespace) -> None:
     validate_checkpoint(args)
     paths = common_paths(args)
     checkpoint = paths["checkpoints"] / "checkpoint_best"
+    num_speculative_tokens = args.num_speculative_tokens or args.num_depths
     cmd = [
         sys.executable,
         str(ROOT / "scripts" / "peagle" / "write_speculative_config.py"),
         "--speculator-model",
         str(checkpoint),
         "--num-speculative-tokens",
-        str(args.num_speculative_tokens),
+        str(num_speculative_tokens),
+        "--method",
+        args.speculative_method,
         "--output",
         str(paths["speculative_config"]),
     ]
+    if args.parallel_drafting:
+        cmd.append("--parallel-drafting")
+    else:
+        cmd.append("--no-parallel-drafting")
     run(cmd, dry_run=args.dry_run)
 
 
@@ -427,6 +445,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--nproc-per-node", type=int, default=1)
     parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument(
+        "--draft-arch",
+        default="llama",
+        help=(
+            "Upstream Speculators draft decoder architecture. Use 'llama' for "
+            "current vLLM P-EAGLE inference compatibility."
+        ),
+    )
     parser.add_argument("--num-depths", type=int, default=2)
     parser.add_argument("--down-sample-ratio", type=float, default=0.7)
     parser.add_argument("--down-sample-ratio-min", type=float, default=0.2)
@@ -489,7 +515,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--extra-train-arg", action="append", default=[])
-    parser.add_argument("--num-speculative-tokens", type=int, default=3)
+    parser.add_argument("--num-speculative-tokens", type=int, default=None)
+    parser.add_argument(
+        "--speculative-method",
+        default="eagle3",
+        help="vLLM speculative_config method string. Use 'eagle3' for P-EAGLE.",
+    )
+    parser.add_argument(
+        "--parallel-drafting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write parallel_drafting=true in the vLLM speculative_config.",
+    )
     return parser.parse_args()
 
 

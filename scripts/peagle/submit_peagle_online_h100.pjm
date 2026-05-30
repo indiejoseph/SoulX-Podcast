@@ -16,6 +16,7 @@ SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
 SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/.speculators_venv}"
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100}"
 SPEC_CONFIG_OUTPUT="${SPEC_CONFIG_OUTPUT:-${PROJECT_DIR}/exports/peagle/speculative_config.json}"
+SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-eagle3}"
 PREPROCESSED_DIR="${WORK_DIR}/preprocessed"
 
 PORT="${PORT:-8000}"
@@ -29,6 +30,7 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 # H100-oriented defaults. Lower these first if memory becomes tight.
 NUM_LAYERS="${NUM_LAYERS:-4}"
 NUM_DEPTHS="${NUM_DEPTHS:-4}"
+DRAFT_ARCH="${DRAFT_ARCH:-llama}"
 TRAIN_TOTAL_SEQ_LEN="${TRAIN_TOTAL_SEQ_LEN:-2048}"
 PREPARE_SEQ_LENGTH="${PREPARE_SEQ_LENGTH:-2048}"
 PREPARE_NUM_PROC="${PREPARE_NUM_PROC:-8}"
@@ -73,6 +75,7 @@ echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
 echo "  WORK_DIR=${WORK_DIR}"
 echo "  NUM_LAYERS=${NUM_LAYERS}"
 echo "  NUM_DEPTHS=${NUM_DEPTHS}"
+echo "  DRAFT_ARCH=${DRAFT_ARCH}"
 echo "  DRAFT_VOCAB_SIZE=${DRAFT_VOCAB_SIZE}"
 echo "  SPEECH_VOCAB_SIZE=${SPEECH_VOCAB_SIZE}"
 echo "  FORCE_PREPARE=${FORCE_PREPARE}"
@@ -83,6 +86,7 @@ echo "  WANDB=${WANDB}"
 echo "  LOGGER=${LOGGER}"
 echo "  RUN_NAME=${RUN_NAME}"
 echo "  WANDB_PROJECT=${WANDB_PROJECT}"
+echo "  SPECULATIVE_METHOD=${SPECULATIVE_METHOD}"
 
 MAX_SAFE_DRAFT_VOCAB_SIZE=$((SPEECH_VOCAB_SIZE + 1 + MAX_NON_SPEECH_DRAFT_TOKENS))
 if [[ "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "1" \
@@ -198,6 +202,10 @@ validate_preprocessed() {
 }
 
 validate_checkpoint() {
+  EXPECTED_TARGET_LAYER_ARGS=()
+  if [[ -n "${TARGET_LAYER_IDS}" ]]; then
+    EXPECTED_TARGET_LAYER_ARGS=(--expected-target-layer-ids "${TARGET_LAYER_ARRAY[@]}")
+  fi
   "${PYTHON_BIN}" scripts/peagle/validate_soulx_peagle_artifacts.py \
     --preprocessed-dir "${PREPROCESSED_DIR}" \
     --model-path "${MODEL_PATH}" \
@@ -205,6 +213,10 @@ validate_checkpoint() {
     --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
     --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
     --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+    --expected-num-depths "${NUM_DEPTHS}" \
+    --expected-num-layers "${NUM_LAYERS}" \
+    --expected-draft-arch "${DRAFT_ARCH}" \
+    "${EXPECTED_TARGET_LAYER_ARGS[@]}" \
     --checkpoint "${WORK_DIR}/checkpoints/checkpoint_best"
 }
 
@@ -380,6 +392,7 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
   --request-timeout "${REQUEST_TIMEOUT}" \
   --max-retries "${MAX_RETRIES}" \
   --num-layers "${NUM_LAYERS}" \
+  --draft-arch "${DRAFT_ARCH}" \
   --num-depths "${NUM_DEPTHS}" \
   --train-total-seq-len "${TRAIN_TOTAL_SEQ_LEN}" \
   --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
@@ -403,6 +416,9 @@ echo "Writing vLLM speculative config"
   --model-path "${MODEL_PATH}" \
   --work-dir "${WORK_DIR}" \
   --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+  --num-layers "${NUM_LAYERS}" \
+  --draft-arch "${DRAFT_ARCH}" \
+  --speculative-method "${SPECULATIVE_METHOD}" \
   --num-speculative-tokens "${NUM_DEPTHS}" \
   --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
   --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
@@ -422,6 +438,7 @@ fi
   --speculative-config "${SPEC_CONFIG_OUTPUT}" \
   --expected-draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
   --expected-num-depths "${NUM_DEPTHS}" \
+  --expected-method "${SPECULATIVE_METHOD}" \
   "${EXPECTED_TARGET_LAYER_ARGS[@]}" \
   --fail-on-error
 

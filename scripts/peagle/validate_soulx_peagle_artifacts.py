@@ -142,6 +142,97 @@ def load_checkpoint_tensor(checkpoint: Path, name: str) -> torch.Tensor | None:
     return None
 
 
+def load_checkpoint_config(checkpoint: Path) -> dict[str, Any] | None:
+    config_path = checkpoint / "config.json"
+    if not config_path.exists():
+        return None
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def parse_int_list(values: list[str] | None) -> list[int] | None:
+    if not values:
+        return None
+    return [int(value) for value in values]
+
+
+def validate_checkpoint_config(
+    *,
+    config: dict[str, Any] | None,
+    draft_vocab_size: int,
+    expected_num_depths: int | None,
+    expected_num_layers: int | None,
+    expected_draft_arch: str | None,
+    expected_target_layer_ids: list[int] | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if config is None:
+        return None, ["checkpoint config.json not found"]
+
+    tl_config = config.get("transformer_layer_config") or {}
+    spec_config = config.get("speculators_config") or {}
+    proposal_methods = spec_config.get("proposal_methods") or []
+    proposal_tokens = None
+    if proposal_methods:
+        proposal_tokens = proposal_methods[0].get("speculative_tokens")
+
+    stats = {
+        "speculators_model_type": config.get("speculators_model_type"),
+        "architectures": config.get("architectures"),
+        "draft_vocab_size": config.get("draft_vocab_size"),
+        "num_depths": config.get("num_depths"),
+        "eagle_aux_hidden_state_layer_ids": config.get(
+            "eagle_aux_hidden_state_layer_ids"
+        ),
+        "transformer_layer_model_type": tl_config.get("model_type"),
+        "transformer_layer_num_hidden_layers": tl_config.get("num_hidden_layers"),
+        "proposal_speculative_tokens": proposal_tokens,
+    }
+
+    errors = []
+    if stats["speculators_model_type"] != "peagle":
+        errors.append(
+            f"checkpoint speculators_model_type={stats['speculators_model_type']!r}; "
+            "expected 'peagle'"
+        )
+    if stats["draft_vocab_size"] != draft_vocab_size:
+        errors.append(
+            f"checkpoint draft_vocab_size={stats['draft_vocab_size']}; "
+            f"expected {draft_vocab_size}"
+        )
+    if expected_num_depths is not None:
+        if stats["num_depths"] != expected_num_depths:
+            errors.append(
+                f"checkpoint num_depths={stats['num_depths']}; "
+                f"expected {expected_num_depths}"
+            )
+        if proposal_tokens != expected_num_depths:
+            errors.append(
+                f"checkpoint proposal speculative_tokens={proposal_tokens}; "
+                f"expected {expected_num_depths}"
+            )
+    if expected_num_layers is not None:
+        if stats["transformer_layer_num_hidden_layers"] != expected_num_layers:
+            errors.append(
+                "checkpoint transformer_layer_config.num_hidden_layers="
+                f"{stats['transformer_layer_num_hidden_layers']}; "
+                f"expected {expected_num_layers}"
+            )
+    if expected_draft_arch:
+        if stats["transformer_layer_model_type"] != expected_draft_arch:
+            errors.append(
+                "checkpoint transformer_layer_config.model_type="
+                f"{stats['transformer_layer_model_type']!r}; "
+                f"expected {expected_draft_arch!r}"
+            )
+    if expected_target_layer_ids is not None:
+        if stats["eagle_aux_hidden_state_layer_ids"] != expected_target_layer_ids:
+            errors.append(
+                "checkpoint eagle_aux_hidden_state_layer_ids="
+                f"{stats['eagle_aux_hidden_state_layer_ids']}; "
+                f"expected {expected_target_layer_ids}"
+            )
+    return stats, errors
+
+
 def effective_d2t_targets(
     d2t: torch.Tensor,
     *,
@@ -179,6 +270,10 @@ def main() -> None:
     parser.add_argument("--mapping-output-dir", default=None)
     parser.add_argument("--write-vocab-mapping", action="store_true")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--expected-num-depths", type=int, default=None)
+    parser.add_argument("--expected-num-layers", type=int, default=None)
+    parser.add_argument("--expected-draft-arch", default="llama")
+    parser.add_argument("--expected-target-layer-ids", nargs="+", default=None)
     parser.add_argument("--json-output", default=None)
     args = parser.parse_args()
 
@@ -236,6 +331,15 @@ def main() -> None:
     checkpoint_stats: dict[str, Any] | None = None
     if args.checkpoint:
         checkpoint = Path(args.checkpoint)
+        checkpoint_config_stats, checkpoint_config_errors = validate_checkpoint_config(
+            config=load_checkpoint_config(checkpoint),
+            draft_vocab_size=args.draft_vocab_size,
+            expected_num_depths=args.expected_num_depths,
+            expected_num_layers=args.expected_num_layers,
+            expected_draft_arch=args.expected_draft_arch,
+            expected_target_layer_ids=parse_int_list(args.expected_target_layer_ids),
+        )
+        errors.extend(checkpoint_config_errors)
         ckpt_d2t = load_checkpoint_tensor(checkpoint, "d2t")
         if ckpt_d2t is None:
             errors.append(f"checkpoint {checkpoint} does not contain d2t")
@@ -247,6 +351,7 @@ def main() -> None:
                 allowed_control_ids=allowed_control_ids,
             )
             checkpoint_stats = {
+                "config": checkpoint_config_stats,
                 "d2t_mode": mode,
                 "d2t_shape": list(ckpt_d2t.shape),
                 "d2t_unique_raw_values": int(torch.unique(ckpt_d2t).numel()),
@@ -272,6 +377,8 @@ def main() -> None:
                 allowed_control_ids=allowed_control_ids,
             )
             checkpoint_stats["t2d_dtype"] = str(ckpt_t2d.dtype)
+        elif checkpoint_stats is None and checkpoint_config_stats is not None:
+            checkpoint_stats = {"config": checkpoint_config_stats}
 
     if args.write_vocab_mapping:
         if not args.mapping_output_dir:

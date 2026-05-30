@@ -128,6 +128,14 @@ def patch_peagle_core_py(speculators_root: Path) -> bool:
 
     text = path.read_text(encoding="utf-8")
     if PEAGLE_POSITION_PATCH_MARKER in text:
+        if (
+            "sampled_position_ids = position_ids[:, orig_positions]" not in text
+            or "position_ids=sampled_position_ids" not in text
+        ):
+            raise RuntimeError(
+                f"{path} contains the P-EAGLE position patch marker, but the "
+                "patched position_ids wiring is incomplete."
+            )
         return False
 
     old = """        position_ids = orig_positions.unsqueeze(0)  # [1, total_sampled]\n\n        position_embeddings = self.rotary_emb(layer_input, position_ids)\n"""

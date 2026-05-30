@@ -30,13 +30,19 @@ def main() -> None:
     parser.add_argument(
         "--num-speculative-tokens",
         type=int,
-        default=3,
+        default=4,
         help="Draft tokens requested from vLLM per verifier step.",
     )
     parser.add_argument(
         "--method",
-        default="peagle",
+        default="eagle3",
         help="vLLM speculative decoding method string for the installed runtime.",
+    )
+    parser.add_argument(
+        "--parallel-drafting",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable vLLM parallel drafting for P-EAGLE checkpoints.",
     )
     parser.add_argument(
         "--extra-json",
@@ -51,6 +57,8 @@ def main() -> None:
         "num_speculative_tokens": args.num_speculative_tokens,
         "method": args.method,
     }
+    if args.parallel_drafting:
+        config["parallel_drafting"] = True
     config.update(args.extra_json)
 
     out_path = Path(args.output)
