@@ -16,6 +16,7 @@ SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
 SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/speculators_venv}"
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100}"
 SPEC_CONFIG_OUTPUT="${SPEC_CONFIG_OUTPUT:-${PROJECT_DIR}/exports/peagle/speculative_config.json}"
+PREPROCESSED_DIR="${WORK_DIR}/preprocessed"
 
 PORT="${PORT:-8000}"
 HOST="${HOST:-127.0.0.1}"
@@ -30,6 +31,9 @@ NUM_LAYERS="${NUM_LAYERS:-4}"
 NUM_DEPTHS="${NUM_DEPTHS:-4}"
 TRAIN_TOTAL_SEQ_LEN="${TRAIN_TOTAL_SEQ_LEN:-2048}"
 PREPARE_SEQ_LENGTH="${PREPARE_SEQ_LENGTH:-2048}"
+PREPARE_NUM_PROC="${PREPARE_NUM_PROC:-8}"
+PREPARE_MAP_BATCH_SIZE="${PREPARE_MAP_BATCH_SIZE:-4000}"
+FORCE_PREPARE="${FORCE_PREPARE:-0}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-8192}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-6e-4}"
@@ -123,20 +127,33 @@ echo "Checking P-EAGLE/vLLM environment"
 "${PYTHON_BIN}" scripts/peagle/check_vllm_speculative_support.py
 
 echo "Preparing SoulX P-EAGLE dataset"
-"${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
-  --stage prepare \
-  --dataset-path "${DATASET_PATH}" \
-  --model-path "${MODEL_PATH}" \
-  --work-dir "${WORK_DIR}" \
-  --speculators-root "${SPECULATORS_ROOT}" \
-  --speculators-python "${PYTHON_BIN}" \
-  --vllm-python "${PYTHON_BIN}" \
-  --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
-  --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
-  --max-speech-tokens 750 \
-  --seed "${SEED}" \
-  "${MAX_SAMPLE_ARGS[@]}" \
-  --overwrite-preprocessed
+if [[ "${FORCE_PREPARE}" != "1" \
+      && -f "${PREPROCESSED_DIR}/token_freq.pt" \
+      && -f "${PREPROCESSED_DIR}/soulx_peagle_prepare_summary.json" ]]; then
+  echo "Reusing prepared P-EAGLE dataset: ${PREPROCESSED_DIR}"
+else
+  PREPARE_OVERWRITE_ARGS=()
+  if [[ "${FORCE_PREPARE}" == "1" || -e "${PREPROCESSED_DIR}" ]]; then
+    PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
+  fi
+
+  "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
+    --stage prepare \
+    --dataset-path "${DATASET_PATH}" \
+    --model-path "${MODEL_PATH}" \
+    --work-dir "${WORK_DIR}" \
+    --speculators-root "${SPECULATORS_ROOT}" \
+    --speculators-python "${PYTHON_BIN}" \
+    --vllm-python "${PYTHON_BIN}" \
+    --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+    --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
+    --prepare-num-proc "${PREPARE_NUM_PROC}" \
+    --prepare-map-batch-size "${PREPARE_MAP_BATCH_SIZE}" \
+    --max-speech-tokens 750 \
+    --seed "${SEED}" \
+    "${MAX_SAMPLE_ARGS[@]}" \
+    "${PREPARE_OVERWRITE_ARGS[@]}"
+fi
 
 echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
 "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \

@@ -118,9 +118,15 @@ Override paths and sizing without editing the file, for example:
 ```bash
 WORK_DIR=/path/to/scratch/peagle_h100 \
 ON_GENERATE=cache \
+PREPARE_NUM_PROC=16 \
 VLLM_GPU_MEMORY_UTILIZATION=0.45 \
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
 ```
+
+The prepare stage uses a batched `datasets.map` path when the input dataset
+already has `speech_tokens`. If `outputs/peagle_soulx_h100/preprocessed`
+already contains `token_freq.pt` and `soulx_peagle_prepare_summary.json`, the
+PJM script reuses it. Set `FORCE_PREPARE=1` to rebuild.
 
 Prepare the dataset:
 

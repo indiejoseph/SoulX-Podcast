@@ -71,17 +71,25 @@ def prepare(args: argparse.Namespace) -> None:
         str(args.max_speech_tokens),
         "--seed",
         str(args.seed),
+        "--map-batch-size",
+        str(args.prepare_map_batch_size),
+        "--num-proc",
+        str(args.prepare_num_proc),
     ]
     if args.dataset_split:
         cmd += ["--split", args.dataset_split]
     if args.max_samples is not None:
         cmd += ["--max-samples", str(args.max_samples)]
+    if args.shuffle_prepare:
+        cmd.append("--shuffle")
     if args.skip_dialect_prefix:
         cmd.append("--skip-dialect-prefix")
     if args.no_eos_loss:
         cmd.append("--no-eos-loss")
     if args.allow_audio_tokenize_fallback:
         cmd.append("--allow-audio-tokenize-fallback")
+    if args.legacy_prepare_loop:
+        cmd.append("--legacy-loop")
     if args.overwrite_preprocessed:
         cmd.append("--overwrite")
     run(cmd, dry_run=args.dry_run)
@@ -279,6 +287,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-seq-length", type=int, default=2048)
     parser.add_argument("--min-speech-tokens", type=int, default=8)
     parser.add_argument("--max-speech-tokens", type=int, default=750)
+    parser.add_argument("--prepare-map-batch-size", type=int, default=2000)
+    parser.add_argument("--prepare-num-proc", type=int, default=1)
+    parser.add_argument("--legacy-prepare-loop", action="store_true")
+    parser.add_argument("--shuffle-prepare", action="store_true")
     parser.add_argument("--skip-dialect-prefix", action="store_true")
     parser.add_argument("--no-eos-loss", action="store_true")
     parser.add_argument("--allow-audio-tokenize-fallback", action="store_true")
