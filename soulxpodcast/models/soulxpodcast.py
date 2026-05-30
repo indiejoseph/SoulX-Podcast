@@ -365,6 +365,15 @@ class SoulXPodcast(torch.nn.Module):
             spk_prompt_mel_len_t = prompt_mels_lens_for_flow[turn_spk]
             spk_emb = spk_emb_for_flow[turn_spk:turn_spk+1].cuda()
 
+            if os.getenv("PROFILE_TURN_MEL"):
+                _pm = spk_prompt_mel[0, :spk_prompt_mel_len_t[0].item()].float()
+                tqdm.write(
+                    f"[PROFILE-TURN] turn={turn_i} spk={turn_spk} "
+                    f"prompt_mel_rms={_pm.pow(2).mean().sqrt().item():.4f} "
+                    f"prompt_mel_peak={_pm.abs().max().item():.4f} "
+                    f"spk_emb_norm={spk_emb.float().norm().item():.4f}"
+                )
+
             llm_stream = torch.cuda.Stream()
             flow_stream = torch.cuda.Stream()
 
@@ -500,6 +509,30 @@ class SoulXPodcast(torch.nn.Module):
                             flow_steps=flow_steps,
                         )
                     final_audio = audio[:, prev_audio_len:].detach().cpu()
+                if os.getenv("PROFILE_TURN_MEL"):
+                    # The cached path has the full turn mel already; for the
+                    # uncached path we slice from audio backward by mel_frames.
+                    if use_flow_chunk_cache and cached_mel_chunks:
+                        _full_mel = torch.cat(cached_mel_chunks, dim=-1).float()
+                        _mel_rms = _full_mel.pow(2).mean().sqrt().item()
+                        _mel_peak = _full_mel.abs().max().item()
+                        _mel_frames = _full_mel.shape[-1]
+                    else:
+                        _mel_rms = float("nan")
+                        _mel_peak = float("nan")
+                        _mel_frames = 0
+                    _full_audio = audio.float() if audio is not None else None
+                    if _full_audio is not None:
+                        _audio_rms = _full_audio.pow(2).mean().sqrt().item()
+                        _audio_peak = _full_audio.abs().max().item()
+                        _audio_samples = _full_audio.shape[-1]
+                    else:
+                        _audio_rms = float("nan"); _audio_peak = float("nan"); _audio_samples = 0
+                    tqdm.write(
+                        f"[PROFILE-TURN] turn={turn_i} spk={turn_spk} "
+                        f"mel_frames={_mel_frames} mel_rms={_mel_rms:.4f} mel_peak={_mel_peak:.4f} "
+                        f"audio_samples={_audio_samples} audio_rms={_audio_rms:.4f} audio_peak={_audio_peak:.4f}"
+                    )
                 yield {
                     "turn": turn_i,
                     "speaker": turn_spk,
