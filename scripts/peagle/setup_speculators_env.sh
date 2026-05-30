@@ -25,7 +25,7 @@ source "${SPECULATORS_VENV}/bin/activate"
 uv pip install -r requirements-peagle.txt
 uv pip install -e "${SPECULATORS_ROOT}"
 
-export PYTHONPATH="${SPECULATORS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${SPECULATORS_ROOT}/src:${SPECULATORS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 python scripts/peagle/check_vllm_speculative_support.py
 python - <<'PY'
 import importlib.util

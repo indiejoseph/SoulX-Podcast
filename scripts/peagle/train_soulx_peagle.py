@@ -54,9 +54,13 @@ def common_paths(args: argparse.Namespace) -> dict[str, Path]:
 
 def speculators_env(args: argparse.Namespace) -> dict[str, str]:
     env = os.environ.copy()
-    spec_root = str(Path(args.speculators_root).resolve())
+    spec_root_path = Path(args.speculators_root).resolve()
+    spec_paths = [
+        str(spec_root_path / "src"),
+        str(spec_root_path),
+    ]
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = spec_root if not existing else spec_root + os.pathsep + existing
+    env["PYTHONPATH"] = os.pathsep.join(spec_paths + ([existing] if existing else []))
     return env
 
 
