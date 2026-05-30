@@ -30,6 +30,10 @@ class APIConfig:
     )
     llm_engine: str = os.getenv("LLM_ENGINE", "hf")  # hf or vllm
     vllm_enforce_eager: bool = _env_bool("VLLM_ENFORCE_EAGER", False)
+    # vLLM's default 0.9 leaves ~2.4GiB headroom on 24GB cards, which is not
+    # enough for the flow chunk cache + flow model + HiFT on long content
+    # (causes OOM on subsequent requests). 0.7 leaves ~7GiB which is safe.
+    vllm_gpu_memory_utilization: float = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.7"))
     hf_prompt_prefix_cache: bool = _env_bool("HF_PROMPT_PREFIX_CACHE", False)
 
     def validate_llm_engine(self):

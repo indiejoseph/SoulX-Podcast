@@ -52,6 +52,7 @@ RUN groupadd --system app && \
 ENV MODEL_PATH=/app/runs/merged \
     LLM_ENGINE=vllm \
     VLLM_ENFORCE_EAGER=false \
+    VLLM_GPU_MEMORY_UTILIZATION=0.7 \
     FP16_FLOW=true \
     ENABLE_MTP=false \
     FLOW_STREAMING=true \

@@ -26,6 +26,9 @@ services:
       MODEL_PATH: "${MODEL_PATH:-/app/runs/merged}"
       LLM_ENGINE: "${LLM_ENGINE:-vllm}"
       VLLM_ENFORCE_EAGER: "${VLLM_ENFORCE_EAGER:-false}"
+      # 0.7 leaves headroom for flow chunk cache + flow + HiFT on 24GB cards.
+      # vLLM default 0.9 OOMs after the first request with FLOW_CHUNK_CACHE=1.
+      VLLM_GPU_MEMORY_UTILIZATION: "${VLLM_GPU_MEMORY_UTILIZATION:-0.7}"
       HF_PROMPT_PREFIX_CACHE: "${HF_PROMPT_PREFIX_CACHE:-false}"
       FP16_FLOW: "${FP16_FLOW:-true}"
       ENABLE_MTP: "${ENABLE_MTP:-false}"
