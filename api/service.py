@@ -34,7 +34,7 @@ from soulxpodcast.utils.text import normalize_text
 from soulxpodcast.training.mtp_inference import mtp_speculative_sample_cached
 from soulxpodcast.training.mtp_module import MtpConfig, SequentialMTP
 
-from api.audio import tensor_to_pcm16_bytes, wav_bytes_from_pcm, wav_header, normalize_turn_audio
+from api.audio import tensor_to_pcm16_bytes, wav_bytes_from_pcm, wav_header
 from api.config import config as api_config
 from api.models import SpeechRequest
 from api.redis_state import get_redis_client, redis_key
@@ -1262,7 +1262,6 @@ class SoulXPodcastService:
             if output_format == "wav":
                 yield wav_header(None)
 
-            turn_buf: List[torch.Tensor] = []
             for event in self.model.forward_longform_streaming(
                 **processed_data,
                 chunk_size=chunk_size if chunk_size is not None else api_config.stream_chunk_size,
@@ -1270,13 +1269,9 @@ class SoulXPodcastService:
                 flow_streaming=api_config.flow_streaming,
                 flow_steps=api_config.flow_steps,
             ):
-                turn_buf.append(event["audio"])
-                if event["is_last_in_turn"]:
-                    for chunk in normalize_turn_audio(turn_buf):
-                        chunk_bytes = tensor_to_pcm16_bytes(chunk, normalize=False)
-                        if chunk_bytes:
-                            yield chunk_bytes
-                    turn_buf = []
+                chunk_bytes = tensor_to_pcm16_bytes(event["audio"])
+                if chunk_bytes:
+                    yield chunk_bytes
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
