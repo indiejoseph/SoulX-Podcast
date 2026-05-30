@@ -34,7 +34,12 @@ PREPARE_SEQ_LENGTH="${PREPARE_SEQ_LENGTH:-2048}"
 PREPARE_NUM_PROC="${PREPARE_NUM_PROC:-8}"
 PREPARE_MAP_BATCH_SIZE="${PREPARE_MAP_BATCH_SIZE:-4000}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-8192}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-6562}"
+SPEECH_VOCAB_SIZE="${SPEECH_VOCAB_SIZE:-6561}"
+MIN_SPEECH_DRAFT_TOKENS="${MIN_SPEECH_DRAFT_TOKENS:-6000}"
+MAX_NON_SPEECH_DRAFT_TOKENS="${MAX_NON_SPEECH_DRAFT_TOKENS:-16}"
+RESET_CHECKPOINTS="${RESET_CHECKPOINTS:-0}"
+ALLOW_OVERLARGE_DRAFT_VOCAB="${ALLOW_OVERLARGE_DRAFT_VOCAB:-0}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-6e-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -61,6 +66,27 @@ echo "  PROJECT_DIR=${PROJECT_DIR}"
 echo "  SPECULATORS_ROOT=${SPECULATORS_ROOT}"
 echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
 echo "  WORK_DIR=${WORK_DIR}"
+echo "  DRAFT_VOCAB_SIZE=${DRAFT_VOCAB_SIZE}"
+echo "  SPEECH_VOCAB_SIZE=${SPEECH_VOCAB_SIZE}"
+echo "  FORCE_PREPARE=${FORCE_PREPARE}"
+echo "  RESET_CHECKPOINTS=${RESET_CHECKPOINTS}"
+
+MAX_SAFE_DRAFT_VOCAB_SIZE=$((SPEECH_VOCAB_SIZE + 1 + MAX_NON_SPEECH_DRAFT_TOKENS))
+if [[ "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "1" \
+      && "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "true" \
+      && "${DRAFT_VOCAB_SIZE}" -gt "${MAX_SAFE_DRAFT_VOCAB_SIZE}" ]]; then
+  cat >&2 <<EOF
+DRAFT_VOCAB_SIZE=${DRAFT_VOCAB_SIZE} is too large for SoulX speech tokens.
+The safe maximum is ${MAX_SAFE_DRAFT_VOCAB_SIZE}
+  SPEECH_VOCAB_SIZE=${SPEECH_VOCAB_SIZE}
+  semantic_token_end allowance=1
+  MAX_NON_SPEECH_DRAFT_TOKENS=${MAX_NON_SPEECH_DRAFT_TOKENS}
+
+Use DRAFT_VOCAB_SIZE=6562 for the normal SoulX P-EAGLE run.
+To intentionally bypass this guard, set ALLOW_OVERLARGE_DRAFT_VOCAB=1.
+EOF
+  exit 2
+fi
 
 if [[ ! -f "${SPECULATORS_ROOT}/scripts/launch_vllm.py" \
       || ! -f "${SPECULATORS_ROOT}/scripts/train.py" ]]; then
@@ -147,6 +173,27 @@ if [[ ${#LOGGER_ARGS[@]} -gt 0 && -n "${LOG_DIR}" ]]; then
   LOGGER_ARGS+=(--log-dir "${LOG_DIR}")
 fi
 
+validate_preprocessed() {
+  "${PYTHON_BIN}" scripts/peagle/validate_soulx_peagle_artifacts.py \
+    --preprocessed-dir "${PREPROCESSED_DIR}" \
+    --model-path "${MODEL_PATH}" \
+    --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
+    --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
+    --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
+    --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}"
+}
+
+validate_checkpoint() {
+  "${PYTHON_BIN}" scripts/peagle/validate_soulx_peagle_artifacts.py \
+    --preprocessed-dir "${PREPROCESSED_DIR}" \
+    --model-path "${MODEL_PATH}" \
+    --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
+    --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
+    --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
+    --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+    --checkpoint "${WORK_DIR}/checkpoints/checkpoint_best"
+}
+
 cleanup() {
   if [[ -n "${VLLM_PID:-}" ]] && kill -0 "${VLLM_PID}" 2>/dev/null; then
     echo "Stopping vLLM hidden-state server pid=${VLLM_PID}"
@@ -208,9 +255,13 @@ PY
 echo "Preparing SoulX P-EAGLE dataset"
 if [[ "${FORCE_PREPARE}" != "1" \
       && -f "${PREPROCESSED_DIR}/token_freq.pt" \
-      && -f "${PREPROCESSED_DIR}/soulx_peagle_prepare_summary.json" ]]; then
-  echo "Reusing prepared P-EAGLE dataset: ${PREPROCESSED_DIR}"
+      && -f "${PREPROCESSED_DIR}/soulx_peagle_prepare_summary.json" ]] \
+      && validate_preprocessed; then
+  echo "Reusing validated P-EAGLE dataset: ${PREPROCESSED_DIR}"
 else
+  if [[ "${FORCE_PREPARE}" != "1" && -e "${PREPROCESSED_DIR}" ]]; then
+    echo "Existing preprocessed dataset failed validation; rebuilding: ${PREPROCESSED_DIR}"
+  fi
   PREPARE_OVERWRITE_ARGS=()
   if [[ "${FORCE_PREPARE}" == "1" || -e "${PREPROCESSED_DIR}" ]]; then
     PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
@@ -232,6 +283,22 @@ else
     --seed "${SEED}" \
     "${MAX_SAMPLE_ARGS[@]}" \
     "${PREPARE_OVERWRITE_ARGS[@]}"
+
+  validate_preprocessed
+fi
+
+if [[ "${RESET_CHECKPOINTS}" == "1" || "${RESET_CHECKPOINTS}" == "true" ]]; then
+  echo "RESET_CHECKPOINTS enabled; removing existing P-EAGLE checkpoints and vocab mapping"
+  rm -rf "${WORK_DIR}/checkpoints" "${WORK_DIR}/vocab_mapping"
+elif [[ -d "${WORK_DIR}/checkpoints/checkpoint_best" ]]; then
+  echo "Validating existing checkpoint_best before possible resume"
+  if ! validate_checkpoint; then
+    cat >&2 <<EOF
+Existing checkpoint_best is incompatible with the current SoulX P-EAGLE vocab
+settings. Use a fresh WORK_DIR or resubmit with RESET_CHECKPOINTS=1.
+EOF
+    exit 2
+  fi
 fi
 
 echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
@@ -279,6 +346,9 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
   --num-workers "${NUM_WORKERS}" \
   --prefetch-factor "${PREFETCH_FACTOR}" \
   --seed "${SEED}" \
+  --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
+  --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
+  --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
   "${TARGET_LAYER_ARGS[@]}" \
   "${LOGGER_ARGS[@]}" \
   "${SAVE_BEST_ARGS[@]}"
@@ -286,7 +356,12 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
 echo "Writing vLLM speculative config"
 "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
   --stage write-config \
+  --model-path "${MODEL_PATH}" \
   --work-dir "${WORK_DIR}" \
-  --speculative-config-output "${SPEC_CONFIG_OUTPUT}"
+  --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+  --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
+  --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
+  --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
+  --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}"
 
 echo "Done. Speculative config: ${SPEC_CONFIG_OUTPUT}"

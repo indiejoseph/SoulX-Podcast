@@ -86,6 +86,74 @@ def logger_arg(args: argparse.Namespace) -> str:
     return ",".join(loggers)
 
 
+def validate_draft_vocab_size(args: argparse.Namespace) -> None:
+    if args.allow_overlarge_draft_vocab:
+        return
+    max_safe = args.speech_vocab_size + 1 + args.max_non_speech_draft_tokens
+    if args.draft_vocab_size > max_safe:
+        raise ValueError(
+            f"--draft-vocab-size {args.draft_vocab_size} is too large for "
+            f"SoulX speech tokens. Use 6562 unless you know the draft vocab "
+            f"should include non-speech target IDs. Safe maximum with current "
+            f"validation settings is {max_safe}."
+        )
+
+
+def validate_preprocessed(args: argparse.Namespace, *, write_mapping: bool) -> None:
+    if args.skip_vocab_validation:
+        return
+    paths = common_paths(args)
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "peagle" / "validate_soulx_peagle_artifacts.py"),
+        "--preprocessed-dir",
+        str(paths["preprocessed"]),
+        "--model-path",
+        args.model_path,
+        "--draft-vocab-size",
+        str(args.draft_vocab_size),
+        "--speech-vocab-size",
+        str(args.speech_vocab_size),
+        "--min-speech-draft-tokens",
+        str(args.min_speech_draft_tokens),
+        "--max-non-speech-draft-tokens",
+        str(args.max_non_speech_draft_tokens),
+    ]
+    if write_mapping:
+        cmd += [
+            "--write-vocab-mapping",
+            "--mapping-output-dir",
+            str(paths["work_dir"] / "vocab_mapping"),
+        ]
+    run(cmd, dry_run=args.dry_run)
+
+
+def validate_checkpoint(args: argparse.Namespace) -> None:
+    if args.skip_vocab_validation:
+        return
+    paths = common_paths(args)
+    checkpoint = paths["checkpoints"] / "checkpoint_best"
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "peagle" / "validate_soulx_peagle_artifacts.py"),
+        "--preprocessed-dir",
+        str(paths["preprocessed"]),
+        "--model-path",
+        args.model_path,
+        "--draft-vocab-size",
+        str(args.draft_vocab_size),
+        "--speech-vocab-size",
+        str(args.speech_vocab_size),
+        "--min-speech-draft-tokens",
+        str(args.min_speech_draft_tokens),
+        "--max-non-speech-draft-tokens",
+        str(args.max_non_speech_draft_tokens),
+        "--checkpoint",
+        str(checkpoint),
+    ]
+    run(cmd, dry_run=args.dry_run)
+
+
 def prepare(args: argparse.Namespace) -> None:
     paths = common_paths(args)
     cmd = [
@@ -185,6 +253,8 @@ def generate_hidden_states(args: argparse.Namespace) -> None:
 def train(args: argparse.Namespace) -> None:
     patch_speculators_checkout(args)
     paths = common_paths(args)
+    validate_draft_vocab_size(args)
+    validate_preprocessed(args, write_mapping=args.explicit_vocab_mapping)
     spec_root = Path(args.speculators_root)
     train_script = script_path(spec_root, "train.py", require=not args.dry_run)
     base_cmd = [
@@ -230,6 +300,13 @@ def train(args: argparse.Namespace) -> None:
         "--seed",
         str(args.seed),
     ]
+    if args.explicit_vocab_mapping:
+        base_cmd += [
+            "--d2t-path",
+            str(paths["work_dir"] / "vocab_mapping" / "d2t.npy"),
+            "--t2d-path",
+            str(paths["work_dir"] / "vocab_mapping" / "t2d.npy"),
+        ]
     if args.on_missing == "generate":
         base_cmd += [
             "--vllm-endpoint",
@@ -277,6 +354,8 @@ def train(args: argparse.Namespace) -> None:
 
 
 def write_config(args: argparse.Namespace) -> None:
+    validate_draft_vocab_size(args)
+    validate_checkpoint(args)
     paths = common_paths(args)
     checkpoint = paths["checkpoints"] / "checkpoint_best"
     cmd = [
@@ -360,7 +439,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--train-total-seq-len", type=int, default=1024)
-    parser.add_argument("--draft-vocab-size", type=int, default=8192)
+    parser.add_argument("--draft-vocab-size", type=int, default=6562)
+    parser.add_argument("--speech-vocab-size", type=int, default=6561)
+    parser.add_argument("--min-speech-draft-tokens", type=int, default=6000)
+    parser.add_argument("--max-non-speech-draft-tokens", type=int, default=16)
+    parser.add_argument("--skip-vocab-validation", action="store_true")
+    parser.add_argument("--allow-overlarge-draft-vocab", action="store_true")
+    parser.add_argument(
+        "--explicit-vocab-mapping",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Build and pass explicit d2t/t2d .npy files from SoulX token_freq.pt. "
+            "Disable only for debugging upstream Speculators defaults."
+        ),
+    )
     parser.add_argument(
         "--on-missing",
         choices=["generate", "skip", "warn", "raise"],

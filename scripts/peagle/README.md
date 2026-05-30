@@ -150,7 +150,42 @@ backends. `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE=offline`, and
 The prepare stage uses a batched `datasets.map` path when the input dataset
 already has `speech_tokens`. If `outputs/peagle_soulx_h100/preprocessed`
 already contains `token_freq.pt` and `soulx_peagle_prepare_summary.json`, the
-PJM script reuses it. Set `FORCE_PREPARE=1` to rebuild.
+PJM script reuses it only after validating that the draft vocabulary maps back
+to SoulX speech tokens. Set `FORCE_PREPARE=1` to rebuild.
+
+SoulX has roughly 6561 speech tokens plus `semantic_token_end`, so the H100 PJM
+defaults `DRAFT_VOCAB_SIZE=6562`. Do not use `8192` unless the validator also
+passes. Speculators' vocabulary builder fills missing draft slots from low
+target-token IDs and sorts the result, which can put text tokens into the draft
+vocabulary when the requested draft vocab is larger than the speech-token
+coverage. The wrapper now writes explicit `vocab_mapping/d2t.npy` and
+`vocab_mapping/t2d.npy` from the validated `token_freq.pt` and passes them to
+upstream `scripts/train.py`.
+
+The PJM script has a shell-level guard for this now: if `DRAFT_VOCAB_SIZE=8192`
+is still exported in your login/session environment, the job exits before
+starting vLLM. The training wrapper has the same guard. Override it only for a
+deliberate ablation with `ALLOW_OVERLARGE_DRAFT_VOCAB=1` or
+`--allow-overlarge-draft-vocab`.
+
+Important detail when inspecting checkpoints: upstream Speculators stores `d2t`
+as an offset tensor. The effective target ID is `draft_index + d2t[draft_index]`,
+not the raw `d2t` value alone.
+
+Validate a prepared dataset or a trained checkpoint manually:
+
+```bash
+python scripts/peagle/validate_soulx_peagle_artifacts.py \
+  --preprocessed-dir outputs/peagle_soulx_h100/preprocessed \
+  --model-path runs/merged \
+  --draft-vocab-size 6562 \
+  --checkpoint outputs/peagle_soulx_h100/checkpoints/checkpoint_best
+```
+
+If you previously trained with `DRAFT_VOCAB_SIZE=8192`, use a fresh `WORK_DIR`
+or set `RESET_CHECKPOINTS=1 FORCE_PREPARE=1 DRAFT_VOCAB_SIZE=6562` for the next
+PJM submission. The new script intentionally refuses to resume from a checkpoint
+whose effective draft vocabulary contains too many non-speech tokens.
 
 The hidden-state vLLM server is launched with `--no-enable-chunked-prefill`
 because Speculators' `ExampleHiddenStatesConnector` rejects chunked prefill in
@@ -213,12 +248,14 @@ python scripts/peagle/train_soulx_peagle.py \
 
 python scripts/peagle/train_soulx_peagle.py \
   --stage write-config \
+  --model-path pretrained_models/SoulX-Podcast-1.7B-dialect \
   --work-dir outputs/peagle_soulx
 ```
 
 The wrapper defaults to a conservative 3090-oriented run:
-`--num-layers 2 --num-depths 2 --train-total-seq-len 1024`. For H100/H200,
-try `--num-layers 4 --num-depths 4 --train-total-seq-len 2048` or higher.
+`--num-layers 2 --num-depths 2 --train-total-seq-len 1024
+--draft-vocab-size 6562`. For H100/H200, try `--num-layers 4 --num-depths 4
+--train-total-seq-len 2048` or higher.
 
 Use SoulX speech-token sequences, not general chat text, for a meaningful
 acceptance rate. The current MTP dataset columns (`text`, `speech_tokens`,
