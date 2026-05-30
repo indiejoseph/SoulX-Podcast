@@ -29,9 +29,12 @@ After training a P-EAGLE checkpoint in Speculators format, write a config:
 ```bash
 python scripts/peagle/write_speculative_config.py \
   --speculator-model /path/to/peagle/checkpoints/checkpoint_best \
-  --num-speculative-tokens 3 \
+  --num-speculative-tokens 4 \
   --output exports/peagle/speculative_config.json
 ```
+
+Set `--num-speculative-tokens` to the P-EAGLE `num_depths` used for training.
+The H100 PJM defaults use `NUM_DEPTHS=4`.
 
 Run the non-MTP vLLM path against a vLLM/speculators runtime that supports
 `speculative_config`:
@@ -123,28 +126,32 @@ runtime speculative config:
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
 ```
 
-Override paths and sizing without editing the file, for example:
+On this PJM cluster, inline shell assignments such as
+`WANDB=1 pjsub scripts/peagle/submit_peagle_online_h100.pjm` are not propagated
+into the batch job. Treat the PJM file itself as the source of truth for job
+settings. Edit the defaults near the top of
+`scripts/peagle/submit_peagle_online_h100.pjm` before submitting.
+
+The checked-in H100 defaults are:
 
 ```bash
-WORK_DIR=/path/to/scratch/peagle_h100 \
-ON_GENERATE=cache \
-PREPARE_NUM_PROC=16 \
-VLLM_GPU_MEMORY_UTILIZATION=0.45 \
+DRAFT_VOCAB_SIZE=6562
+AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1
+WANDB=1
+LOGGER=wandb
+WANDB_PROJECT=soulx-peagle
+```
+
+The wrapper maps `WANDB=1` to Speculators' `--logger wandb` option. Set
+`WANDB_MODE=offline` or `WANDB_API_KEY=...` in the PJM file if the compute node
+cannot authenticate interactively.
+
+```bash
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
 ```
 
-Enable Weights & Biases logging with the PJM wrapper by setting `WANDB=1`.
-The wrapper maps this to Speculators' `--logger wandb` option:
-
-```bash
-WANDB=1 \
-WANDB_PROJECT=soulx-peagle \
-RUN_NAME=peagle-soulx-h100-v1 \
-pjsub scripts/peagle/submit_peagle_online_h100.pjm
-```
-
-Use `LOGGER=tensorboard,wandb` if you want to pass multiple Speculators logger
-backends. `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE=offline`, and
+Use `LOGGER=tensorboard,wandb` in the PJM file if you want multiple Speculators
+logger backends. `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE=offline`, and
 `WANDB_API_KEY` are read by the `wandb` package from the environment.
 
 The prepare stage uses a batched `datasets.map` path when the input dataset
@@ -172,6 +179,16 @@ Important detail when inspecting checkpoints: upstream Speculators stores `d2t`
 as an offset tensor. The effective target ID is `draft_index + d2t[draft_index]`,
 not the raw `d2t` value alone.
 
+The wrapper also patches upstream P-EAGLE training to preserve packed-sample
+`position_ids` after COD downsampling. Without that patch, training and
+validation use flattened packed-batch RoPE positions, while vLLM inference uses
+normal per-request positions. Any checkpoint trained before this patch should be
+discarded with `RESET_CHECKPOINTS=1`; the hidden-state cache and preprocessed
+dataset can be reused. The PJM script records
+`PEAGLE_TRAINING_CONTRACT_VERSION=2` in the work directory and automatically
+moves older/no-marker checkpoints aside when
+`AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1`.
+
 Validate a prepared dataset or a trained checkpoint manually:
 
 ```bash
@@ -180,6 +197,20 @@ python scripts/peagle/validate_soulx_peagle_artifacts.py \
   --model-path runs/merged \
   --draft-vocab-size 6562 \
   --checkpoint outputs/peagle_soulx_h100/checkpoints/checkpoint_best
+```
+
+Inspect the runtime contract after training:
+
+```bash
+python scripts/peagle/inspect_peagle_runtime_contract.py \
+  --model-path runs/merged \
+  --checkpoint outputs/peagle_soulx_h100/checkpoints/checkpoint_best \
+  --preprocessed-dir outputs/peagle_soulx_h100/preprocessed \
+  --hidden-states-dir outputs/peagle_soulx_h100/hidden_states \
+  --speculative-config exports/peagle/speculative_config.json \
+  --expected-draft-vocab-size 6562 \
+  --expected-num-depths 4 \
+  --fail-on-error
 ```
 
 If you previously trained with `DRAFT_VOCAB_SIZE=8192`, use a fresh `WORK_DIR`
@@ -251,7 +282,8 @@ python scripts/peagle/train_soulx_peagle.py \
 python scripts/peagle/train_soulx_peagle.py \
   --stage write-config \
   --model-path pretrained_models/SoulX-Podcast-1.7B-dialect \
-  --work-dir outputs/peagle_soulx
+  --work-dir outputs/peagle_soulx \
+  --num-speculative-tokens 4
 ```
 
 The wrapper defaults to a conservative 3090-oriented run:

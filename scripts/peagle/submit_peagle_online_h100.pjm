@@ -40,6 +40,7 @@ MIN_SPEECH_DRAFT_TOKENS="${MIN_SPEECH_DRAFT_TOKENS:-6000}"
 MAX_NON_SPEECH_DRAFT_TOKENS="${MAX_NON_SPEECH_DRAFT_TOKENS:-16}"
 RESET_CHECKPOINTS="${RESET_CHECKPOINTS:-0}"
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS="${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS:-1}"
+PEAGLE_TRAINING_CONTRACT_VERSION="${PEAGLE_TRAINING_CONTRACT_VERSION:-2}"
 ALLOW_OVERLARGE_DRAFT_VOCAB="${ALLOW_OVERLARGE_DRAFT_VOCAB:-0}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-6e-4}"
@@ -49,12 +50,15 @@ SAVE_BEST="${SAVE_BEST:-1}"
 ON_GENERATE="${ON_GENERATE:-cache}"  # cache = generate once and reuse; delete = pure online
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
-WANDB="${WANDB:-0}"
-LOGGER="${LOGGER:-}"
+# PJM on this cluster does not propagate inline shell assignments from
+# `VAR=value pjsub ...`. Keep job-critical defaults in this file.
+WANDB="${WANDB:-1}"
+LOGGER="${LOGGER:-wandb}"
 LOG_DIR="${LOG_DIR:-${WORK_DIR}/train_logs}"
-RUN_NAME="${RUN_NAME:-}"
+RUN_NAME="${RUN_NAME:-peagle_soulx_h100}"
 SEED="${SEED:-42}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
+export WANDB_PROJECT="${WANDB_PROJECT:-soulx-peagle}"
 
 # Optional: export TARGET_LAYER_IDS="20 24 27" and the same layer IDs will be
 # used for both the vLLM hidden-state server and the P-EAGLE trainer.
@@ -67,11 +71,18 @@ echo "  PROJECT_DIR=${PROJECT_DIR}"
 echo "  SPECULATORS_ROOT=${SPECULATORS_ROOT}"
 echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
 echo "  WORK_DIR=${WORK_DIR}"
+echo "  NUM_LAYERS=${NUM_LAYERS}"
+echo "  NUM_DEPTHS=${NUM_DEPTHS}"
 echo "  DRAFT_VOCAB_SIZE=${DRAFT_VOCAB_SIZE}"
 echo "  SPEECH_VOCAB_SIZE=${SPEECH_VOCAB_SIZE}"
 echo "  FORCE_PREPARE=${FORCE_PREPARE}"
 echo "  RESET_CHECKPOINTS=${RESET_CHECKPOINTS}"
 echo "  AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}"
+echo "  PEAGLE_TRAINING_CONTRACT_VERSION=${PEAGLE_TRAINING_CONTRACT_VERSION}"
+echo "  WANDB=${WANDB}"
+echo "  LOGGER=${LOGGER}"
+echo "  RUN_NAME=${RUN_NAME}"
+echo "  WANDB_PROJECT=${WANDB_PROJECT}"
 
 MAX_SAFE_DRAFT_VOCAB_SIZE=$((SPEECH_VOCAB_SIZE + 1 + MAX_NON_SPEECH_DRAFT_TOKENS))
 if [[ "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "1" \
@@ -137,6 +148,7 @@ mkdir -p "${WORK_DIR}" "${PROJECT_DIR}/logs" "$(dirname "${SPEC_CONFIG_OUTPUT}")
 PYTHON_BIN="$(command -v python)"
 JOB_ID="${PJM_JOBID:-manual}"
 VLLM_LOG="${PROJECT_DIR}/logs/peagle_vllm_${JOB_ID}.log"
+CONTRACT_VERSION_FILE="${WORK_DIR}/peagle_training_contract_version.txt"
 
 "${PYTHON_BIN}" scripts/peagle/patch_speculators_checkout.py \
   --speculators-root "${SPECULATORS_ROOT}"
@@ -293,21 +305,40 @@ if [[ "${RESET_CHECKPOINTS}" == "1" || "${RESET_CHECKPOINTS}" == "true" ]]; then
   echo "RESET_CHECKPOINTS enabled; removing existing P-EAGLE checkpoints and vocab mapping"
   rm -rf "${WORK_DIR}/checkpoints" "${WORK_DIR}/vocab_mapping"
 elif [[ -d "${WORK_DIR}/checkpoints/checkpoint_best" ]]; then
-  echo "Validating existing checkpoint_best before possible resume"
-  if ! validate_checkpoint; then
+  CURRENT_CONTRACT_VERSION="$(cat "${CONTRACT_VERSION_FILE}" 2>/dev/null || true)"
+  if [[ "${CURRENT_CONTRACT_VERSION}" != "${PEAGLE_TRAINING_CONTRACT_VERSION}" ]]; then
     if [[ "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "1" \
           || "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "true" ]]; then
-      BAD_CHECKPOINTS_DIR="${WORK_DIR}/checkpoints.incompatible_${JOB_ID}_$(date +%Y%m%d%H%M%S)"
-      echo "Existing checkpoint_best is incompatible; moving checkpoints to ${BAD_CHECKPOINTS_DIR}"
+      BAD_CHECKPOINTS_DIR="${WORK_DIR}/checkpoints.contract_${CURRENT_CONTRACT_VERSION:-none}_to_${PEAGLE_TRAINING_CONTRACT_VERSION}_${JOB_ID}_$(date +%Y%m%d%H%M%S)"
+      echo "Existing checkpoint_best was trained under contract '${CURRENT_CONTRACT_VERSION:-none}', expected '${PEAGLE_TRAINING_CONTRACT_VERSION}'; moving checkpoints to ${BAD_CHECKPOINTS_DIR}"
       mv "${WORK_DIR}/checkpoints" "${BAD_CHECKPOINTS_DIR}"
       rm -rf "${WORK_DIR}/vocab_mapping"
     else
       cat >&2 <<EOF
+Existing checkpoint_best has P-EAGLE training contract
+'${CURRENT_CONTRACT_VERSION:-none}', expected '${PEAGLE_TRAINING_CONTRACT_VERSION}'.
+Use a fresh WORK_DIR, set RESET_CHECKPOINTS=1, or leave
+AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1.
+EOF
+      exit 2
+    fi
+  else
+    echo "Validating existing checkpoint_best before possible resume"
+    if ! validate_checkpoint; then
+      if [[ "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "1" \
+            || "${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}" == "true" ]]; then
+        BAD_CHECKPOINTS_DIR="${WORK_DIR}/checkpoints.incompatible_${JOB_ID}_$(date +%Y%m%d%H%M%S)"
+        echo "Existing checkpoint_best is incompatible; moving checkpoints to ${BAD_CHECKPOINTS_DIR}"
+        mv "${WORK_DIR}/checkpoints" "${BAD_CHECKPOINTS_DIR}"
+        rm -rf "${WORK_DIR}/vocab_mapping"
+      else
+        cat >&2 <<EOF
 Existing checkpoint_best is incompatible with the current SoulX P-EAGLE vocab
 settings. Use a fresh WORK_DIR, set RESET_CHECKPOINTS=1, or leave
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1.
 EOF
-      exit 2
+        exit 2
+      fi
     fi
   fi
 fi
@@ -364,15 +395,34 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
   "${LOGGER_ARGS[@]}" \
   "${SAVE_BEST_ARGS[@]}"
 
+printf '%s\n' "${PEAGLE_TRAINING_CONTRACT_VERSION}" > "${CONTRACT_VERSION_FILE}"
+
 echo "Writing vLLM speculative config"
 "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
   --stage write-config \
   --model-path "${MODEL_PATH}" \
   --work-dir "${WORK_DIR}" \
   --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+  --num-speculative-tokens "${NUM_DEPTHS}" \
   --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
   --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
   --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
   --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}"
+
+echo "Inspecting trained P-EAGLE runtime contract"
+EXPECTED_TARGET_LAYER_ARGS=()
+if [[ -n "${TARGET_LAYER_IDS}" ]]; then
+  EXPECTED_TARGET_LAYER_ARGS=(--expected-target-layer-ids "${TARGET_LAYER_IDS}")
+fi
+"${PYTHON_BIN}" scripts/peagle/inspect_peagle_runtime_contract.py \
+  --model-path "${MODEL_PATH}" \
+  --checkpoint "${WORK_DIR}/checkpoints/checkpoint_best" \
+  --preprocessed-dir "${PREPROCESSED_DIR}" \
+  --hidden-states-dir "${WORK_DIR}/hidden_states" \
+  --speculative-config "${SPEC_CONFIG_OUTPUT}" \
+  --expected-draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
+  --expected-num-depths "${NUM_DEPTHS}" \
+  "${EXPECTED_TARGET_LAYER_ARGS[@]}" \
+  --fail-on-error
 
 echo "Done. Speculative config: ${SPEC_CONFIG_OUTPUT}"

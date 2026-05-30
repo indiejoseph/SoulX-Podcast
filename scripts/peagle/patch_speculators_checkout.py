@@ -9,6 +9,7 @@ from pathlib import Path
 
 INDEX_PATCH_MARKER = "# SoulX compatibility: DataLoader samplers may pass numpy integer scalars."
 ONLINE_FILE_PATCH_MARKER = "# SoulX compatibility: wait for online generated hidden-state files."
+PEAGLE_POSITION_PATCH_MARKER = "# SoulX compatibility: preserve packed-sample position_ids for P-EAGLE."
 
 OLD_INDEX = """    def __getitem__(self, index) -> BatchType | None:
         data = self._get_raw_data(index)
@@ -120,6 +121,31 @@ def patch_data_py(speculators_root: Path) -> bool:
     return True
 
 
+def patch_peagle_core_py(speculators_root: Path) -> bool:
+    path = speculators_root / "src" / "speculators" / "models" / "peagle" / "core.py"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found")
+
+    text = path.read_text(encoding="utf-8")
+    if PEAGLE_POSITION_PATCH_MARKER in text:
+        return False
+
+    old = """        position_ids = orig_positions.unsqueeze(0)  # [1, total_sampled]\n\n        position_embeddings = self.rotary_emb(layer_input, position_ids)\n"""
+    new = f"""        {PEAGLE_POSITION_PATCH_MARKER}\n        if position_ids is None:\n            sampled_position_ids = orig_positions.unsqueeze(0)\n        else:\n            sampled_position_ids = position_ids[:, orig_positions]\n\n        position_embeddings = self.rotary_emb(layer_input, sampled_position_ids)\n"""
+    if old not in text:
+        raise RuntimeError(f"Expected P-EAGLE position_ids block not found in {path}")
+    text = text.replace(old, new)
+
+    old = """                position_ids=position_ids,\n                position_embeddings=position_embeddings,\n"""
+    new = """                position_ids=sampled_position_ids,\n                position_embeddings=position_embeddings,\n"""
+    if old not in text:
+        raise RuntimeError(f"Expected P-EAGLE decoder position_ids call not found in {path}")
+    text = text.replace(old, new, 1)
+
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -129,7 +155,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    changed = patch_data_py(Path(args.speculators_root))
+    speculators_root = Path(args.speculators_root)
+    changed = patch_data_py(speculators_root)
+    changed = patch_peagle_core_py(speculators_root) or changed
     print(
         "patched speculators checkout"
         if changed
