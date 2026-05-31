@@ -1,0 +1,146 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=1:00:00
+#PJM -j
+
+set -euo pipefail
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+PROJECT_DIR="${PROJECT_DIR:-/home/pj24001684/ku40000295/jc/projects/SoulX-Podcast}"
+MODEL_PATH="${MODEL_PATH:-${PROJECT_DIR}/runs/merged}"
+SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
+SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/.speculators_venv}"
+WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100}"
+PREPROCESSED_DIR="${PREPROCESSED_DIR:-${WORK_DIR}/preprocessed}"
+HIDDEN_STATES_DIR="${HIDDEN_STATES_DIR:-${WORK_DIR}/hidden_states}"
+
+PORT="${PORT:-8000}"
+HOST="${HOST:-127.0.0.1}"
+ENDPOINT="${ENDPOINT:-http://${HOST}:${PORT}/v1}"
+NUM_SAMPLES="${NUM_SAMPLES:-3}"
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
+KEEP_LIVE_DIR="${KEEP_LIVE_DIR:-}"
+TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-}"
+
+cd "${PROJECT_DIR}"
+source "${SPECULATORS_VENV}/bin/activate"
+
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+export VLLM_USE_V1=1
+export SOULX_VLLM_MODEL_RAS=1
+export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
+export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
+export VLLM_USE_DEEP_GEMM_E8M0="${VLLM_USE_DEEP_GEMM_E8M0:-0}"
+export VLLM_DEEP_GEMM_WARMUP="${VLLM_DEEP_GEMM_WARMUP:-skip}"
+export PYTHONPATH="${SPECULATORS_ROOT}/src:${SPECULATORS_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+PYTHON_BIN="$(command -v python)"
+JOB_ID="${PJM_JOBID:-manual}"
+VLLM_LOG="${PROJECT_DIR}/logs/peagle_cache_check_vllm_${JOB_ID}.log"
+
+mkdir -p "${PROJECT_DIR}/logs"
+
+echo "Resolved P-EAGLE cache-check paths:"
+echo "  PROJECT_DIR=${PROJECT_DIR}"
+echo "  MODEL_PATH=${MODEL_PATH}"
+echo "  SPECULATORS_ROOT=${SPECULATORS_ROOT}"
+echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
+echo "  PREPROCESSED_DIR=${PREPROCESSED_DIR}"
+echo "  HIDDEN_STATES_DIR=${HIDDEN_STATES_DIR}"
+echo "  ENDPOINT=${ENDPOINT}"
+echo "  NUM_SAMPLES=${NUM_SAMPLES}"
+echo "  TARGET_LAYER_IDS=${TARGET_LAYER_IDS}"
+
+"${PYTHON_BIN}" scripts/peagle/patch_speculators_checkout.py \
+  --speculators-root "${SPECULATORS_ROOT}"
+
+TARGET_LAYER_ARGS=()
+if [[ -n "${TARGET_LAYER_IDS}" ]]; then
+  read -r -a TARGET_LAYER_ARRAY <<< "${TARGET_LAYER_IDS}"
+  TARGET_LAYER_ARGS=(--target-layer-ids "${TARGET_LAYER_ARRAY[@]}")
+fi
+
+cleanup() {
+  if [[ -n "${VLLM_PID:-}" ]] && kill -0 "${VLLM_PID}" 2>/dev/null; then
+    echo "Stopping vLLM hidden-state server pid=${VLLM_PID}"
+    kill "${VLLM_PID}" 2>/dev/null || true
+    wait "${VLLM_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+wait_for_vllm() {
+  local models_url="${ENDPOINT%/}/models"
+  for attempt in $(seq 1 180); do
+    if "${PYTHON_BIN}" - "${models_url}" <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+try:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        raise SystemExit(0 if 200 <= response.status < 500 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+      echo "vLLM hidden-state endpoint is ready: ${models_url}"
+      return 0
+    fi
+
+    if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+      echo "vLLM hidden-state server exited early. Last log lines:"
+      tail -n 80 "${VLLM_LOG}" || true
+      return 1
+    fi
+
+    sleep 5
+  done
+
+  echo "Timed out waiting for vLLM hidden-state endpoint: ${models_url}"
+  tail -n 80 "${VLLM_LOG}" || true
+  return 1
+}
+
+echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
+"${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
+  --stage launch-vllm \
+  --model-path "${MODEL_PATH}" \
+  --work-dir "${WORK_DIR}" \
+  --speculators-root "${SPECULATORS_ROOT}" \
+  --speculators-python "${PYTHON_BIN}" \
+  --vllm-python "${PYTHON_BIN}" \
+  "${TARGET_LAYER_ARGS[@]}" \
+  --vllm-arg=--host --vllm-arg="${HOST}" \
+  --vllm-arg=--port --vllm-arg="${PORT}" \
+  --vllm-arg=--data-parallel-size --vllm-arg=1 \
+  --vllm-arg=--gpu-memory-utilization --vllm-arg="${VLLM_GPU_MEMORY_UTILIZATION}" \
+  --vllm-arg=--max-model-len --vllm-arg="${VLLM_MAX_MODEL_LEN}" \
+  --vllm-arg=--no-enable-chunked-prefill \
+  > "${VLLM_LOG}" 2>&1 &
+VLLM_PID=$!
+
+wait_for_vllm
+
+KEEP_LIVE_ARGS=()
+if [[ -n "${KEEP_LIVE_DIR}" ]]; then
+  KEEP_LIVE_ARGS=(--keep-live-dir "${KEEP_LIVE_DIR}")
+fi
+
+echo "Comparing cached hidden states against live vLLM extraction"
+"${PYTHON_BIN}" scripts/peagle/compare_peagle_hidden_state_cache.py \
+  --preprocessed-dir "${PREPROCESSED_DIR}" \
+  --hidden-states-dir "${HIDDEN_STATES_DIR}" \
+  --endpoint "${ENDPOINT}" \
+  --num-samples "${NUM_SAMPLES}" \
+  --request-timeout "${REQUEST_TIMEOUT}" \
+  "${KEEP_LIVE_ARGS[@]}" \
+  --fail-on-mismatch
+
+echo "P-EAGLE hidden-state cache check completed"

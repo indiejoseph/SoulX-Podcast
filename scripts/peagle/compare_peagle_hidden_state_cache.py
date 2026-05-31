@@ -29,12 +29,43 @@ def resolve_model_id(endpoint: str, explicit_model: str | None) -> str:
     return str(model_id)
 
 
-def wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
+def wait_for_hidden_states_file(path: Path, timeout: float = 30.0) -> None:
+    """Wait until vLLM has written a readable hidden-state file.
+
+    Some ExampleHiddenStatesConnector builds leave stale ``.lock`` files after
+    writing the safetensors payload.  Treat a non-empty file with a stable size
+    as complete instead of blocking forever on the lock.
+    """
+
     deadline = time.monotonic() + timeout
-    while lock_path.exists():
+    lock_path = Path(str(path) + ".lock")
+    last_size = -1
+    stable_since: float | None = None
+    stable_seconds = 2.0
+
+    while True:
+        if path.exists():
+            size = path.stat().st_size
+            if size > 0 and not lock_path.exists():
+                return
+
+            if size > 0 and size == last_size:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= stable_seconds:
+                    return
+            else:
+                last_size = size
+                stable_since = None
+
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out waiting for lock file: {lock_path}")
-        time.sleep(0.1)
+            if lock_path.exists():
+                raise TimeoutError(
+                    f"Timed out waiting for stable hidden-state file: {path} "
+                    f"(stale lock still exists: {lock_path})"
+                )
+            raise FileNotFoundError(path)
+        time.sleep(0.2)
 
 
 def extract_hidden_states_path(response: Any, expected_token_ids: list[int]) -> str:
@@ -89,9 +120,7 @@ def request_live_hidden_states(
         timeout=timeout,
     )
     path = Path(extract_hidden_states_path(response, token_ids))
-    wait_for_lock(Path(str(path) + ".lock"), timeout=timeout)
-    if not path.exists():
-        raise FileNotFoundError(path)
+    wait_for_hidden_states_file(path, timeout=timeout)
     return path
 
 
