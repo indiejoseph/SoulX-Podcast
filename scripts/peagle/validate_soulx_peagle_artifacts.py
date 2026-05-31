@@ -46,15 +46,30 @@ def build_vocab_mapping(
     token_freq: dict[int, int],
     draft_vocab_size: int,
     target_vocab_size: int,
+    fallback_token_ids: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     """Match upstream Speculators' offset d2t + boolean t2d implementation."""
     sorted_tokens = sorted(token_freq, key=lambda tid: (-token_freq[tid], tid))
-    selected_token_ids = sorted_tokens[: min(draft_vocab_size, len(sorted_tokens))]
+    selected_token_ids: list[int] = []
+    selected_set: set[int] = set()
+
+    def add_token_ids(token_ids: list[int]) -> None:
+        for tid in token_ids:
+            if len(selected_token_ids) >= draft_vocab_size:
+                break
+            if tid in selected_set:
+                continue
+            selected_token_ids.append(tid)
+            selected_set.add(tid)
+
+    add_token_ids(sorted_tokens)
+    if len(selected_token_ids) < draft_vocab_size and fallback_token_ids:
+        add_token_ids(fallback_token_ids)
     if len(selected_token_ids) < draft_vocab_size:
-        current_ids = set(selected_token_ids)
         for tid in range(draft_vocab_size):
-            if tid not in current_ids:
+            if tid not in selected_set:
                 selected_token_ids.append(tid)
+                selected_set.add(tid)
             if len(selected_token_ids) >= draft_vocab_size:
                 break
     selected_token_ids.sort()
@@ -296,6 +311,10 @@ def main() -> None:
     semantic_token_end = resolve_token_id(tokenizer, "<|semantic_token_end|>")
     allowed_control_ids = {semantic_token_end}
     target_vocab_size = load_target_vocab_size(args.model_path)
+    summary = {}
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    is_generated_prepare = summary.get("prepare_mode") == "generated_trajectory"
 
     token_freq = load_token_freq(token_freq_path)
     token_ids = sorted(token_freq)
@@ -310,6 +329,8 @@ def main() -> None:
         token_freq=token_freq,
         draft_vocab_size=args.draft_vocab_size,
         target_vocab_size=target_vocab_size,
+        fallback_token_ids=[semantic_token_end]
+        + list(range(speech_start, speech_start + args.speech_vocab_size)),
     )
     selected_counts = classify_ids(
         selected_ids,
@@ -319,11 +340,12 @@ def main() -> None:
     )
 
     errors = []
+    token_freq_min_speech = 0 if is_generated_prepare else args.min_speech_draft_tokens
     errors.extend(
         validate_counts(
             name="token_freq",
             counts=token_freq_counts,
-            min_speech_tokens=args.min_speech_draft_tokens,
+            min_speech_tokens=token_freq_min_speech,
             max_non_speech_tokens=args.max_non_speech_draft_tokens,
         )
     )
@@ -396,9 +418,6 @@ def main() -> None:
         np.save(mapping_dir / "d2t.npy", d2t.numpy())
         np.save(mapping_dir / "t2d.npy", t2d.numpy())
 
-    summary = {}
-    if summary_path.exists():
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if args.expected_prepare_mode is not None:
         actual_prepare_mode = summary.get("prepare_mode")
         if actual_prepare_mode != args.expected_prepare_mode:
