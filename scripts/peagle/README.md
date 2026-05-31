@@ -174,15 +174,58 @@ TRAJECTORY_SOURCE=generated
 WORK_DIR=outputs/peagle_soulx_h100_generated
 DRAFT_VOCAB_SIZE=6562
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1
+MULTI_SPEAKER=1
+NUM_SPEAKERS=2
+LANG_MIX="yue:1,zh:1,en:1"
 WANDB=1
 LOGGER=wandb
 WANDB_PROJECT=soulx-peagle
 ```
 
 Set `TRAJECTORY_SOURCE=teacher` in the PJM file only for an explicit ablation
-against the old teacher-forced dataset. The generated path records
-`PEAGLE_TRAINING_CONTRACT_VERSION=3-generated`, so old teacher-forced
-checkpoints are not resumed accidentally.
+against the old teacher-forced dataset.
+
+`MULTI_SPEAKER=1` (default) builds each training sample as a runtime-shaped
+podcast dialogue:
+
+```
+[task_podcast]
+  [SPEAKER_0][text_start]<spk0_prompt_text>[text_end][semantic_token_start]
+      <spk0_prompt_speech_tokens>[semantic_token_end]
+  [SPEAKER_1][text_start]<spk1_prompt_text>[text_end][semantic_token_start]
+      <spk1_prompt_speech_tokens>[semantic_token_end]
+  [SPEAKER_t][text_start]<turn_text>[text_end][semantic_token_start]
+  <-- verifier generates turn speech here, drafter learns its trajectory -->
+```
+
+This matches the prompt layout that `soulxpodcast/utils/dataloader.py` builds at
+runtime, so the verifier's aux hidden states during training carry the same
+multi-speaker conditioning as deployment. Single-utterance regen (the old
+`MULTI_SPEAKER=0` ablation) achieves high validation accuracy on its own
+distribution but collapses to ~24% pos-0 acceptance at runtime because the
+training and runtime aux-state distributions differ; multi-speaker regen closes
+that gap.
+
+`LANG_MIX` defaults to equal coverage across Cantonese / Mandarin / English
+(`yue:1,zh:1,en:1`). Use weighted form like `yue:2,zh:1,en:1` to match a
+known production user mix. The dataset row pool drives speaker sampling:
+LibriSpeech (`en`) and AISHELL (`zh`) ids carry speaker info and are paired as
+distinct-speaker prompts; Cantonese (`yue_*`) rows are anonymous and randomly
+paired.
+
+`NUM_DIALOGUES` defaults to `len(dataset)`; set it explicitly to bound the
+number of generated dialogue samples (e.g. `NUM_DIALOGUES=200000`). With
+`MULTI_SPEAKER=1`, `MAX_SAMPLES` only acts as an explicit row-pool cap, not an
+output cap.
+
+The contract version reflects the prepare variant:
+
+- `PEAGLE_TRAINING_CONTRACT_VERSION=4-generated-multispeaker` (multi-speaker, default)
+- `PEAGLE_TRAINING_CONTRACT_VERSION=3-generated` (single-utterance ablation)
+- `PEAGLE_TRAINING_CONTRACT_VERSION=2` (teacher-forced ablation)
+
+`AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1` ensures checkpoints from a previous
+contract are moved aside rather than resumed across the boundary.
 
 The wrapper maps `WANDB=1` to Speculators' `--logger wandb` option. Set
 `WANDB_MODE=offline` or `WANDB_API_KEY=...` in the PJM file if the compute node

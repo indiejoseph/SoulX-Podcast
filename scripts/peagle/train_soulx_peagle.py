@@ -264,6 +264,13 @@ def prepare_generated(args: argparse.Namespace) -> None:
         cmd.append("--overwrite")
     if args.resume_generated_prepare:
         cmd.append("--resume")
+    if args.multi_speaker:
+        cmd.append("--multi-speaker")
+        cmd += ["--num-speakers", str(args.num_speakers)]
+        if args.num_dialogues is not None:
+            cmd += ["--num-dialogues", str(args.num_dialogues)]
+        if args.lang_mix:
+            cmd += ["--lang-mix", args.lang_mix]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -497,6 +504,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generation-repetition-penalty", type=float, default=1.25)
     parser.add_argument("--generation-max-tokens", type=int, default=None)
     parser.add_argument("--resume-generated-prepare", action="store_true")
+    parser.add_argument(
+        "--multi-speaker",
+        action="store_true",
+        help="Forward --multi-speaker to prepare_soulx_generated_dataset.py.",
+    )
+    parser.add_argument(
+        "--num-dialogues",
+        type=int,
+        default=None,
+        help="Number of multi-speaker dialogues to generate (only with --multi-speaker).",
+    )
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=2,
+        help="Number of speaker prompts per dialogue (only with --multi-speaker).",
+    )
+    parser.add_argument(
+        "--lang-mix",
+        type=str,
+        default="",
+        help="Language weights for multi-speaker mode, e.g. 'yue:1,zh:1,en:1'.",
+    )
     parser.add_argument("--expected-prepare-mode", default=None)
     parser.add_argument("--legacy-prepare-loop", action="store_true")
     parser.add_argument("--shuffle-prepare", action="store_true")

@@ -1,0 +1,6 @@
+{
+  "method": "ngram",
+  "num_speculative_tokens": 4,
+  "prompt_lookup_min": 2,
+  "prompt_lookup_max": 6
+}

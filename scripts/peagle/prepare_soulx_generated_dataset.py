@@ -7,12 +7,13 @@ import argparse
 import json
 import logging
 import os
+import random
 import shutil
 import sys
 import threading
 import time
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
@@ -338,6 +339,10 @@ def build_resume_config(args: argparse.Namespace, *, served_model: str) -> dict[
         "repetition_penalty": args.repetition_penalty,
         "skip_dialect_prefix": args.skip_dialect_prefix,
         "no_eos_loss": args.no_eos_loss,
+        "multi_speaker": bool(args.multi_speaker),
+        "num_speakers": int(args.num_speakers) if args.multi_speaker else None,
+        "num_dialogues": int(args.num_dialogues) if (args.multi_speaker and args.num_dialogues) else None,
+        "lang_mix": args.lang_mix if args.multi_speaker else None,
     }
 
 
@@ -424,6 +429,252 @@ def build_prefixes(
     return prefixes
 
 
+def parse_speaker_id(row_id: str, lang: str) -> str | None:
+    """Extract a stable speaker tag from the row's id.
+
+    Returns None when speaker identity cannot be parsed (e.g. yue rows
+    use anonymous ``yue_NNN`` ids). Callers should treat None as
+    'unknown speaker' and avoid speaker-distinct constraints.
+    """
+    if not row_id:
+        return None
+    if lang == "en":
+        parts = row_id.split("-")
+        if parts and parts[0].isdigit():
+            return f"en:{parts[0]}"
+    elif lang == "zh":
+        if row_id.startswith("SSB") and len(row_id) >= 7:
+            return f"zh:{row_id[:7]}"
+    return None
+
+
+def resolve_speaker_token_ids(tokenizer, num_speakers: int) -> list[int]:
+    """Resolve <|SPEAKER_K|> token ids for K in [0, num_speakers)."""
+    out: list[int] = []
+    for k in range(num_speakers):
+        sym = f"<|SPEAKER_{k}|>"
+        ids = tokenizer.encode(sym, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(f"Tokenizer did not encode {sym} as one token: {ids}")
+        out.append(int(ids[0]))
+    return out
+
+
+def parse_lang_mix(spec: str, available_langs: list[str]) -> dict[str, float]:
+    """Parse '--lang-mix' spec like 'yue:1,zh:1,en:1' into weight dict.
+
+    Empty spec → equal weights across all available_langs.
+    Items without ':<weight>' default to weight 1.0.
+    """
+    if not spec.strip():
+        return {lang: 1.0 for lang in available_langs}
+    weights: dict[str, float] = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            lang, w = item.split(":", 1)
+            weights[lang.strip()] = float(w)
+        else:
+            weights[item] = 1.0
+    return weights
+
+
+def build_multispeaker_prefixes(
+    *,
+    hf_ds,
+    tokenizer,
+    special: dict[str, int],
+    args: argparse.Namespace,
+    speech_token_offset: int,
+) -> list[tuple[int, list[int]]]:
+    """Pair rows into multi-speaker podcast-format prefixes that mirror runtime.
+
+    Each output prefix represents one dialogue sample with shape:
+
+        [task_podcast]
+          [SPK_0][text_start]<spk0_prompt_text>[text_end][semantic_token_start]
+              <spk0_prompt_speech_tokens+offset>[semantic_token_end]
+          [SPK_1][text_start]<spk1_prompt_text>[text_end][semantic_token_start]
+              <spk1_prompt_speech_tokens+offset>[semantic_token_end]
+          [SPK_t][text_start]<turn_text>[text_end][semantic_token_start]
+              <-- generation starts here -->
+
+    This matches the runtime LLM input layout produced by
+    ``soulxpodcast/models/soulxpodcast.py:_run_llm_prompt`` so the verifier
+    sees the same multi-speaker conditioning during data generation as it
+    does at deployment.
+    """
+    if args.num_speakers < 2:
+        raise ValueError("--num-speakers must be >= 2 for multi-speaker mode")
+
+    speaker_token_ids = resolve_speaker_token_ids(tokenizer, args.num_speakers)
+    semantic_token_end_id = special["semantic_token_end"]
+
+    log.info("Scanning dataset for language + speaker grouping (%d rows)", len(hf_ds))
+    rows_lang: list[str] = []
+    rows_speaker: list[str | None] = []
+    by_lang: dict[str, list[int]] = defaultdict(list)
+    by_lang_speaker: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i in tqdm(range(len(hf_ds)), desc="Indexing rows"):
+        row = hf_ds[i]
+        lang = str(row.get("lang", ""))
+        if not lang:
+            rows_lang.append("")
+            rows_speaker.append(None)
+            continue
+        sid = parse_speaker_id(str(row.get("id", "")), lang)
+        rows_lang.append(lang)
+        rows_speaker.append(sid)
+        by_lang[lang].append(i)
+        if sid:
+            by_lang_speaker[(lang, sid)].append(i)
+
+    available_langs = sorted(lang for lang, idxs in by_lang.items() if len(idxs) >= 3)
+    if not available_langs:
+        raise RuntimeError(
+            "No language has >=3 rows; cannot build any multi-speaker dialogue"
+        )
+
+    lang_weights = parse_lang_mix(args.lang_mix, available_langs)
+    lang_weights = {
+        lang: w for lang, w in lang_weights.items() if lang in available_langs and w > 0
+    }
+    if not lang_weights:
+        raise RuntimeError(
+            f"--lang-mix {args.lang_mix!r} matches no language with enough rows; "
+            f"available langs: {available_langs}"
+        )
+
+    total_dialogues = int(args.num_dialogues) if args.num_dialogues else len(hf_ds)
+    weight_total = sum(lang_weights.values())
+    quotas = {
+        lang: int(total_dialogues * w / weight_total) for lang, w in lang_weights.items()
+    }
+    leftover = total_dialogues - sum(quotas.values())
+    if leftover:
+        ranked = sorted(lang_weights.items(), key=lambda x: -x[1])
+        for k in range(leftover):
+            quotas[ranked[k % len(ranked)][0]] += 1
+
+    log.info(
+        "Multi-speaker plan: %d total dialogues, per-lang quotas=%s",
+        total_dialogues,
+        quotas,
+    )
+
+    rng = random.Random(args.seed)
+    prefixes: list[tuple[int, list[int]]] = []
+    dialog_idx = 0
+    rejected_prefix_overflow = 0
+
+    for lang, quota in quotas.items():
+        candidates = by_lang.get(lang, [])
+        if len(candidates) < 3:
+            log.warning("Skipping lang=%s — only %d rows", lang, len(candidates))
+            continue
+        # Pool keyed by speaker for distinct-speaker pairing
+        speaker_pool: dict[str, list[int]] = {
+            sid: rows for (lng, sid), rows in by_lang_speaker.items() if lng == lang
+        }
+        speakers_with_data = sorted(speaker_pool.keys())
+
+        produced = 0
+        attempts = 0
+        attempt_cap = max(quota * 3, 100)
+        while produced < quota and attempts < attempt_cap:
+            attempts += 1
+            spk0_row: int
+            spk1_row: int
+            turn_spk_idx = rng.randint(0, args.num_speakers - 1) if args.num_speakers == 2 else rng.randint(0, 1)
+
+            if len(speakers_with_data) >= 2:
+                spk_pair = rng.sample(speakers_with_data, 2)
+                spk0_row = rng.choice(speaker_pool[spk_pair[0]])
+                spk1_row = rng.choice(speaker_pool[spk_pair[1]])
+                # Turn row: prefer a different utterance from the chosen turn speaker
+                turn_speaker_id = spk_pair[turn_spk_idx]
+                turn_pool = [r for r in speaker_pool[turn_speaker_id] if r != (spk0_row if turn_spk_idx == 0 else spk1_row)]
+                if not turn_pool:
+                    # Speaker has only one utterance — fall back to any other row
+                    turn_pool = [r for r in candidates if r not in (spk0_row, spk1_row)]
+                    if not turn_pool:
+                        continue
+                turn_row = rng.choice(turn_pool)
+            else:
+                # No speaker info → just pick three distinct rows from the same lang
+                picks = rng.sample(candidates, 3)
+                spk0_row, spk1_row, turn_row = picks[0], picks[1], picks[2]
+
+            spk0_data = hf_ds[spk0_row]
+            spk1_data = hf_ds[spk1_row]
+            turn_data = hf_ds[turn_row]
+
+            speakers_data = [spk0_data, spk1_data]
+            prefix: list[int] = [special["task_podcast"]]
+
+            ok = True
+            for spk_idx, row_data in enumerate(speakers_data):
+                row_text = apply_dialect_prefix(
+                    str(row_data["text"]),
+                    str(row_data["lang"]),
+                    skip_dialect_prefix=args.skip_dialect_prefix,
+                )
+                text_ids = tokenizer(row_text, add_special_tokens=False)["input_ids"]
+                row_speech = row_data.get("speech_tokens") or []
+                if not row_speech:
+                    ok = False
+                    break
+                prefix.append(speaker_token_ids[spk_idx])
+                prefix.append(special["text_start"])
+                prefix.extend(int(t) for t in text_ids)
+                prefix.append(special["text_end"])
+                prefix.append(special["semantic_token_start"])
+                prefix.extend(int(t) + speech_token_offset for t in row_speech)
+                prefix.append(semantic_token_end_id)
+            if not ok:
+                continue
+
+            turn_text = apply_dialect_prefix(
+                str(turn_data["text"]),
+                str(turn_data["lang"]),
+                skip_dialect_prefix=args.skip_dialect_prefix,
+            )
+            turn_text_ids = tokenizer(turn_text, add_special_tokens=False)["input_ids"]
+            prefix.append(speaker_token_ids[turn_spk_idx])
+            prefix.append(special["text_start"])
+            prefix.extend(int(t) for t in turn_text_ids)
+            prefix.append(special["text_end"])
+            prefix.append(special["semantic_token_start"])
+
+            if len(prefix) >= args.seq_length - args.min_speech_tokens:
+                rejected_prefix_overflow += 1
+                continue
+
+            prefixes.append((dialog_idx, [int(tok) for tok in prefix]))
+            dialog_idx += 1
+            produced += 1
+
+        log.info(
+            "Lang %s: produced %d/%d dialogues (attempts=%d)",
+            lang,
+            produced,
+            quota,
+            attempts,
+        )
+
+    if rejected_prefix_overflow:
+        log.warning(
+            "Rejected %d dialogues whose prefix exceeded seq_length - min_speech_tokens",
+            rejected_prefix_overflow,
+        )
+
+    if not prefixes:
+        raise RuntimeError("No valid multi-speaker dialogues were produced")
+    return prefixes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", required=True)
@@ -451,6 +702,41 @@ def main() -> None:
     parser.add_argument("--no-eos-loss", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--multi-speaker",
+        action="store_true",
+        help=(
+            "Build multi-speaker dialogue prefixes (matches the runtime SoulX podcast "
+            "prompt layout) instead of single-utterance prefixes. Closes the "
+            "single-turn-vs-multi-turn distribution gap that causes runtime acceptance "
+            "to collapse despite high single-utterance validation accuracy."
+        ),
+    )
+    parser.add_argument(
+        "--num-dialogues",
+        type=int,
+        default=None,
+        help=(
+            "Number of multi-speaker dialogue samples to produce. Only used with "
+            "--multi-speaker. Defaults to len(dataset)."
+        ),
+    )
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=2,
+        help="Number of speaker prompts per dialogue (default 2). Only used with --multi-speaker.",
+    )
+    parser.add_argument(
+        "--lang-mix",
+        type=str,
+        default="",
+        help=(
+            "Language mix for --multi-speaker, e.g. 'yue:1,zh:1,en:1' for equal thirds "
+            "or 'yue:2,zh:1,en:1' for weighted. Empty = equal weights across all langs "
+            "present in the dataset that have >=3 rows."
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -482,12 +768,26 @@ def main() -> None:
     )
 
     hf_ds = load_split(Path(args.dataset_path), args.split)
-    if args.shuffle or args.max_samples is not None:
+    # In single-utterance mode --max-samples bounds the input rows. In multi-speaker
+    # mode we keep the full row pool for sampling and use --num-dialogues to bound
+    # output count; --max-samples then only acts as an explicit pool cap.
+    if args.shuffle or (args.max_samples is not None and not args.multi_speaker):
         hf_ds = hf_ds.shuffle(seed=args.seed)
-    if args.max_samples is not None:
+    if args.max_samples is not None and not args.multi_speaker:
         hf_ds = hf_ds.select(range(min(args.max_samples, len(hf_ds))))
+    elif args.multi_speaker and args.max_samples is not None:
+        hf_ds = hf_ds.shuffle(seed=args.seed).select(range(min(args.max_samples, len(hf_ds))))
 
-    prefixes = build_prefixes(hf_ds=hf_ds, tokenizer=tokenizer, special=special, args=args)
+    if args.multi_speaker:
+        prefixes = build_multispeaker_prefixes(
+            hf_ds=hf_ds,
+            tokenizer=tokenizer,
+            special=special,
+            args=args,
+            speech_token_offset=speech_start,
+        )
+    else:
+        prefixes = build_prefixes(hf_ds=hf_ds, tokenizer=tokenizer, special=special, args=args)
     if not prefixes:
         raise RuntimeError("No valid generation prompts were produced")
 
@@ -597,6 +897,11 @@ def main() -> None:
         "include_eos_in_loss_mask": not args.no_eos_loss,
         "token_freq_tokens": len(token_freq),
         "prepare_mode": "generated_trajectory",
+        "prepare_variant": "multispeaker" if args.multi_speaker else "single_utterance",
+        "multi_speaker": bool(args.multi_speaker),
+        "num_speakers": int(args.num_speakers) if args.multi_speaker else None,
+        "num_dialogues": int(args.num_dialogues) if (args.multi_speaker and args.num_dialogues) else None,
+        "lang_mix": args.lang_mix if args.multi_speaker else None,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "top_p": args.top_p,
