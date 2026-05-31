@@ -111,16 +111,83 @@ AWQ does NOT regress streaming dynamic range. The peak being ~5.5 dB hotter (0.9
 
 **Reproducibility note:** the AWQ checkpoint's heavy-file symlinks (`flow.pt`, `hift.pt`, `campplus.onnx`, `flow.cache.pt`, `flow.decoder.estimator.fp32.onnx`) point at the absolute path they were created under (`/notebooks/projects/SoulX-Podcast/pretrained_models/...`). The [docker-compose.bench.yml](docker-compose.bench.yml) overlay bind-mounts the host `pretrained_models/` tree at that absolute path so the symlinks resolve inside the container. Rolling AWQ into `docker-compose.yml` as the default needs the same mount or relative symlinks.
 
-### Residual loudness inconsistency lives in flow/mel space, not LLM
+### Residual loudness inconsistency — two streaming-specific artifacts, both in piece boundaries
 
-After ripping out the flow chunk cache AND switching to AWQ, the Cantonese streaming output still exhibits ~6 dB per-segment RMS spread. Evidence the cause is **upstream of the LLM, in the flow/mel-spec output:**
+After ripping out the flow chunk cache AND switching to AWQ, listening A/B on the streamed output exposed two specific complaints:
 
-1. **Cache removed:** `grep` for `flow_chunk_cache | FLOW_CHUNK_CACHE | chunk_cache | encoder_kv_cache | conv_cache | ode_state` in [soulxpodcast/](soulxpodcast/) + [api/](api/) → 0 matches. Commit 8d80db0 deleted 125 lines from [flow.py](soulxpodcast/models/modules/flow.py), 280 from [estimator.py](soulxpodcast/models/modules/flow_components/estimator.py), 113 from [upsample_encoder.py](soulxpodcast/models/modules/flow_components/upsample_encoder.py).
-2. **bf16 ≡ AWQ on streaming spread** — both produce rms σ/μ ≈ 0.23 across speech segments on the same dialogue+seed (table above). Quantization is not the cause.
-3. **Sync ≠ stream on Cantonese, but sync is worse** — `/generate` (full bidirectional flow) on AWQ Cantonese produces 11.6 dB max/min RMS across 9 segments vs 4.5 dB for `/generate-stream`. The streaming chunk-masked attention path is not amplifying variation; if anything it smooths it.
-4. **Mandarin shows ~2-3 dB spread, Cantonese ~6-12 dB** — variability is dialect/content correlated. Same LLM, same flow, same vocoder.
+> Loudness problem only on turn 0; almost all streams have some extent of louder ending.
 
-The variation is therefore in the **mel-spectrogram produced by the CFM flow** (or further upstream in the speech-token sequence's prosodic profile for Cantonese). HiFT is a deterministic CNN — given a stable mel, output peak/RMS is stable. Per-turn loudness normalization (previous attempt aafd827, reverted in d2dd436 because it held the whole turn before emitting → 1s+ TTFA regression) targeted the symptom, not the cause. A streaming-friendly fix would need a short look-ahead (e.g. EBU R128 short-term, ~400ms window) so per-chunk gain can be set without buffering the full turn.
+Per-piece RMS diagnostic ([`scripts/inference/flow_piece_diagnostic.py`](scripts/inference/flow_piece_diagnostic.py)) on a 4-turn Cantonese dialogue with the same LLM-generated tokens replayed through both paths (chunk=150, first_chunk=4) confirms both:
+
+**Per-piece loudness within each turn — turn 0 stands out:**
+
+| Turn | piece | dur | peak | rms_dB | comment |
+|---|---|---|---|---|---|
+| **0** | c0_nf4 | 0.04 s | **0.183** | **-33.4** | ← near-silent blip (4 tok, 3 dropped as lookahead) |
+| **0** | c1_nf150 | 6.00 s | 0.501 | -25.6 | normal body |
+| **0** | flush | 5.48 s | **0.689** | -25.6 | ← hot peak (+3 dB vs body) |
+| 1 | c0_nf150 | 5.88 s | 0.441 | -24.5 | |
+| 1 | c1_nf150 | 6.00 s | 0.521 | -25.5 | |
+| 1 | flush | 0.40 s | 0.127 | -36.3 | trailing silence |
+| 2 | c0_nf150 / c1 / flush | — | 0.34-0.48 | -26.3 ↔ -25.9 | flat ✓ |
+| 3 | c0_nf150 | 5.88 s | 0.380 | -25.6 | |
+| 3 | flush | 0.80 s | 0.293 | **-23.1** | ← hot rms (+2.8 dB) |
+
+Turn 0 has **11.5 dB peak swing across pieces** (0.183 → 0.689). Other turns: 1-3 dB.
+
+**Two artifacts, two separate root causes:**
+
+1. **Turn-0 soft-hard pattern is caused by `first_chunk_size=4`.** It was added (fix #12 above) to keep TTFA at 0.64 s, but emits a 40 ms piece with only 4 tokens (3 of which are lookahead-dropped), then jumps straight to a normal-loudness 6 s body. Perceptually: speech starts soft then suddenly becomes loud. **Only turn 0 is affected** because `effective_first_chunk_size = first_chunk_size if turn_i == 0 else chunk_size`.
+
+   Sweeping `first_chunk_size` on turn 0:
+    | first_chunk | turn-0 peak | turn-0 rms | piece0 peak | piece0 rms | verdict |
+    |---|---|---|---|---|---|
+    | (sync) | 0.859 | -24.4 | — | — | reference |
+    | **4** (current) | 0.655 | -25.5 | 0.116 | **-37.4** | silent first piece |
+    | 16 | **0.935** | -24.1 | **0.703** | **-19.1** | ⚠️ catastrophic — piece0 +5 dB hotter than body |
+    | 50 | 0.796 | -25.0 | 0.491 | -24.1 | ✓ piece0 matches body |
+    | 100 | 0.607 | -25.4 | 0.456 | -26.2 | ✓ |
+    | 150 | 0.691 | -25.0 | 0.585 | -25.7 | ✓ (no special first chunk) |
+
+   first_chunk=16 is **worse than the current 4** — piece0 lands inside a flow-internal boundary the chunk-masked attention wasn't built for. first_chunk ≥ 50 normalises turn 0.
+
+2. **End-of-turn hot flush is real for some turns, not all.** Body-vs-flush per turn:
+    | Turn | flush dur | body→flush Δrms dB | body→flush Δpeak dB |
+    |---|---|---|---|
+    | 0 | 5.5 s | +0.86 | **+3.09** |
+    | 1 | 0.4 s | -11.31 (silence) | -10.98 |
+    | 2 | 0.7 s | +0.62 | -4.15 |
+    | 3 | 0.8 s | **+2.77** | -1.74 |
+
+   The `finalize=True` flush re-runs flow on the full sequence with a different attention mask than the chunked `finalize=False` body. When the flush size is large (turn 0: 5.5 s of audio because chunk math left a 134-token trailing partial), the mismatch in mel energy is audible. When the flush is trailing silence (turn 1), it's invisible.
+
+**Earlier finding (chunk-size sweep, sync vs stream peak range) was directionally right but understated:**
+
+| Path | per-turn RMS spread | per-turn peak spread |
+|---|---|---|
+| SYNC (single flow call/turn) | 0.89 dB | 2.10 dB |
+| STREAM chunk=50 | 1.35 dB | 6.24 dB |
+| STREAM chunk=150 (default) | 0.59 dB | 5.86 dB |
+| STREAM chunk=250 | 0.55 dB | 2.98 dB |
+
+The peak-range improvement at larger chunks is real but partly because larger chunks shift the partial/flush balance — not a clean "per-chunk finalize=False is the only cause" story.
+
+**Other evidence (still valid):**
+- bf16 and AWQ produce identical per-segment streaming spread (rms σ/μ ≈ 0.23). Quantization not the cause.
+- Within-turn loudness variation (6-12 dB segment-level spread on `gen_stream_vs_sync.py`) is intrinsic to the LLM's token sequence — prosody, present in both sync and stream.
+- Cache fully removed: `grep` for `flow_chunk_cache | FLOW_CHUNK_CACHE | chunk_cache | encoder_kv_cache | conv_cache | ode_state` in [soulxpodcast/](soulxpodcast/) + [api/](api/) → 0 matches. Commit 8d80db0 deleted 125 lines from [flow.py](soulxpodcast/models/modules/flow.py), 280 from [estimator.py](soulxpodcast/models/modules/flow_components/estimator.py), 113 from [upsample_encoder.py](soulxpodcast/models/modules/flow_components/upsample_encoder.py).
+
+**Fix candidates:**
+
+| Fix | Addresses | Cost | Effort |
+|---|---|---|---|
+| (A) `STREAM_FIRST_CHUNK_SIZE` 4 → 50 | turn-0 soft-hard | TTFA 0.64 s → ~1.5 s | env flip |
+| (B) Drop/silence first piece on turn 0 in `forward_longform_streaming` | turn-0 soft-hard | TTFA unchanged | small code change |
+| (C) `STREAM_CHUNK_SIZE` 150 → 250 | reduces flush size (no large trailing partial) + general peak spread | TTFA unchanged, RTF likely improves (fewer flow calls) | env flip |
+| (D) Post-vocoder peak limiter on flush piece | end-of-turn hot peak | adds 10-20 ms processing | code change |
+| (E) Replace flow architecture (e.g. MeanFlow / 1-step CFM) | both, indirectly | retraining + audio quality risk | research |
+
+**Recommendation:** combine **(B) + (C)** — drop the first piece's audio on turn 0 (it's only 40 ms of mostly-lookahead-dropped garbage; nobody hears anything useful in it) AND bump `STREAM_CHUNK_SIZE` to 250 (TTFA-neutral, eliminates the 5 s turn-0 trailing partial). Then listen — if the end-of-turn hotness still bothers, add (D).
 
 ### Flow chunk cache experiment, rejected
 
@@ -204,7 +271,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
-- **Open quality work: per-turn loudness in mel-spec space.** AWQ ships clean, but the underlying ~6 dB per-segment RMS spread on Cantonese streaming (see [Residual loudness inconsistency lives in flow/mel space, not LLM](#residual-loudness-inconsistency-lives-in-flowmel-space-not-llm)) remains. Streaming-friendly look-ahead-windowed loudness normalization (~400ms EBU R128 short-term) is the recommended next attempt — the per-turn buffer approach (aafd827) is off the table due to the TTFA cost.
+- **Open quality work: two streaming-specific loudness artifacts.** AWQ ships clean. Per-piece RMS diagnostic isolates two artifacts: (1) turn-0 soft-hard transition caused by `first_chunk_size=4` emitting a 40 ms near-silent piece; (2) end-of-turn hot flush when the `finalize=True` re-run renders >1 s of trailing audio with a different attention mask than the chunked body. See [Residual loudness inconsistency — two streaming-specific artifacts, both in piece boundaries](#residual-loudness-inconsistency--two-streaming-specific-artifacts-both-in-piece-boundaries) for the full table and fix candidates. Recommended combo: drop/silence the turn-0 first piece (40 ms code change, TTFA-neutral) + bump `STREAM_CHUNK_SIZE` 150 → 250 (env flip, removes the 5 s flush case).
 
 ## Critical implementation gotchas
 
