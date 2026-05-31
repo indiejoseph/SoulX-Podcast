@@ -15,6 +15,18 @@ services:
       # (the path inside the notebooks container where it was quantized). Mount the
       # same pretrained_models tree at that absolute path so those symlinks resolve.
       - /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models:/notebooks/projects/SoulX-Podcast/pretrained_models:ro
+      # Mount the local tmp/ dir for benchmarking custom model variants
+      # (e.g. MeanFlow drop-in: tmp/meanflow_awq_model has AWQ symlinks + the
+      # converted Chatterbox flow.pt). Mount the local absolute path too so
+      # the flow.pt symlink target (absolute /home/joseph/.../flow_meanflow.pt)
+      # resolves inside the container.
+      - ./tmp:/app/tmp:ro
+      - /home/joseph/projects/SoulX-Podcast/tmp:/home/joseph/projects/SoulX-Podcast/tmp:ro
       - ./example:/app/example:ro
       - ./api/outputs:/app/api/outputs
       - ./api/temp:/app/api/temp
+      # Bind-mount the patched source so the MeanFlow port is picked up
+      # without rebuilding the image. Read-only — the container should not
+      # mutate our working tree.
+      - ./soulxpodcast:/app/soulxpodcast:ro
+      - ./api:/app/api:ro

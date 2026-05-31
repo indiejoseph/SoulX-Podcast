@@ -44,13 +44,15 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM | off | on | 4 | 150 | long | 0.65s² | 11.83s | 0.374 | before turn-0-only first_chunk fix |
 | vLLM bf16 | off | on | 4 | 150 | short | 0.64s | 2.62s | 0.405 | post both first-chunk + final-partial fixes |
 | vLLM bf16 | off | on | 4 | 150 | long | 0.64s | 8.49s | 0.265 | post both fixes — pre-AWQ best |
-| **vLLM AWQ-INT4** | off | on | 4 | 150 | short | **0.66s** | **2.26s** | **0.343** | `awq_marlin` kernel, dtype=fp16 |
-| **vLLM AWQ-INT4** | off | on | 4 | 150 | long | **0.67s** | **6.53s** | **0.208** | **🏆 current best** |
+| vLLM AWQ-INT4 | off | on | 4 | 150 | short | 0.66s | 2.26s | 0.343 | `awq_marlin` kernel, dtype=fp16 |
+| vLLM AWQ-INT4 | off | on | 4 | 150 | long | 0.67s | 6.53s | 0.208 | pre-MeanFlow best |
+| **vLLM AWQ + MeanFlow** | off | on | 1 | 150 | short | **0.49s** | **1.68s** | **0.261** | Chatterbox drop-in, no CFG, 1 step |
+| **vLLM AWQ + MeanFlow** | off | on | 1 | 150 | long | **0.49s** | **5.36s** | **0.164** | **🏆 current best** |
 
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** AWQ-INT4 (`awq_marlin` kernel) is the dominant configuration. RTF=0.208 on long content (4.8× real-time), RTF=0.343 on short (~6.5s audio), TTFA=0.66s. Halves model weight GPU memory (3.86 → 1.91 GiB) so KV cache headroom grows from 10.9 → 12.9 GiB. vLLM auto-detects the AWQ marker in `config.json` and switches kernel + dtype; no code change required. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 MODEL_PATH=<awq-checkpoint>`.
+**Key finding:** AWQ-INT4 LLM + Chatterbox MeanFlow flow is the dominant configuration. RTF=**0.164** on long content (**6.1× real-time**), RTF=0.261 on short (~6.5 s audio), TTFA=**0.49 s**. Improvement over AWQ + CFM-4 baseline: -21% long RTF, -24% short RTF, -26% TTFA. MeanFlow drops CFG entirely (basic_euler does single forward per step, no batch doubling), which dwarfs the step-count reduction as the source of speedup. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 MODEL_PATH=<awq+meanflow-checkpoint>`.
 
 ### Inference runtime comparison summary
 
@@ -62,7 +64,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM CUDA graphs, 4 steps | 0.374 | 0.486 | 0.65s | flow+HiFT (fixed overhead) |
 | vLLM CUDA graphs, 4 steps + turn-0-only first_chunk | 0.303 | 0.445 | 0.65s | intermediate |
 | vLLM CUDA graphs, 4 steps + skip final-partial finalize=False | 0.265 | 0.405 | 0.64s | flow+HiFT (pre-AWQ bf16 best) |
-| **vLLM AWQ-INT4 + CUDA graphs, 4 steps, both fixes** | **0.208** | **0.343** | **0.66s** | **🏆 flow+HiFT (LLM now nearly free)** |
+| vLLM AWQ-INT4 + CUDA graphs, 4 steps, both fixes | 0.208 | 0.343 | 0.66s | flow+HiFT (pre-MeanFlow best) |
+| **vLLM AWQ + MeanFlow (Chatterbox drop-in), 1 step, both fixes** | **0.164** | **0.261** | **0.49s** | **🏆 flow+HiFT collapsed (no CFG)** |
 
 **Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
@@ -89,7 +92,18 @@ The user-flagged hypothesis turned out correct: Chatterbox's `s3gen_meanflow.saf
 
 **Key compatibility:** their `flow.*` subset of the safetensors has 1121 keys all matching ours exactly with zero shape mismatches, plus one extra key `decoder.estimator.time_embed_mixer.weight (1024, 2048)` — the MeanFlow time-embedding fuser, a single bias-free `nn.Linear(2*time_embed_dim, time_embed_dim)`. The earlier port had this module as a 2-layer SiLU MLP (wrong guess); fixing it to match the upstream single-Linear layout makes `strict=True` loading work.
 
-**Flow+HiFT speedup** (measured on a 4-turn Cantonese dialect dialogue, fp16, same speech tokens replayed through each flow):
+**End-to-end TTFA / RTF via `/generate-stream` (vLLM AWQ + CUDA graphs, RTX 3090, chunk=150, first_chunk=4):**
+
+| Config | Dialogue | TTFA | Wall | RTF |
+|---|---|---|---|---|
+| AWQ + CFM, FLOW_STEPS=4 (previous best) | short ~6.5 s | 0.66 s | 2.26 s | 0.343 |
+| **AWQ + MeanFlow, FLOW_STEPS=1** | short ~6.5 s | **0.49 s** | **1.68 s** | **0.261** |
+| AWQ + CFM, FLOW_STEPS=4 (previous best) | long ~32 s | 0.67 s | 6.53 s | 0.208 |
+| **AWQ + MeanFlow, FLOW_STEPS=1** | long ~32 s | **0.49 s** | **5.36 s** | **0.164** |
+
+**Improvement:** -24% short RTF, -21% long RTF, -26% TTFA. Long content now runs **6.1× real-time** with sub-500 ms TTFA. All measured via `scripts/inference/bench_stream.py` against the production `/generate-stream` endpoint with the same dialogue and seed used for previous baselines.
+
+**Flow+HiFT direct timing** (no LLM, same speech tokens replayed through each flow, fp16):
 
 | Config | Total flow+HiFT | Speedup vs CFM-4 |
 |---|---|---|
@@ -97,7 +111,7 @@ The user-flagged hypothesis turned out correct: Chatterbox's `s3gen_meanflow.saf
 | **MeanFlow, steps=1** | **374 ms** | **2.86× (-65%)** |
 | MeanFlow, steps=4 | 825 ms | 1.30× (-23%) |
 
-The 2.86× win is much larger than I predicted (was ~10%) because **MeanFlow drops CFG entirely**. CFM's `solve_euler` doubles the batch on every estimator call for classifier-free guidance (uncond + cond). MeanFlow's `basic_euler` does a single forward per step with no doubling — distilled students bake CFG in during training. Net per-flow-call: 4×2=8 estimator forwards under CFM-4, 1 under MeanFlow-1. That's where the wall savings come from, not just the step-count reduction.
+The 2.86× flow-only win is much larger than the ~10% I initially predicted because **MeanFlow drops CFG entirely**. CFM's `solve_euler` doubles the batch on every estimator call for classifier-free guidance (uncond + cond). MeanFlow's `basic_euler` does a single forward per step with no doubling — distilled students bake CFG in during training. Net per-flow-call: 4×2=8 estimator forwards under CFM-4, 1 under MeanFlow-1. End-to-end the ~20% wall reduction is less than the 65% flow-only number because LLM, encoder, and HiFT are unchanged.
 
 **Cross-lingual transfer works.** Chatterbox-Turbo is English-only by their README, yet the converted weights produced intelligible Cantonese on our 4-turn dialect dialogue (user-confirmed listening test). The s3tokenizer is content-agnostic enough that flow weights trained on English speech still map to reasonable Chinese mels — same phonemes, same speaker conditioning interface, same mel scale.
 
@@ -303,11 +317,11 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | Skip tiny first-chunk on turns 2+ | RTF 0.374→0.303 long, 0.486→0.445 short | ✅ yes |
 | Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
 | AWQ-INT4 (`awq_marlin` kernel) | RTF 0.265→0.208 long, 0.405→0.343 short, -50% model VRAM | ✅ yes — new default |
-| MeanFlow flow weights (Chatterbox drop-in) | flow+HiFT 2.86× faster at FLOW_STEPS=1 (1070ms→374ms); 1.30× at FLOW_STEPS=4 | ⚠️ ready, audio quality OK (intelligible cross-lingually); needs peak limiter at steps=1 |
+| MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
-**Current best:** RTF=0.208 (long, ~32s audio) / RTF=0.343 (short, ~6.5s audio), TTFA=0.66s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 STREAM_CHUNK_SIZE=150 MODEL_PATH=<awq-checkpoint>`.
+**Current best:** RTF=**0.164** (long, ~32 s audio, **6.1× real-time**) / RTF=**0.261** (short, ~6.5 s audio) / TTFA=**0.49 s**. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 STREAM_CHUNK_SIZE=150 MODEL_PATH=<awq+meanflow-checkpoint>`. Auto-detected MeanFlow path: the SoulXPodcastService sniffs `flow.pt` keys at startup; presence of `decoder.estimator.time_embed_mixer.weight` switches the model to MeanFlow inference automatically (no env var, just point MODEL_PATH at a checkpoint converted via `scripts/inference/convert_chatterbox_meanflow.py`).
 
 ## Implications for PLAN.md phases
 
