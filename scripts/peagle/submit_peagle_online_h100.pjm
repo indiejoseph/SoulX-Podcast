@@ -515,6 +515,7 @@ echo "Writing vLLM speculative config"
   --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
   --num-layers "${NUM_LAYERS}" \
   --draft-arch "${DRAFT_ARCH}" \
+  --num-depths "${NUM_DEPTHS}" \
   --speculative-method "${SPECULATIVE_METHOD}" \
   --num-speculative-tokens "${NUM_DEPTHS}" \
   --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
