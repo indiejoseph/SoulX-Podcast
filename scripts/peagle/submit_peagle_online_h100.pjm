@@ -14,7 +14,8 @@ DATASET_PATH="${DATASET_PATH:-/home/pj24001684/ku40000295/jc/projects/tts202509/
 MODEL_PATH="${MODEL_PATH:-${PROJECT_DIR}/runs/merged}"
 SPECULATORS_ROOT="${SPECULATORS_ROOT:-${PROJECT_DIR}/third_party/speculators}"
 SPECULATORS_VENV="${SPECULATORS_VENV:-${PROJECT_DIR}/.speculators_venv}"
-WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100}"
+TRAJECTORY_SOURCE="${TRAJECTORY_SOURCE:-generated}"  # generated or teacher
+WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/outputs/peagle_soulx_h100_${TRAJECTORY_SOURCE}}"
 SPEC_CONFIG_OUTPUT="${SPEC_CONFIG_OUTPUT:-${PROJECT_DIR}/exports/peagle/speculative_config.json}"
 SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-eagle3}"
 PREPROCESSED_DIR="${WORK_DIR}/preprocessed"
@@ -36,13 +37,31 @@ PREPARE_SEQ_LENGTH="${PREPARE_SEQ_LENGTH:-2048}"
 PREPARE_NUM_PROC="${PREPARE_NUM_PROC:-8}"
 PREPARE_MAP_BATCH_SIZE="${PREPARE_MAP_BATCH_SIZE:-4000}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
+RESUME_GENERATED_PREPARE="${RESUME_GENERATED_PREPARE:-1}"
+GENERATION_CONCURRENCY="${GENERATION_CONCURRENCY:-32}"
+GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-0.6}"
+GENERATION_TOP_K="${GENERATION_TOP_K:-100}"
+GENERATION_TOP_P="${GENERATION_TOP_P:-0.9}"
+GENERATION_REPETITION_PENALTY="${GENERATION_REPETITION_PENALTY:-1.25}"
+GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-6562}"
 SPEECH_VOCAB_SIZE="${SPEECH_VOCAB_SIZE:-6561}"
 MIN_SPEECH_DRAFT_TOKENS="${MIN_SPEECH_DRAFT_TOKENS:-6000}"
 MAX_NON_SPEECH_DRAFT_TOKENS="${MAX_NON_SPEECH_DRAFT_TOKENS:-16}"
 RESET_CHECKPOINTS="${RESET_CHECKPOINTS:-0}"
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS="${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS:-1}"
-PEAGLE_TRAINING_CONTRACT_VERSION="${PEAGLE_TRAINING_CONTRACT_VERSION:-2}"
+if [[ -z "${PEAGLE_TRAINING_CONTRACT_VERSION:-}" ]]; then
+  if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
+    PEAGLE_TRAINING_CONTRACT_VERSION="3-generated"
+  else
+    PEAGLE_TRAINING_CONTRACT_VERSION="2"
+  fi
+fi
+if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
+  EXPECTED_PREPARE_MODE="generated_trajectory"
+else
+  EXPECTED_PREPARE_MODE="fast_map"
+fi
 ALLOW_OVERLARGE_DRAFT_VOCAB="${ALLOW_OVERLARGE_DRAFT_VOCAB:-0}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-6e-4}"
@@ -73,6 +92,7 @@ echo "  PROJECT_DIR=${PROJECT_DIR}"
 echo "  SPECULATORS_ROOT=${SPECULATORS_ROOT}"
 echo "  SPECULATORS_VENV=${SPECULATORS_VENV}"
 echo "  WORK_DIR=${WORK_DIR}"
+echo "  TRAJECTORY_SOURCE=${TRAJECTORY_SOURCE}"
 echo "  NUM_LAYERS=${NUM_LAYERS}"
 echo "  NUM_DEPTHS=${NUM_DEPTHS}"
 echo "  DRAFT_ARCH=${DRAFT_ARCH}"
@@ -82,11 +102,18 @@ echo "  FORCE_PREPARE=${FORCE_PREPARE}"
 echo "  RESET_CHECKPOINTS=${RESET_CHECKPOINTS}"
 echo "  AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}"
 echo "  PEAGLE_TRAINING_CONTRACT_VERSION=${PEAGLE_TRAINING_CONTRACT_VERSION}"
+echo "  EXPECTED_PREPARE_MODE=${EXPECTED_PREPARE_MODE}"
 echo "  WANDB=${WANDB}"
 echo "  LOGGER=${LOGGER}"
 echo "  RUN_NAME=${RUN_NAME}"
 echo "  WANDB_PROJECT=${WANDB_PROJECT}"
 echo "  SPECULATIVE_METHOD=${SPECULATIVE_METHOD}"
+echo "  GENERATION_CONCURRENCY=${GENERATION_CONCURRENCY}"
+
+if [[ "${TRAJECTORY_SOURCE}" != "generated" && "${TRAJECTORY_SOURCE}" != "teacher" ]]; then
+  echo "TRAJECTORY_SOURCE must be 'generated' or 'teacher', got '${TRAJECTORY_SOURCE}'" >&2
+  exit 2
+fi
 
 MAX_SAFE_DRAFT_VOCAB_SIZE=$((SPEECH_VOCAB_SIZE + 1 + MAX_NON_SPEECH_DRAFT_TOKENS))
 if [[ "${ALLOW_OVERLARGE_DRAFT_VOCAB}" != "1" \
@@ -168,6 +195,16 @@ if [[ -n "${MAX_SAMPLES}" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
 fi
 
+GENERATION_MAX_TOKEN_ARGS=()
+if [[ -n "${GENERATION_MAX_TOKENS}" ]]; then
+  GENERATION_MAX_TOKEN_ARGS=(--generation-max-tokens "${GENERATION_MAX_TOKENS}")
+fi
+
+RESUME_GENERATED_ARGS=()
+if [[ "${RESUME_GENERATED_PREPARE}" == "1" || "${RESUME_GENERATED_PREPARE}" == "true" ]]; then
+  RESUME_GENERATED_ARGS=(--resume-generated-prepare)
+fi
+
 SAVE_BEST_ARGS=()
 if [[ "${SAVE_BEST}" == "1" || "${SAVE_BEST}" == "true" ]]; then
   SAVE_BEST_ARGS=(--save-best)
@@ -198,7 +235,8 @@ validate_preprocessed() {
     --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
     --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
     --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
-    --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}"
+    --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+    --expected-prepare-mode "${EXPECTED_PREPARE_MODE}"
 }
 
 validate_checkpoint() {
@@ -213,11 +251,77 @@ validate_checkpoint() {
     --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
     --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
     --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+    --expected-prepare-mode "${EXPECTED_PREPARE_MODE}" \
     --expected-num-depths "${NUM_DEPTHS}" \
     --expected-num-layers "${NUM_LAYERS}" \
     --expected-draft-arch "${DRAFT_ARCH}" \
     "${EXPECTED_TARGET_LAYER_ARGS[@]}" \
     --checkpoint "${WORK_DIR}/checkpoints/checkpoint_best"
+}
+
+prepare_dataset() {
+  echo "Preparing SoulX P-EAGLE dataset (${TRAJECTORY_SOURCE})"
+  if [[ "${FORCE_PREPARE}" != "1" \
+        && -f "${PREPROCESSED_DIR}/token_freq.pt" \
+        && -f "${PREPROCESSED_DIR}/soulx_peagle_prepare_summary.json" ]] \
+        && validate_preprocessed; then
+    echo "Reusing validated P-EAGLE dataset: ${PREPROCESSED_DIR}"
+    return 0
+  fi
+
+  if [[ "${FORCE_PREPARE}" != "1" && -e "${PREPROCESSED_DIR}" ]]; then
+    echo "Existing preprocessed dataset failed validation; rebuilding: ${PREPROCESSED_DIR}"
+  fi
+  PREPARE_OVERWRITE_ARGS=()
+  if [[ "${FORCE_PREPARE}" == "1" || -e "${PREPROCESSED_DIR}" ]]; then
+    PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
+  fi
+
+  if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
+    "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
+      --stage prepare-generated \
+      --dataset-path "${DATASET_PATH}" \
+      --model-path "${MODEL_PATH}" \
+      --work-dir "${WORK_DIR}" \
+      --endpoint "${ENDPOINT}" \
+      --speculators-root "${SPECULATORS_ROOT}" \
+      --speculators-python "${PYTHON_BIN}" \
+      --vllm-python "${PYTHON_BIN}" \
+      --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+      --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
+      --generation-concurrency "${GENERATION_CONCURRENCY}" \
+      --generation-temperature "${GENERATION_TEMPERATURE}" \
+      --generation-top-k "${GENERATION_TOP_K}" \
+      --generation-top-p "${GENERATION_TOP_P}" \
+      --generation-repetition-penalty "${GENERATION_REPETITION_PENALTY}" \
+      --request-timeout "${REQUEST_TIMEOUT}" \
+      --max-retries "${MAX_RETRIES}" \
+      --max-speech-tokens 750 \
+      --seed "${SEED}" \
+      "${MAX_SAMPLE_ARGS[@]}" \
+      "${GENERATION_MAX_TOKEN_ARGS[@]}" \
+      "${RESUME_GENERATED_ARGS[@]}" \
+      "${PREPARE_OVERWRITE_ARGS[@]}"
+  else
+    "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
+      --stage prepare \
+      --dataset-path "${DATASET_PATH}" \
+      --model-path "${MODEL_PATH}" \
+      --work-dir "${WORK_DIR}" \
+      --speculators-root "${SPECULATORS_ROOT}" \
+      --speculators-python "${PYTHON_BIN}" \
+      --vllm-python "${PYTHON_BIN}" \
+      --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+      --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
+      --prepare-num-proc "${PREPARE_NUM_PROC}" \
+      --prepare-map-batch-size "${PREPARE_MAP_BATCH_SIZE}" \
+      --max-speech-tokens 750 \
+      --seed "${SEED}" \
+      "${MAX_SAMPLE_ARGS[@]}" \
+      "${PREPARE_OVERWRITE_ARGS[@]}"
+  fi
+
+  validate_preprocessed
 }
 
 cleanup() {
@@ -278,40 +382,30 @@ if missing:
     raise SystemExit(f"missing required speculators modules: {missing}")
 PY
 
-echo "Preparing SoulX P-EAGLE dataset"
-if [[ "${FORCE_PREPARE}" != "1" \
-      && -f "${PREPROCESSED_DIR}/token_freq.pt" \
-      && -f "${PREPROCESSED_DIR}/soulx_peagle_prepare_summary.json" ]] \
-      && validate_preprocessed; then
-  echo "Reusing validated P-EAGLE dataset: ${PREPROCESSED_DIR}"
-else
-  if [[ "${FORCE_PREPARE}" != "1" && -e "${PREPROCESSED_DIR}" ]]; then
-    echo "Existing preprocessed dataset failed validation; rebuilding: ${PREPROCESSED_DIR}"
-  fi
-  PREPARE_OVERWRITE_ARGS=()
-  if [[ "${FORCE_PREPARE}" == "1" || -e "${PREPROCESSED_DIR}" ]]; then
-    PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
-  fi
-
+if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
+  echo "Starting vLLM hidden-state/generation server; log=${VLLM_LOG}"
   "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
-    --stage prepare \
-    --dataset-path "${DATASET_PATH}" \
+    --stage launch-vllm \
     --model-path "${MODEL_PATH}" \
     --work-dir "${WORK_DIR}" \
     --speculators-root "${SPECULATORS_ROOT}" \
     --speculators-python "${PYTHON_BIN}" \
     --vllm-python "${PYTHON_BIN}" \
     --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
-    --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
-    --prepare-num-proc "${PREPARE_NUM_PROC}" \
-    --prepare-map-batch-size "${PREPARE_MAP_BATCH_SIZE}" \
-    --max-speech-tokens 750 \
-    --seed "${SEED}" \
-    "${MAX_SAMPLE_ARGS[@]}" \
-    "${PREPARE_OVERWRITE_ARGS[@]}"
+    "${TARGET_LAYER_ARGS[@]}" \
+    --vllm-arg=--host --vllm-arg="${HOST}" \
+    --vllm-arg=--port --vllm-arg="${PORT}" \
+    --vllm-arg=--data-parallel-size --vllm-arg=1 \
+    --vllm-arg=--gpu-memory-utilization --vllm-arg="${VLLM_GPU_MEMORY_UTILIZATION}" \
+    --vllm-arg=--max-model-len --vllm-arg="${VLLM_MAX_MODEL_LEN}" \
+    --vllm-arg=--no-enable-chunked-prefill \
+    > "${VLLM_LOG}" 2>&1 &
+  VLLM_PID=$!
 
-  validate_preprocessed
+  wait_for_vllm
 fi
+
+prepare_dataset
 
 if [[ "${RESET_CHECKPOINTS}" == "1" || "${RESET_CHECKPOINTS}" == "true" ]]; then
   echo "RESET_CHECKPOINTS enabled; removing existing P-EAGLE checkpoints and vocab mapping"
@@ -355,28 +449,30 @@ EOF
   fi
 fi
 
-echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
-"${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
-  --stage launch-vllm \
-  --model-path "${MODEL_PATH}" \
-  --work-dir "${WORK_DIR}" \
-  --speculators-root "${SPECULATORS_ROOT}" \
-  --speculators-python "${PYTHON_BIN}" \
-  --vllm-python "${PYTHON_BIN}" \
-  --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
-  "${TARGET_LAYER_ARGS[@]}" \
-  --vllm-arg=--host --vllm-arg="${HOST}" \
-  --vllm-arg=--port --vllm-arg="${PORT}" \
-  --vllm-arg=--data-parallel-size --vllm-arg=1 \
-  --vllm-arg=--gpu-memory-utilization --vllm-arg="${VLLM_GPU_MEMORY_UTILIZATION}" \
-  --vllm-arg=--max-model-len --vllm-arg="${VLLM_MAX_MODEL_LEN}" \
-  --vllm-arg=--no-enable-chunked-prefill \
-  > "${VLLM_LOG}" 2>&1 &
-VLLM_PID=$!
+if [[ "${TRAJECTORY_SOURCE}" != "generated" ]]; then
+  echo "Starting vLLM hidden-state server; log=${VLLM_LOG}"
+  "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
+    --stage launch-vllm \
+    --model-path "${MODEL_PATH}" \
+    --work-dir "${WORK_DIR}" \
+    --speculators-root "${SPECULATORS_ROOT}" \
+    --speculators-python "${PYTHON_BIN}" \
+    --vllm-python "${PYTHON_BIN}" \
+    --speculative-config-output "${SPEC_CONFIG_OUTPUT}" \
+    "${TARGET_LAYER_ARGS[@]}" \
+    --vllm-arg=--host --vllm-arg="${HOST}" \
+    --vllm-arg=--port --vllm-arg="${PORT}" \
+    --vllm-arg=--data-parallel-size --vllm-arg=1 \
+    --vllm-arg=--gpu-memory-utilization --vllm-arg="${VLLM_GPU_MEMORY_UTILIZATION}" \
+    --vllm-arg=--max-model-len --vllm-arg="${VLLM_MAX_MODEL_LEN}" \
+    --vllm-arg=--no-enable-chunked-prefill \
+    > "${VLLM_LOG}" 2>&1 &
+  VLLM_PID=$!
 
-wait_for_vllm
+  wait_for_vllm
+fi
 
-echo "Training P-EAGLE with online teacher hidden-state generation"
+echo "Training P-EAGLE with online hidden-state generation"
 "${PYTHON_BIN}" scripts/peagle/train_soulx_peagle.py \
   --stage train \
   --dataset-path "${DATASET_PATH}" \
@@ -404,6 +500,7 @@ echo "Training P-EAGLE with online teacher hidden-state generation"
   --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
   --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
   --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+  --expected-prepare-mode "${EXPECTED_PREPARE_MODE}" \
   "${TARGET_LAYER_ARGS[@]}" \
   "${LOGGER_ARGS[@]}" \
   "${SAVE_BEST_ARGS[@]}"
@@ -423,12 +520,13 @@ echo "Writing vLLM speculative config"
   --draft-vocab-size "${DRAFT_VOCAB_SIZE}" \
   --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
   --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
-  --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}"
+  --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
+  --expected-prepare-mode "${EXPECTED_PREPARE_MODE}"
 
 echo "Inspecting trained P-EAGLE runtime contract"
 EXPECTED_TARGET_LAYER_ARGS=()
 if [[ -n "${TARGET_LAYER_IDS}" ]]; then
-  EXPECTED_TARGET_LAYER_ARGS=(--expected-target-layer-ids "${TARGET_LAYER_IDS}")
+  EXPECTED_TARGET_LAYER_ARGS=(--expected-target-layer-ids "${TARGET_LAYER_ARRAY[@]}")
 fi
 "${PYTHON_BIN}" scripts/peagle/inspect_peagle_runtime_contract.py \
   --model-path "${MODEL_PATH}" \

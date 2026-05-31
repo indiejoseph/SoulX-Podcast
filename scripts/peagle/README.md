@@ -92,13 +92,41 @@ training: PyTorch samplers can pass `numpy.int64` indices, while Hugging Face
 connector can return a temporary `.safetensors` path before it is visible to
 the training worker.
 
-The implemented offline path is:
+The legacy teacher-forced offline path is:
 
 1. Prepare SoulX `text` / `speech_tokens` / `lang` rows into Speculators Arrow format.
 2. Launch the vLLM hidden-state extraction server for the verifier.
 3. Generate cached hidden states with upstream `data_generation_offline.py`.
 4. Train with upstream `scripts/train.py --speculator-type peagle`.
 5. Write a `VLLM_SPECULATIVE_CONFIG` JSON for this repo.
+
+For SoulX, do not use the teacher-forced path as the main training recipe. It
+produced high validation accuracy on ground-truth speech-token prefixes but low
+runtime acceptance on verifier-generated prefixes. The fixed path first
+regenerates speech-token trajectories with the serving verifier, then trains
+P-EAGLE on those generated prefixes.
+
+With a running vLLM hidden-state server, prepare generated trajectories:
+
+```bash
+python scripts/peagle/train_soulx_peagle.py \
+  --stage prepare-generated \
+  --speculators-root third_party/speculators \
+  --model-path pretrained_models/SoulX-Podcast-1.7B-dialect \
+  --dataset-path data/your_full_dataset \
+  --work-dir outputs/peagle_soulx_generated \
+  --endpoint http://localhost:8000/v1 \
+  --generation-concurrency 32 \
+  --overwrite-preprocessed
+```
+
+`prepare_soulx_generated_dataset.py` sends the text-only SoulX prompt
+(`<|task_podcast|>...<|semantic_token_start|>`) to the verifier, keeps only
+valid generated speech-token trajectories plus `semantic_token_end`, and writes
+the same `input_ids` / `loss_mask` / `seq_len` schema expected by Speculators.
+The default generation sampling parameters mirror production SoulX inference:
+temperature `0.6`, top-k `100`, top-p `0.9`, repetition penalty `1.25`, and
+minimum speech tokens `8`.
 
 On large training nodes, you can skip the separate hidden-state extraction pass
 and let Speculators request teacher hidden states during training:
@@ -120,9 +148,9 @@ from the running vLLM endpoint and then discarded. Use `--on-generate cache`
 for a hybrid first epoch that stores generated states for later reuse.
 
 For the PJM/H100 cluster, `scripts/peagle/submit_peagle_online_h100.pjm`
-prepares the dataset, starts the hidden-state server in the background, waits
-for `/v1/models`, trains with online hidden-state generation, and writes the
-runtime speculative config:
+now defaults to verifier-generated trajectories. It starts the hidden-state
+server first, prepares generated P-EAGLE data against that endpoint, trains with
+online hidden-state generation, and writes the runtime speculative config:
 
 ```bash
 pjsub scripts/peagle/submit_peagle_online_h100.pjm
@@ -142,12 +170,19 @@ settings. Edit the defaults near the top of
 The checked-in H100 defaults are:
 
 ```bash
+TRAJECTORY_SOURCE=generated
+WORK_DIR=outputs/peagle_soulx_h100_generated
 DRAFT_VOCAB_SIZE=6562
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1
 WANDB=1
 LOGGER=wandb
 WANDB_PROJECT=soulx-peagle
 ```
+
+Set `TRAJECTORY_SOURCE=teacher` in the PJM file only for an explicit ablation
+against the old teacher-forced dataset. The generated path records
+`PEAGLE_TRAINING_CONTRACT_VERSION=3-generated`, so old teacher-forced
+checkpoints are not resumed accidentally.
 
 The wrapper maps `WANDB=1` to Speculators' `--logger wandb` option. Set
 `WANDB_MODE=offline` or `WANDB_API_KEY=...` in the PJM file if the compute node
@@ -161,11 +196,14 @@ Use `LOGGER=tensorboard,wandb` in the PJM file if you want multiple Speculators
 logger backends. `WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE=offline`, and
 `WANDB_API_KEY` are read by the `wandb` package from the environment.
 
-The prepare stage uses a batched `datasets.map` path when the input dataset
-already has `speech_tokens`. If `outputs/peagle_soulx_h100/preprocessed`
-already contains `token_freq.pt` and `soulx_peagle_prepare_summary.json`, the
-PJM script reuses it only after validating that the draft vocabulary maps back
-to SoulX speech tokens. Set `FORCE_PREPARE=1` to rebuild.
+The teacher prepare stage uses a batched `datasets.map` path when the input
+dataset already has `speech_tokens`. The generated prepare stage uses vLLM
+completion requests and writes an adjacent `preprocessed.generated_records.jsonl`
+file so interrupted generation can resume with `RESUME_GENERATED_PREPARE=1`.
+If `WORK_DIR/preprocessed` already contains `token_freq.pt` and
+`soulx_peagle_prepare_summary.json`, the PJM script reuses it only after
+validating that the draft vocabulary maps back to SoulX speech tokens. Set
+`FORCE_PREPARE=1` to rebuild.
 
 SoulX has roughly 6561 speech tokens plus `semantic_token_end`, so the H100 PJM
 defaults `DRAFT_VOCAB_SIZE=6562`. Do not use `8192` unless the validator also
@@ -184,16 +222,18 @@ deliberate ablation with `ALLOW_OVERLARGE_DRAFT_VOCAB=1` or
 
 Important detail when inspecting checkpoints: upstream Speculators stores `d2t`
 as an offset tensor. The effective target ID is `draft_index + d2t[draft_index]`,
-not the raw `d2t` value alone.
+not the raw `d2t` value alone. `t2d` is intentionally a boolean verifier-vocab
+coverage mask, not an integer target-to-draft index table.
 
 The wrapper also patches upstream P-EAGLE training to preserve packed-sample
 `position_ids` after COD downsampling. Without that patch, training and
 validation use flattened packed-batch RoPE positions, while vLLM inference uses
 normal per-request positions. Any checkpoint trained before this patch should be
 discarded with `RESET_CHECKPOINTS=1`; the hidden-state cache and preprocessed
-dataset can be reused. The PJM script records
-`PEAGLE_TRAINING_CONTRACT_VERSION=2` in the work directory and automatically
-moves older/no-marker checkpoints aside when
+dataset can be reused for teacher-forced training. The generated-trajectory
+path should use a fresh `WORK_DIR`. The PJM script records
+`PEAGLE_TRAINING_CONTRACT_VERSION=3-generated` for generated data and
+automatically moves older/no-marker checkpoints aside when
 `AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1`.
 
 Validate a prepared dataset or a trained checkpoint manually:

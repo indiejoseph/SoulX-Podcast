@@ -47,7 +47,7 @@ def build_vocab_mapping(
     draft_vocab_size: int,
     target_vocab_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """Match vllm-project/speculators train.vocab_mapping implementation."""
+    """Match upstream Speculators' offset d2t + boolean t2d implementation."""
     sorted_tokens = sorted(token_freq, key=lambda tid: (-token_freq[tid], tid))
     selected_token_ids = sorted_tokens[: min(draft_vocab_size, len(sorted_tokens))]
     if len(selected_token_ids) < draft_vocab_size:
@@ -281,6 +281,7 @@ def main() -> None:
     parser.add_argument("--expected-num-layers", type=int, default=None)
     parser.add_argument("--expected-draft-arch", default="llama")
     parser.add_argument("--expected-target-layer-ids", nargs="+", default=None)
+    parser.add_argument("--expected-prepare-mode", default=None)
     parser.add_argument("--json-output", default=None)
     args = parser.parse_args()
 
@@ -398,6 +399,13 @@ def main() -> None:
     summary = {}
     if summary_path.exists():
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if args.expected_prepare_mode is not None:
+        actual_prepare_mode = summary.get("prepare_mode")
+        if actual_prepare_mode != args.expected_prepare_mode:
+            errors.append(
+                "prepare_summary.prepare_mode: expected "
+                f"{args.expected_prepare_mode!r}, got {actual_prepare_mode!r}"
+            )
 
     report = {
         "preprocessed_dir": str(preprocessed_dir),

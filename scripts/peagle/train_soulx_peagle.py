@@ -125,6 +125,8 @@ def validate_preprocessed(args: argparse.Namespace, *, write_mapping: bool) -> N
             "--mapping-output-dir",
             str(paths["work_dir"] / "vocab_mapping"),
         ]
+    if args.expected_prepare_mode:
+        cmd += ["--expected-prepare-mode", args.expected_prepare_mode]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -160,6 +162,8 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
     target_layer_ids = parse_int_list(args.target_layer_ids)
     if target_layer_ids:
         cmd += ["--expected-target-layer-ids", *target_layer_ids]
+    if args.expected_prepare_mode:
+        cmd += ["--expected-prepare-mode", args.expected_prepare_mode]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -203,6 +207,63 @@ def prepare(args: argparse.Namespace) -> None:
         cmd.append("--legacy-loop")
     if args.overwrite_preprocessed:
         cmd.append("--overwrite")
+    run(cmd, dry_run=args.dry_run)
+
+
+def prepare_generated(args: argparse.Namespace) -> None:
+    paths = common_paths(args)
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "peagle" / "prepare_soulx_generated_dataset.py"),
+        "--dataset-path",
+        args.dataset_path,
+        "--model-path",
+        args.model_path,
+        "--output-dir",
+        str(paths["preprocessed"]),
+        "--endpoint",
+        args.endpoint,
+        "--seq-length",
+        str(args.prepare_seq_length),
+        "--min-speech-tokens",
+        str(args.min_speech_tokens),
+        "--max-speech-tokens",
+        str(args.max_speech_tokens),
+        "--speech-vocab-size",
+        str(args.speech_vocab_size),
+        "--seed",
+        str(args.seed),
+        "--concurrency",
+        str(args.generation_concurrency),
+        "--request-timeout",
+        str(args.request_timeout),
+        "--max-retries",
+        str(args.max_retries),
+        "--temperature",
+        str(args.generation_temperature),
+        "--top-k",
+        str(args.generation_top_k),
+        "--top-p",
+        str(args.generation_top_p),
+        "--repetition-penalty",
+        str(args.generation_repetition_penalty),
+    ]
+    if args.dataset_split:
+        cmd += ["--split", args.dataset_split]
+    if args.max_samples is not None:
+        cmd += ["--max-samples", str(args.max_samples)]
+    if args.generation_max_tokens is not None:
+        cmd += ["--generation-max-tokens", str(args.generation_max_tokens)]
+    if args.shuffle_prepare:
+        cmd.append("--shuffle")
+    if args.skip_dialect_prefix:
+        cmd.append("--skip-dialect-prefix")
+    if args.no_eos_loss:
+        cmd.append("--no-eos-loss")
+    if args.overwrite_preprocessed:
+        cmd.append("--overwrite")
+    if args.resume_generated_prepare:
+        cmd.append("--resume")
     run(cmd, dry_run=args.dry_run)
 
 
@@ -395,6 +456,7 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         choices=[
             "prepare",
+            "prepare-generated",
             "launch-vllm",
             "generate-hidden-states",
             "train",
@@ -428,6 +490,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-speech-tokens", type=int, default=750)
     parser.add_argument("--prepare-map-batch-size", type=int, default=2000)
     parser.add_argument("--prepare-num-proc", type=int, default=1)
+    parser.add_argument("--generation-concurrency", type=int, default=32)
+    parser.add_argument("--generation-temperature", type=float, default=0.6)
+    parser.add_argument("--generation-top-k", type=int, default=100)
+    parser.add_argument("--generation-top-p", type=float, default=0.9)
+    parser.add_argument("--generation-repetition-penalty", type=float, default=1.25)
+    parser.add_argument("--generation-max-tokens", type=int, default=None)
+    parser.add_argument("--resume-generated-prepare", action="store_true")
+    parser.add_argument("--expected-prepare-mode", default=None)
     parser.add_argument("--legacy-prepare-loop", action="store_true")
     parser.add_argument("--shuffle-prepare", action="store_true")
     parser.add_argument("--skip-dialect-prefix", action="store_true")
@@ -534,6 +604,8 @@ def main() -> None:
     args = parse_args()
     if args.stage == "prepare":
         prepare(args)
+    elif args.stage == "prepare-generated":
+        prepare_generated(args)
     elif args.stage == "launch-vllm":
         launch_vllm(args)
     elif args.stage == "generate-hidden-states":
