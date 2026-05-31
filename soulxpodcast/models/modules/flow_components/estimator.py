@@ -435,7 +435,7 @@ class TimestepEmbedding(nn.Module):
         return sample
 
 
-class MeanFlowTimeMixer(nn.Module):
+class MeanFlowTimeMixer(nn.Linear):
     """Fuses a start-time embedding `t` with an end-time embedding `r` into a
     single conditioning vector for the MeanFlow estimator.
 
@@ -445,22 +445,14 @@ class MeanFlowTimeMixer(nn.Module):
     endpoints as conditioning input; this module is the small head that maps
     concat([t_emb, r_emb]) -> single embedding the rest of the UNet expects.
 
-    Architecture (2-layer SiLU MLP) is a guess — Chatterbox's upstream
-    `get_intmeanflow_time_mixer` lives in `utils/intmeanflow.py` which is not
-    publicly indexed. Whoever distils real MeanFlow weights for this trunk
-    must verify this matches, or this module must be retrained from scratch.
+    Layout: bias-free linear projection (2*time_embed_dim -> time_embed_dim).
+    This matches the Chatterbox `s3gen_meanflow.safetensors` checkpoint
+    (single `time_embed_mixer.weight` of shape (D, 2D), no bias), so its
+    distilled weights load strict=True straight into this module.
     """
 
     def __init__(self, time_embed_dim: int):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(2 * time_embed_dim, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        super().__init__(2 * time_embed_dim, time_embed_dim, bias=False)
 
 
 class Upsample1D(nn.Module):

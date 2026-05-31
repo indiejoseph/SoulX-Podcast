@@ -83,6 +83,55 @@ Measured via `PROFILE_FLOW_STAGES=1` on the 6-turn long dialogue (31s audio, 20 
 - Larger chunk size (250–400 tokens): halves flow call count, saves ~2–3s (**20–30%**) — free config change
 - Incremental flow (encoder KV cache + ODE state reuse): targets the 84% share — high value, but **attempted and rejected**: introduced ~2.5 dB extra dynamic range on streaming output vs the bidirectional sync path. See [Flow chunk cache experiment, rejected](#flow-chunk-cache-experiment-rejected).
 
+### MeanFlow flow — direct drop-in from Chatterbox (no distillation needed)
+
+The user-flagged hypothesis turned out correct: Chatterbox's `s3gen_meanflow.safetensors` is **architecturally + bitwise compatible** with our `CausalMaskedDiffWithXvec` flow. No distillation, no retraining — just convert the safetensors into our `flow.pt` format and drop it in.
+
+**Key compatibility:** their `flow.*` subset of the safetensors has 1121 keys all matching ours exactly with zero shape mismatches, plus one extra key `decoder.estimator.time_embed_mixer.weight (1024, 2048)` — the MeanFlow time-embedding fuser, a single bias-free `nn.Linear(2*time_embed_dim, time_embed_dim)`. The earlier port had this module as a 2-layer SiLU MLP (wrong guess); fixing it to match the upstream single-Linear layout makes `strict=True` loading work.
+
+**Flow+HiFT speedup** (measured on a 4-turn Cantonese dialect dialogue, fp16, same speech tokens replayed through each flow):
+
+| Config | Total flow+HiFT | Speedup vs CFM-4 |
+|---|---|---|
+| CFM, steps=4 (previous default) | 1070 ms | 1.00× |
+| **MeanFlow, steps=1** | **374 ms** | **2.86× (-65%)** |
+| MeanFlow, steps=4 | 825 ms | 1.30× (-23%) |
+
+The 2.86× win is much larger than I predicted (was ~10%) because **MeanFlow drops CFG entirely**. CFM's `solve_euler` doubles the batch on every estimator call for classifier-free guidance (uncond + cond). MeanFlow's `basic_euler` does a single forward per step with no doubling — distilled students bake CFG in during training. Net per-flow-call: 4×2=8 estimator forwards under CFM-4, 1 under MeanFlow-1. That's where the wall savings come from, not just the step-count reduction.
+
+**Cross-lingual transfer works.** Chatterbox-Turbo is English-only by their README, yet the converted weights produced intelligible Cantonese on our 4-turn dialect dialogue (user-confirmed listening test). The s3tokenizer is content-agnostic enough that flow weights trained on English speech still map to reasonable Chinese mels — same phonemes, same speaker conditioning interface, same mel scale.
+
+**Quality caveats (real, need follow-up):**
+- MeanFlow output is ~1.5 dB hotter overall than CFM baseline on the same tokens.
+- At FLOW_STEPS=1, turn 0 peaks at 0.99 — near clipping. The other turns peak 0.58-0.70 (sane). Per-turn peak spread is 4.62 dB vs CFM's 2.10 dB.
+- At FLOW_STEPS=4, MeanFlow output matches CFM levels closely (peaks 0.55-0.71, RMS within 0.5 dB) but only delivers 1.30× speedup.
+- Speaker similarity not yet measured against a ground-truth reference — Chatterbox's training data used different speakers and possibly a different CAMPPlus checkpoint. Our `campplus.onnx` produces embeddings that the MeanFlow flow conditions on, but whether the resulting voice matches the prompt speaker tightly needs a SECS / cosine-sim test.
+
+**Recommended config for shipping:**
+- `FLOW_STEPS=4` with MeanFlow weights (1.30× faster, audio matches CFM, no post-processing needed), OR
+- `FLOW_STEPS=1` with a 0.85 peak limiter applied post-vocoder (2.86× faster, audio intelligible, transient peaks tamed). The +1.5 dB overall loudness can be normalised the same way.
+
+Either way, the per-piece streaming loudness artifacts (turn-0 soft-hard, end-of-turn hot flush) **still apply** — they're orchestration-level (chunked finalize=False + flush mismatch), independent of the underlying flow model. Bumping `STREAM_CHUNK_SIZE` 150 → 250 + dropping the turn-0 first piece are still the right separate fixes.
+
+**Files:**
+- [scripts/inference/convert_chatterbox_meanflow.py](scripts/inference/convert_chatterbox_meanflow.py) — extracts `flow.*` keys from the safetensors, strips the `flow.` prefix, saves as `flow.pt`-compatible torch checkpoint. Verifies meanflow marker + cross-checks against existing CFM checkpoint.
+- [scripts/inference/test_meanflow_inference.py](scripts/inference/test_meanflow_inference.py) — end-to-end test on the 4-turn Cantonese dialogue. Asserts auto-detected meanflow=True, reports per-turn peak/RMS.
+- [scripts/inference/meanflow_smoke_test.py](scripts/inference/meanflow_smoke_test.py) — unit-level: module construction, backward-compat CFM load, basic_euler no-CFG batch check.
+
+**To deploy MeanFlow as default:**
+```bash
+# Download Chatterbox MeanFlow weights (one-time)
+huggingface-cli download ResembleAI/chatterbox-turbo s3gen_meanflow.safetensors --local-dir tmp/chatterbox/
+
+# Convert
+python scripts/inference/convert_chatterbox_meanflow.py \
+  --src tmp/chatterbox/s3gen_meanflow.safetensors \
+  --dst <model_dir>/flow.pt \
+  --reference <original-model_dir>/flow.pt  # sanity check
+
+# Restart service — auto-detect kicks in via SoulXPodcastService._load_model
+```
+
 ### AWQ-INT4 quantization — shipped
 
 **Result: -22% long RTF, -15% short RTF, TTFA unchanged.** Same dialogue + seed, vLLM `awq_marlin` kernel, fp16 dtype (auto-detected from `quantization_config.quant_method` in `config.json`).
@@ -254,6 +303,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | Skip tiny first-chunk on turns 2+ | RTF 0.374→0.303 long, 0.486→0.445 short | ✅ yes |
 | Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
 | AWQ-INT4 (`awq_marlin` kernel) | RTF 0.265→0.208 long, 0.405→0.343 short, -50% model VRAM | ✅ yes — new default |
+| MeanFlow flow weights (Chatterbox drop-in) | flow+HiFT 2.86× faster at FLOW_STEPS=1 (1070ms→374ms); 1.30× at FLOW_STEPS=4 | ⚠️ ready, audio quality OK (intelligible cross-lingually); needs peak limiter at steps=1 |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
