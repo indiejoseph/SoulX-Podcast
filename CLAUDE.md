@@ -10,7 +10,7 @@ For full architecture details read `.claude/skills/soulx-model/SKILL.md` and `re
 - Always `conda deactivate` before activating `.venv`.
 - vLLM 0.10.1 binary wheel is ABI-compatible with torch 2.7.1. The Soul-AILab RAS patches (4 Python files from `Soul-AILab/vllm@v0.10.1.1-soulxpodcast`) must be copied over the installed package — these enable RAS sampling inside vLLM.
 
-## Performance baselines (RTX 3090, 24 GB, bf16)
+## Performance baselines (RTX 3090, 24 GB)
 
 ### Direct model calls (no HTTP overhead)
 
@@ -42,11 +42,15 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM | off | on | 8 | 150 | long | 0.86s² | 12.56s | 0.418 | |
 | vLLM | off | on | 4 | 150 | short | 0.65s | 3.27s | 0.486 | |
 | vLLM | off | on | 4 | 150 | long | 0.65s² | 11.83s | 0.374 | before turn-0-only first_chunk fix |
+| vLLM bf16 | off | on | 4 | 150 | short | 0.64s | 2.62s | 0.405 | post both first-chunk + final-partial fixes |
+| vLLM bf16 | off | on | 4 | 150 | long | 0.64s | 8.49s | 0.265 | post both fixes — pre-AWQ best |
+| **vLLM AWQ-INT4** | off | on | 4 | 150 | short | **0.66s** | **2.26s** | **0.343** | `awq_marlin` kernel, dtype=fp16 |
+| **vLLM AWQ-INT4** | off | on | 4 | 150 | long | **0.67s** | **6.53s** | **0.208** | **🏆 current best** |
 
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** vLLM CUDA graphs + FLOW_STEPS=4 + skip-redundant-flow-calls is the dominant configuration. RTF=0.262 on long content (3.8× real-time), RTF=0.391 on short (~6s audio), TTFA=0.64s. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4`.
+**Key finding:** AWQ-INT4 (`awq_marlin` kernel) is the dominant configuration. RTF=0.208 on long content (4.8× real-time), RTF=0.343 on short (~6.5s audio), TTFA=0.66s. Halves model weight GPU memory (3.86 → 1.91 GiB) so KV cache headroom grows from 10.9 → 12.9 GiB. vLLM auto-detects the AWQ marker in `config.json` and switches kernel + dtype; no code change required. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 MODEL_PATH=<awq-checkpoint>`.
 
 ### Inference runtime comparison summary
 
@@ -57,7 +61,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM CUDA graphs, 8 steps | 0.418 | 0.680 | 0.86s | flow+HiFT |
 | vLLM CUDA graphs, 4 steps | 0.374 | 0.486 | 0.65s | flow+HiFT (fixed overhead) |
 | vLLM CUDA graphs, 4 steps + turn-0-only first_chunk | 0.303 | 0.445 | 0.65s | intermediate |
-| **vLLM CUDA graphs, 4 steps + skip final-partial finalize=False** | **0.262** | **0.391** | **0.64s** | **🏆 current best** |
+| vLLM CUDA graphs, 4 steps + skip final-partial finalize=False | 0.265 | 0.405 | 0.64s | flow+HiFT (pre-AWQ bf16 best) |
+| **vLLM AWQ-INT4 + CUDA graphs, 4 steps, both fixes** | **0.208** | **0.343** | **0.66s** | **🏆 flow+HiFT (LLM now nearly free)** |
 
 **Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
@@ -78,6 +83,45 @@ Measured via `PROFILE_FLOW_STAGES=1` on the 6-turn long dialogue (31s audio, 20 
 - Larger chunk size (250–400 tokens): halves flow call count, saves ~2–3s (**20–30%**) — free config change
 - Incremental flow (encoder KV cache + ODE state reuse): targets the 84% share — high value, but **attempted and rejected**: introduced ~2.5 dB extra dynamic range on streaming output vs the bidirectional sync path. See [Flow chunk cache experiment, rejected](#flow-chunk-cache-experiment-rejected).
 
+### AWQ-INT4 quantization — shipped
+
+**Result: -22% long RTF, -15% short RTF, TTFA unchanged.** Same dialogue + seed, vLLM `awq_marlin` kernel, fp16 dtype (auto-detected from `quantization_config.quant_method` in `config.json`).
+
+| Metric | bf16 | AWQ-INT4 | Δ |
+|---|---|---|---|
+| Long RTF (~32s audio) | 0.265 | **0.208** | **-22%** |
+| Short RTF (~6.5s audio) | 0.405 | **0.343** | **-15%** |
+| Wall long | 8.49 s | 6.53 s | -23% |
+| Wall short | 2.62 s | 2.26 s | -14% |
+| TTFA (warm) | 0.64 s | 0.66 s | +0.02s (noise) |
+| Model weight GPU memory | 3.86 GiB | **1.91 GiB** | **-50%** |
+| KV cache headroom | 10.93 GiB | 12.88 GiB | +18% |
+| vLLM engine init (incl. graph capture) | 42.5 s | 29.8 s | -30% |
+
+vLLM logs `awq_marlin.py:117 The model is convertible to awq_marlin during runtime. Using awq_marlin kernel`. No code change beyond the auto-detect block already present in [llm_engine.py](soulxpodcast/engine/llm_engine.py) (commit b0ef599+). Calibration: 256 SoulX-formatted prompts (text + speech tokens) from the local training dataset, q_group_size=128, GEMM version. See [scripts/inference/quantize_awq.py](scripts/inference/quantize_awq.py).
+
+**Audio quality A/B (Cantonese, seed=42, /generate-stream):** per-segment loudness spread is **identical** to bf16:
+
+| Path | segs | rms σ/μ | max/min rms | overall peak |
+|---|---|---|---|---|
+| bf16 Cantonese stream | 7 | 0.23 | 6.2 dB | 0.523 |
+| AWQ  Cantonese stream | 8 | 0.24 | 6.2 dB | **0.990** |
+
+AWQ does NOT regress streaming dynamic range. The peak being ~5.5 dB hotter (0.99 vs 0.52) is the only audible difference — same relative loudness variation rides on a louder signal, which makes the variation feel more pronounced. This is the LLM's logit distribution shifting slightly under int4 rounding so the emitted speech tokens drive the (unchanged) bf16 flow harder. Listening A/B at matched peak is essentially identical.
+
+**Reproducibility note:** the AWQ checkpoint's heavy-file symlinks (`flow.pt`, `hift.pt`, `campplus.onnx`, `flow.cache.pt`, `flow.decoder.estimator.fp32.onnx`) point at the absolute path they were created under (`/notebooks/projects/SoulX-Podcast/pretrained_models/...`). The [docker-compose.bench.yml](docker-compose.bench.yml) overlay bind-mounts the host `pretrained_models/` tree at that absolute path so the symlinks resolve inside the container. Rolling AWQ into `docker-compose.yml` as the default needs the same mount or relative symlinks.
+
+### Residual loudness inconsistency lives in flow/mel space, not LLM
+
+After ripping out the flow chunk cache AND switching to AWQ, the Cantonese streaming output still exhibits ~6 dB per-segment RMS spread. Evidence the cause is **upstream of the LLM, in the flow/mel-spec output:**
+
+1. **Cache removed:** `grep` for `flow_chunk_cache | FLOW_CHUNK_CACHE | chunk_cache | encoder_kv_cache | conv_cache | ode_state` in [soulxpodcast/](soulxpodcast/) + [api/](api/) → 0 matches. Commit 8d80db0 deleted 125 lines from [flow.py](soulxpodcast/models/modules/flow.py), 280 from [estimator.py](soulxpodcast/models/modules/flow_components/estimator.py), 113 from [upsample_encoder.py](soulxpodcast/models/modules/flow_components/upsample_encoder.py).
+2. **bf16 ≡ AWQ on streaming spread** — both produce rms σ/μ ≈ 0.23 across speech segments on the same dialogue+seed (table above). Quantization is not the cause.
+3. **Sync ≠ stream on Cantonese, but sync is worse** — `/generate` (full bidirectional flow) on AWQ Cantonese produces 11.6 dB max/min RMS across 9 segments vs 4.5 dB for `/generate-stream`. The streaming chunk-masked attention path is not amplifying variation; if anything it smooths it.
+4. **Mandarin shows ~2-3 dB spread, Cantonese ~6-12 dB** — variability is dialect/content correlated. Same LLM, same flow, same vocoder.
+
+The variation is therefore in the **mel-spectrogram produced by the CFM flow** (or further upstream in the speech-token sequence's prosodic profile for Cantonese). HiFT is a deterministic CNN — given a stable mel, output peak/RMS is stable. Per-turn loudness normalization (previous attempt aafd827, reverted in d2dd436 because it held the whole turn before emitting → 1s+ TTFA regression) targeted the symptom, not the cause. A streaming-friendly fix would need a short look-ahead (e.g. EBU R128 short-term, ~400ms window) so per-chunk gain can be set without buffering the full turn.
+
 ### Flow chunk cache experiment, rejected
 
 We implemented per-chunk K/V + causal-conv caching across the encoder, U-Net decoder, and per-ODE-step estimator (commits 8aeb00f / 8f78568, reverted by [this rip-out commit]). The standalone flow+HiFT bench showed -50.6% wall on long content. End-to-end gain was only ~6.5% because B3 already overlapped LLM and flow.
@@ -95,9 +139,11 @@ We implemented per-chunk K/V + causal-conv caching across the encoder, U-Net dec
 
 The cached chunked flow produces mels with ~2.5 dB extra dynamic range vs the bidirectional reference. Root cause: the cached path approximates bidirectional self-attention with chunk-causal K/V accumulation, an attention pattern the model was never trained on. The 0.991 cosine similarity smoke test was vs `streaming=True` (chunk-masked) — both diverge from the actual bidirectional reference. **Trade-off: 6.5% end-to-end RTF win for audibly worse audio is not worth it.** Ripped out.
 
-## Key findings — vLLM CUDA graphs dominate; flow+HiFT is the new bottleneck
+## Key findings — AWQ + vLLM CUDA graphs dominate; flow+HiFT is the only remaining bottleneck
 
-**vLLM with CUDA graphs (`VLLM_ENFORCE_EAGER=false`) is the dominant mode.** The LLM runs so fast under CUDA graphs that flow+HiFT is the new bottleneck, same as MTP but 2.2× cheaper to achieve.
+**AWQ-INT4 served under vLLM `awq_marlin` is the dominant mode.** Long-content RTF dropped from 0.265 (bf16) to 0.208 with no audio quality regression. LLM is now a thin slice of total wall; flow+HiFT is the only remaining lever.
+
+0. **AWQ-INT4 quantization is shipped.** -22% long RTF, -15% short RTF, TTFA unchanged. Halves model VRAM (3.86 → 1.91 GiB). vLLM auto-detects the `quantization_config` marker and picks `awq_marlin` + fp16 — no code change. Audio quality A/B on Cantonese (same seed) shows identical per-segment loudness spread to bf16 (rms σ/μ ≈ 0.23). The only audible difference is a hotter overall peak (0.99 vs 0.52); apply post-vocoder gain if matching bf16 levels is important. See [AWQ-INT4 quantization — shipped](#awq-int4-quantization--shipped).
 
 1. **`VLLM_ENFORCE_EAGER=false` is the key unlock.** All prior vLLM tests had `enforce_eager=True` hardcoded in service.py — they tested vLLM eager mode, not CUDA-graph mode. With graphs enabled, vLLM (no MTP) achieves RTF=0.418 vs HF+MTP RTF=0.904. MTP is no longer needed for RTF < 1.
 
@@ -140,24 +186,25 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | RESTRICT_SPEECH_VOCAB | ~1.5% HF-only, backbone dominates | ❌ disabled |
 | Skip tiny first-chunk on turns 2+ | RTF 0.374→0.303 long, 0.486→0.445 short | ✅ yes |
 | Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
+| AWQ-INT4 (`awq_marlin` kernel) | RTF 0.265→0.208 long, 0.405→0.343 short, -50% model VRAM | ✅ yes — new default |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
-**Current best:** RTF=0.262 (long, ~30s audio) / RTF=0.391 (short, ~6s audio), TTFA=0.64s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 STREAM_CHUNK_SIZE=150`.
+**Current best:** RTF=0.208 (long, ~32s audio) / RTF=0.343 (short, ~6.5s audio), TTFA=0.66s. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=4 STREAM_CHUNK_SIZE=150 MODEL_PATH=<awq-checkpoint>`.
 
 ## Implications for PLAN.md phases
 
-- **Phase 0 inference optimization has hit a quality floor.** Flow chunk cache was tried and rejected — the standalone -50.6% flow+HiFT win didn't translate (only 6.5% end-to-end because of B3 overlap) and it introduced +2.5 dB extra dynamic range on streaming output. Further flow-side optimizations are unlikely to yield wall savings without quality regression.
-- **LLM is the next high-value lever.** ~60% of wall is LLM-bound, and ~25% of wall is *exclusive* LLM time (after the overlap with flow). The remaining flow share (32%) is already shadowed by LLM, so cutting it further does not reduce wall.
-- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 3.7× regression on current vLLM RTF 0.262 — net loss even after MTP's ~1.8×. The viable moves are:
-  - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B) — vLLM 0.10 supports this natively, no patch needed; typical 1.5–2× on memory-bandwidth-bound decode.
-  - **INT4 / AWQ quantization** of Qwen3-1.7B served under vLLM — `scripts/inference/quantize_awq.py` already exists; verify the AWQ checkpoint runs under vLLM CUDA graphs.
+- **Phase 0 inference optimization has hit a quality floor.** Flow chunk cache was tried and rejected. AWQ-INT4 is now shipped (-22% long RTF, no quality regression). Further flow-side optimizations are unlikely to yield wall savings without quality regression.
+- **Flow+HiFT is now ~70% of wall** since AWQ collapsed the LLM share. The remaining flow share is dominated by encoder + CFM ODE fixed-overhead per call; halving step count further saves <5%.
+- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 4.3× regression on current AWQ RTF 0.208 — net loss even after MTP's ~1.8×. The viable moves are:
+  - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B) — vLLM 0.10 supports this natively, no patch needed; typical 1.5–2× on memory-bandwidth-bound decode. Stacks on top of AWQ.
+  - **Larger chunks (250–400 tokens):** halves flow call count, saves ~20–30% wall at the cost of higher TTFA. Free config change.
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
   - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
-- **The fastest available lever is larger chunks.** chunk=250–400 tokens halves the flow call count, saving ~20–30% wall time at the cost of higher TTFA. No code change needed — just config.
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
-- **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved.
+- **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
+- **Open quality work: per-turn loudness in mel-spec space.** AWQ ships clean, but the underlying ~6 dB per-segment RMS spread on Cantonese streaming (see [Residual loudness inconsistency lives in flow/mel space, not LLM](#residual-loudness-inconsistency-lives-in-flowmel-space-not-llm)) remains. Streaming-friendly look-ahead-windowed loudness normalization (~400ms EBU R128 short-term) is the recommended next attempt — the per-turn buffer approach (aafd827) is off the table due to the TTFA cost.
 
 ## Critical implementation gotchas
 

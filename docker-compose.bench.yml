@@ -1,0 +1,20 @@
+# Bench overlay: remap external pretrained_models/runs into the container.
+# Used only for one-off benchmarking.
+
+services:
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  tts:
+    volumes:
+      - /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/runs:/app/runs:ro
+      - /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models:/app/pretrained_models:ro
+      - /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models:/home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models:ro
+      # AWQ checkpoint has symlinks pointing at /notebooks/projects/SoulX-Podcast/...
+      # (the path inside the notebooks container where it was quantized). Mount the
+      # same pretrained_models tree at that absolute path so those symlinks resolve.
+      - /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models:/notebooks/projects/SoulX-Podcast/pretrained_models:ro
+      - ./example:/app/example:ro
+      - ./api/outputs:/app/api/outputs
+      - ./api/temp:/app/api/temp
