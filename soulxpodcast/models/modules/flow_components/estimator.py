@@ -435,6 +435,34 @@ class TimestepEmbedding(nn.Module):
         return sample
 
 
+class MeanFlowTimeMixer(nn.Module):
+    """Fuses a start-time embedding `t` with an end-time embedding `r` into a
+    single conditioning vector for the MeanFlow estimator.
+
+    MeanFlow predicts the average velocity field over the interval [t, r] (the
+    integral of the instantaneous velocity, normalised by r - t), rather than
+    the instantaneous velocity at time t. The estimator therefore needs both
+    endpoints as conditioning input; this module is the small head that maps
+    concat([t_emb, r_emb]) -> single embedding the rest of the UNet expects.
+
+    Architecture (2-layer SiLU MLP) is a guess — Chatterbox's upstream
+    `get_intmeanflow_time_mixer` lives in `utils/intmeanflow.py` which is not
+    publicly indexed. Whoever distils real MeanFlow weights for this trunk
+    must verify this matches, or this module must be retrained from scratch.
+    """
+
+    def __init__(self, time_embed_dim: int):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(2 * time_embed_dim, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
 
@@ -789,6 +817,7 @@ class CausalConditionalDecoder(ConditionalDecoder):
         act_fn="gelu",
         static_chunk_size=50,
         num_decoding_left_chunks=-1,
+        meanflow: bool = False,
     ):
         torch.nn.Module.__init__(self)
         channels = tuple(channels)
@@ -801,6 +830,13 @@ class CausalConditionalDecoder(ConditionalDecoder):
             time_embed_dim=time_embed_dim,
             act_fn="silu",
         )
+        # MeanFlow conditions the estimator on the integration interval [t, r]
+        # rather than just t. When enabled, fuse the two time embeddings before
+        # they are routed into the rest of the UNet via `t` (which downstream
+        # blocks already consume). meanflow=False keeps the architecture
+        # bit-identical to the standard CFM decoder.
+        self.meanflow = meanflow
+        self.time_embed_mixer = MeanFlowTimeMixer(time_embed_dim) if meanflow else None
         self.static_chunk_size = static_chunk_size
         self.num_decoding_left_chunks = num_decoding_left_chunks
         self.down_blocks = nn.ModuleList([])
@@ -882,7 +918,7 @@ class CausalConditionalDecoder(ConditionalDecoder):
         self.final_proj = nn.Conv1d(channels[-1], self.out_channels, 1)
         self.initialize_weights()
 
-    def forward(self, x, mask, mu, t, spks=None, cond=None, streaming=False):
+    def forward(self, x, mask, mu, t, spks=None, cond=None, streaming=False, r=None):
         """Forward pass of the UNet1DConditional model.
 
         Args:
@@ -891,6 +927,11 @@ class CausalConditionalDecoder(ConditionalDecoder):
             t (_type_): shape (batch_size)
             spks (_type_, optional): shape: (batch_size, condition_channels). Defaults to None.
             cond (_type_, optional): placeholder for future use. Defaults to None.
+            r: end time for the MeanFlow integration interval (shape (batch_size,)
+                or broadcastable). Required when this decoder was constructed with
+                meanflow=True; ignored otherwise. When meanflow is enabled the
+                time conditioning becomes a learned fusion of (t, r) embeddings
+                so the estimator predicts the average velocity over [t, r].
 
         Raises:
             ValueError: _description_
@@ -901,6 +942,16 @@ class CausalConditionalDecoder(ConditionalDecoder):
         """
         t = self.time_embeddings(t).to(t.dtype)
         t = self.time_mlp(t)
+        if self.meanflow:
+            if r is None:
+                raise ValueError(
+                    "CausalConditionalDecoder was built with meanflow=True but no "
+                    "`r` (interval end time) was passed to forward. Pass r=tensor "
+                    "or rebuild the decoder with meanflow=False."
+                )
+            r_emb = self.time_embeddings(r).to(t.dtype)
+            r_emb = self.time_mlp(r_emb)
+            t = self.time_embed_mixer(torch.cat([t, r_emb], dim=1))
 
         x = pack([x, mu], "b * t")[0]
 

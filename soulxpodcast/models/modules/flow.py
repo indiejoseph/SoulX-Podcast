@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,8 @@ class CfmParams:
 
 
 class CausalConditionalCFM(torch.nn.Module):
-    def __init__(self, in_channels=320, cfm_params=CfmParams(), n_spks=1, spk_emb_dim=80, estimator: torch.nn.Module = None):
+    def __init__(self, in_channels=320, cfm_params=CfmParams(), n_spks=1, spk_emb_dim=80,
+                 estimator: torch.nn.Module = None, meanflow: bool = False):
         super().__init__()
         self.n_feats = in_channels
         self.n_spks = n_spks
@@ -34,11 +36,19 @@ class CausalConditionalCFM(torch.nn.Module):
         self.training_cfg_rate = cfm_params.training_cfg_rate
         self.inference_cfg_rate = cfm_params.inference_cfg_rate
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
-        # Just change the architecture of the estimator here
-        self.estimator = CausalConditionalDecoder() if estimator is None else estimator
+        # MeanFlow distillation produces a 1-step (or few-step) student that
+        # predicts the average velocity over [t, r]. The estimator must be
+        # built with the matching time-embedding fusion path; route the flag
+        # through unless an estimator is supplied externally.
+        self.meanflow = meanflow
+        if estimator is None:
+            self.estimator = CausalConditionalDecoder(meanflow=meanflow)
+        else:
+            self.estimator = estimator
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None,
+                streaming=False, meanflow: Optional[bool] = None):
         """Forward diffusion
 
         Args:
@@ -46,22 +56,64 @@ class CausalConditionalCFM(torch.nn.Module):
                 shape: (batch_size, n_feats, mel_timesteps)
             mask (torch.Tensor): output_mask
                 shape: (batch_size, 1, mel_timesteps)
-            n_timesteps (int): number of diffusion steps
+            n_timesteps (int): number of diffusion steps. With meanflow, set
+                n_timesteps=1 for the 1-step distilled inference path.
             temperature (float, optional): temperature for scaling noise. Defaults to 1.0.
             spks (torch.Tensor, optional): speaker ids. Defaults to None.
                 shape: (batch_size, spk_emb_dim)
             cond: Not used but kept for future purposes
+            meanflow: per-call override of the init-time `self.meanflow` flag.
+                When True (or when the model was built with meanflow=True), the
+                cosine t-scheduler is bypassed and inference uses `basic_euler`
+                (no CFG; distilled meanflow models already bake CFG in during
+                training, per the upstream Chatterbox notes).
 
         Returns:
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
+        if meanflow is None:
+            meanflow = self.meanflow
         z = torch.randn_like(mu).to(mu.device).to(mu.dtype) * temperature
         # fix prompt and overlap part mu and z
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if self.t_scheduler == 'cosine':
+        if (not meanflow) and self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
+        if meanflow:
+            return self.basic_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks,
+                                    cond=cond, streaming=streaming), None
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks,
+                                cond=cond, streaming=streaming), None
+
+    def basic_euler(self, x, t_span, mu, mask, spks, cond, streaming=False):
+        """Single-batch Euler solver for MeanFlow inference.
+
+        Each step calls the estimator once (no CFG batch doubling) with both
+        the current time `t` and the step end-time `r`; the estimator returns
+        the average velocity over [t, r]. For the distilled 1-step path use
+        n_timesteps=1 — t_span becomes [0, 1] and the loop runs once.
+
+        CFG is omitted: per the Chatterbox upstream, MeanFlow students are
+        distilled from a teacher that was already CFG'd, so the guidance is
+        baked into the weights.
+
+        Args mirror solve_euler.
+        """
+        # Iterate consecutive pairs (t_i, t_{i+1}) along t_span.
+        for t, r in zip(t_span[:-1], t_span[1:]):
+            t = t.unsqueeze(0)
+            r = r.unsqueeze(0)
+            dxdt = self.estimator(
+                x, mask,
+                mu, t,
+                spks,
+                cond,
+                streaming,
+                r,
+            )
+            dt = r - t
+            x = x + dt * dxdt
+        return x.float()
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming=False):
         """
@@ -138,6 +190,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         pre_lookahead_len: int = 3,
         encoder: torch.nn.Module = None,
         decoder: torch.nn.Module = None,
+        meanflow: bool = False,
     ):
         super().__init__()
         self.input_size = input_size
@@ -149,7 +202,14 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
         self.encoder = UpsampleConformerEncoder() if encoder is None else encoder
         self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
-        self.decoder = CausalConditionalCFM() if decoder is None else decoder
+        # Same propagation rule as CausalConditionalCFM: if the caller supplies
+        # a pre-built decoder it owns the flag; otherwise build one with the
+        # right meanflow architecture so checkpoint shapes line up.
+        self.meanflow = meanflow
+        if decoder is None:
+            self.decoder = CausalConditionalCFM(meanflow=meanflow)
+        else:
+            self.decoder = decoder
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
 
@@ -162,7 +222,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                 embedding,
                 streaming,
                 finalize,
-                n_timesteps: int = 15):
+                n_timesteps: int = 15,
+                meanflow: Optional[bool] = None):
         if n_timesteps <= 0:
             raise ValueError(f"n_timesteps must be positive, got {n_timesteps}")
 
@@ -196,6 +257,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             spks=embedding,
             cond=conds,
             n_timesteps=n_timesteps,
-            streaming=streaming
+            streaming=streaming,
+            meanflow=meanflow,  # None defers to decoder's init-time flag
         )  # [B, num_mels, T]
         return feat.float(), h_lengths

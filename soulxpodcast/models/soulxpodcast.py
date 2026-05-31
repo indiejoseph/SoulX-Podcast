@@ -58,12 +58,25 @@ class SoulXPodcast(torch.nn.Module):
 
         self.use_tqdm = True
 
-        self.flow = CausalMaskedDiffWithXvec()
+        # Auto-detect MeanFlow weights from the checkpoint: the distilled
+        # student adds a `time_embed_mixer` head that fuses (t, r) embeddings.
+        # If those params are present the model must be constructed with
+        # meanflow=True so the architecture matches; otherwise we keep the
+        # standard CFM decoder for bit-identical baseline behaviour.
+        _flow_ckpt_path = f"{self.config.model}/flow.pt"
+        _flow_state = torch.load(_flow_ckpt_path, map_location="cpu", weights_only=True)
+        _meanflow = any("time_embed_mixer" in k for k in _flow_state.keys())
+        if _meanflow:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+            tqdm.write(f"[{timestamp}] - [INFO] - Detected MeanFlow flow checkpoint; "
+                       f"using basic_euler (no CFG, 1-step capable). Pass FLOW_STEPS=1 "
+                       f"to get the full distilled speedup.")
+        self.flow = CausalMaskedDiffWithXvec(meanflow=_meanflow)
         if self.config.hf_config.fp16_flow:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
             tqdm.write(f"[{timestamp}] - [INFO] - Casting flow to fp16")
             self.flow.half()
-        self.flow.load_state_dict(torch.load(f"{self.config.model}/flow.pt", map_location="cpu", weights_only=True), strict=True)
+        self.flow.load_state_dict(_flow_state, strict=True)
         self.flow.cuda().eval()
 
         self.hift = HiFTGenerator()
