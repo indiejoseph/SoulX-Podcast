@@ -66,11 +66,24 @@ class SoulXPodcast(torch.nn.Module):
         _flow_ckpt_path = f"{self.config.model}/flow.pt"
         _flow_state = torch.load(_flow_ckpt_path, map_location="cpu", weights_only=True)
         _meanflow = any("time_embed_mixer" in k for k in _flow_state.keys())
+        _env_flow_steps = int(os.environ.get("FLOW_STEPS", "0"))
+        _ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
         if _meanflow:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
-            tqdm.write(f"[{timestamp}] - [INFO] - Detected MeanFlow flow checkpoint; "
-                       f"using basic_euler (no CFG, 1-step capable). Pass FLOW_STEPS=1 "
-                       f"to get the full distilled speedup.")
+            tqdm.write(f"[{_ts}] - [INFO] - Detected MeanFlow flow checkpoint; "
+                       f"using basic_euler (no CFG, 1-step capable). "
+                       f"Recommended: FLOW_STEPS=1.")
+            if _env_flow_steps > 2:
+                tqdm.write(f"[{_ts}] - [WARN] - FLOW_STEPS={_env_flow_steps} with MeanFlow "
+                           f"weights wastes compute (each extra step adds a full estimator "
+                           f"forward with no quality gain). Set FLOW_STEPS=1.")
+        else:
+            tqdm.write(f"[{_ts}] - [INFO] - Detected legacy CFM flow checkpoint; "
+                       f"using solve_euler with CFG. Recommended: FLOW_STEPS=4.")
+            if _env_flow_steps in (1, 2):
+                tqdm.write(f"[{_ts}] - [WARN] - FLOW_STEPS={_env_flow_steps} with CFM "
+                           f"weights produces low-quality audio (CFM needs ~4 ODE steps "
+                           f"to converge). Set FLOW_STEPS=4 or upgrade to MeanFlow weights "
+                           f"via scripts/inference/convert_chatterbox_meanflow.py.")
         self.flow = CausalMaskedDiffWithXvec(meanflow=_meanflow)
         if self.config.hf_config.fp16_flow:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]

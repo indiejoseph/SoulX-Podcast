@@ -78,7 +78,10 @@ class APIConfig:
     stream_chunk_size: int = int(os.getenv("STREAM_CHUNK_SIZE", "100"))
     stream_first_chunk_size: int = int(os.getenv("STREAM_FIRST_CHUNK_SIZE", "4"))
     flow_streaming: bool = os.getenv("FLOW_STREAMING", "true").lower() == "true"
-    flow_steps: int = int(os.getenv("FLOW_STEPS", "8"))
+    # Default 1 = MeanFlow distilled 1-step path. If MODEL_PATH still has a
+    # legacy CFM flow.pt (no `time_embed_mixer` keys), set FLOW_STEPS=4 to
+    # recover usable quality — CFM at 1 step produces garbage.
+    flow_steps: int = int(os.getenv("FLOW_STEPS", "1"))
     trt_estimator: bool = os.getenv("TRT_ESTIMATOR", "false").lower() == "true"
     trt_onnx: str = os.getenv("TRT_ONNX", "")
     trt_plan: str = os.getenv("TRT_PLAN", "")

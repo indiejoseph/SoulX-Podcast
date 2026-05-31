@@ -34,7 +34,9 @@ services:
       ENABLE_MTP: "${ENABLE_MTP:-false}"
       MTP_CHECKPOINT: "${MTP_CHECKPOINT:-/app/runs/mtp_h100_v3_kl_refresh_from22000/mtp_step2000.pt}"
       FLOW_STREAMING: "${FLOW_STREAMING:-true}"
-      FLOW_STEPS: "${FLOW_STEPS:-4}"
+      # Default 1 = MeanFlow distilled 1-step path (basic_euler, no CFG).
+      # Set FLOW_STEPS=4 if MODEL_PATH still has a legacy CFM flow.pt.
+      FLOW_STEPS: "${FLOW_STEPS:-1}"
       TORCH_COMPILE: "${TORCH_COMPILE:-false}"
       STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-150}"
       STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"
