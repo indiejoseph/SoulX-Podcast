@@ -422,11 +422,80 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
 | fp8_e5m2 KV cache (Ampere) | wash on warm (XFormers fallback) or -7% (FlashInfer); cold TTFA 28s with FlashInfer | ❌ not on Ampere — fp8 + FA incompatible, no native fp8 hw on sm_86. Plumbed via `VLLM_KV_CACHE_DTYPE` for future Ada/Hopper deploy. |
 | Chunked prefill (`enable_chunked_prefill=True`, default `max_num_batched_tokens=2048`) | RTF 0.169→0.162 long (-4%), TTFA 0.51s→0.49s (-4%), short unchanged | ✅ yes — new default. Multi-turn dialogue lets the scheduler interleave new-turn prefill with previous-turn decode tail. |
-| vLLM V1 engine port | Same model: long RTF 0.162→0.280 (+73%), short 0.261→0.404 (+55%), TTFA 0.49→0.59s | ❌ V1 is throughput-optimized via separate engine process (IPC per step); regresses single-request latency. Stay on V0. |
+| vLLM V1 engine port | Same model: long RTF 0.162→0.280 (+73%), short 0.261→0.404 (+55%), TTFA 0.49→0.59s | ❌ V1 is throughput-optimized via separate engine process (IPC per step); regresses single-request latency. Stay on V0 until P-EAGLE training finishes — V1 then unlocks spec decode which recovers + exceeds the gap. |
+
+**Different optimization axis — production multi-stream serving (concurrent throughput):**
+
+| Optimization | Outcome | Active? |
+|---|---|---|
+| Remove `_generation_lock` from `stream_speech_podcast` | N=4 TTFA 8.5s → 0.89s, N=4 throughput 5.85× → 14.77× realtime | ✅ yes — committed |
+| Cross-request `FlowHiftBatcher` | +10-16% throughput on top of lock removal (N=4: 14.77× → 15.48×; N=8: 19.31× → 22.43×) | ✅ yes — opt-in via `FLOW_HIFT_BATCHING=true` |
+
+These wins are on the **concurrent-stream** axis, not single-request RTF. Both ship and unlock 8 concurrent streams per RTX 3090 at sub-1.5s TTFA. See [Production multi-stream serving (single GPU)](#production-multi-stream-serving-single-gpu).
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
 **Current best:** RTF=**0.162** (long, ~32 s audio, **6.2× real-time**) / RTF=**0.261** (short, ~6.5 s audio) / TTFA=**0.49 s**. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 STREAM_CHUNK_SIZE=150 VLLM_ENABLE_CHUNKED_PREFILL=true MODEL_PATH=<awq+meanflow-checkpoint>`. Auto-detected MeanFlow path: the SoulXPodcastService sniffs `flow.pt` keys at startup; presence of `decoder.estimator.time_embed_mixer.weight` switches the model to MeanFlow inference automatically (no env var, just point MODEL_PATH at a checkpoint converted via `scripts/inference/convert_chatterbox_meanflow.py`).
+
+## Production multi-stream serving (single GPU)
+
+Distinct axis from single-request RTF: how many concurrent `/generate-stream`
+clients can one GPU support while keeping per-client TTFA tight. The
+single-request numbers above don't predict this — the actual production
+bottlenecks turned out to be in the API layer, not the model.
+
+### Concurrent bench: same hardware, same model, varying N
+
+All numbers RTX 3090, AWQ + MeanFlow + chunked prefill + FLOW_STEPS=1, long
+Cantonese dialogue, via [scripts/inference/bench_concurrent.py](scripts/inference/bench_concurrent.py).
+
+| Config | N=1 RTF | N=4 TTFA avg | N=4 throughput | N=8 TTFA max | N=8 throughput |
+|---|---|---|---|---|---|
+| Original (global lock, no batcher) | 0.168 | **8.49 s** | 5.85× realtime | ~36 s | capped |
+| Lock removed, no batcher | 0.168 | 1.03 s | 14.77× | 1.66 s | 19.31× |
+| **Lock removed + FlowHiftBatcher** | **0.166** | **0.89 s** | **15.48× realtime** | **1.47 s** | **22.43× realtime** |
+
+**Headline:** 8 concurrent streams on a single RTX 3090, sub-1.5 s TTFA across all clients, every client still producing audio at sub-realtime (per-stream RTF 0.35 means audio comes out 2.9× faster than playback rate).
+
+### Two production fixes that unlocked this
+
+**1. Per-request global lock — the dominant fix (8.5 s → 0.89 s TTFA at N=4).** The `stream_speech_podcast` body in [api/service.py](api/service.py) was wrapped in `with self._generation_lock:` for the entire request: LLM generation, flow + HiFT, HTTP streaming. Every concurrent client serialised on this lock, meaning vLLM's continuous batching could never see more than one in-flight request. Concurrent bench at N=4 produced a clean staircase TTFA pattern (0.5/5.5/10.5/15.6 s spaced exactly one single-request wall apart) that confirmed full serialisation.
+
+The lock was protecting (a) `self.dataset.update_datasource([dataitem]) + self.dataset[0]` — the only real data race — and (b) `torch.manual_seed` / `np.random.seed` / `random.seed` (process-global, only affects reproducibility). Fix: extract `PodcastDataset.__getitem__` body into a stateless `process_data(self, data)` method, expose `PodcastInferHandler.process_dataitem(dataitem)` as the production entry point, drop the lock. Trade-off: per-request `seed` no longer reproducible across concurrent requests (one wins the seed race). For "max QPS production" this is the correct trade.
+
+Also dropped: `torch.cuda.empty_cache()` calls inside the request — they acquired the CUDA allocator lock and stalled all concurrent CUDA work. vLLM's KV cache manager handles fragmentation correctly without them.
+
+**2. FlowHiftBatcher — adds 10-16% on top of lock removal.** vLLM batches LLM decode across concurrent requests; flow + HiFT did not. Without batching, every active request created its own `torch.cuda.Stream()` and called `model.flow(...)` / `model.hift(...)` inline from its own thread → N concurrent requests = N flow streams contending on the GPU scheduler.
+
+[soulxpodcast/utils/flow_batcher.py](soulxpodcast/utils/flow_batcher.py) implements a single shared worker thread + single dedicated CUDA stream. Producer threads submit chunks and await a Future. Worker uses **opportunistic batching with zero artificial wait**: blocks on `queue.get()` for the first item, then drains the queue with `get_nowait()` for items already piled up. Single-request runs immediately (batch=[1]); multi-request batches whatever accumulated while the worker was busy — no `max_wait_ms` knob.
+
+Pads tokens + prompt_mel to per-batch max length, masks via the existing `_len` tensors. Groups by `(streaming, finalize, flow_steps)` since the flow's forward signature requires these uniform across a batch. Equivalence verified: B=1 through the batcher is bit-exact to the inline call (max_abs=0.0 on the test).
+
+Opt-in via `FLOW_HIFT_BATCHING=true`. Default off preserves the legacy inline path for zero regression risk on existing deployments.
+
+### What's still queued for production hardening
+
+- **`generate_speech_podcast` (the non-streaming `/generate` endpoint)** still has the global lock. Not on the realtime-voice critical path; same fix pattern applies.
+- **Client disconnect cancellation** — when an HTTP client drops mid-stream, the vLLM request and flow loop currently run to completion (wasted GPU). Wire HTTP cancellation → `vllm.abort_request` + flow loop break.
+- **Backpressure / 503 above N_safe** — at very high N, per-stream RTF will eventually exceed 1.0 (audio falls behind playback). Need to define the SLO-safe max-N and return 503 above it instead of degrading everyone.
+- **Per-request structured logs** — TTFA / wall / RTF / token counts / completion status as JSON for operational visibility. No APM stack required.
+- **Health probe with meaning** — `/health` today only confirms model loaded; add a "ready to accept new streams" check that returns 503 when GPU is saturated.
+
+### Production config summary
+
+```bash
+LLM_ENGINE=vllm
+VLLM_ENFORCE_EAGER=false
+VLLM_GPU_MEMORY_UTILIZATION=0.7
+VLLM_ENABLE_CHUNKED_PREFILL=true
+FLOW_STREAMING=true
+FLOW_STEPS=1
+STREAM_CHUNK_SIZE=150
+STREAM_FIRST_CHUNK_SIZE=4
+FLOW_HIFT_BATCHING=true              # new: cross-request flow+HiFT batching
+FLOW_HIFT_BATCH_SIZE=4                # default cap
+MODEL_PATH=<awq+meanflow-checkpoint>  # see scripts/setup_meanflow.sh
+```
 
 ## Implications for PLAN.md phases
 
@@ -438,10 +507,11 @@ All practical vLLM/inference-level speedups have been tried. Summary:
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
   - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
   - **Hardware upgrade to sm_89+ (Ada/Hopper)** unlocks native fp8 KV cache + fp8 GEMM. Plumbing already in place via `VLLM_KV_CACHE_DTYPE`.
-- **vLLM V1 engine port: rejected.** V1 is throughput-optimized via a separate engine process with IPC per `step()` call; for our single-request workload this regresses RTF by ~73% on long content. RAS sampler patches would also need a rewrite as a V1 `LogitsProcessor` plugin (~50 LoC, clean extension point). Revisit only if deployment shifts to concurrent batch serving. Details: see [vLLM V1 engine port — investigated and rejected](#vllm-v1-engine-port--investigated-and-rejected-regresses-73-on-long-content).
+- **vLLM V1 engine port: gated on P-EAGLE acceptance, not rejected.** V1 alone regresses single-request RTF by ~73% on long content. But spec-decode is V1-only in vLLM 0.10.1 (`vllm/spec_decode/` V0 runtime is empty), so V1 is the prerequisite for lever #1. Break-even is ~58% runtime spec-decode acceptance; the P-EAGLE branch is now training with the exposure-bias fix (memory note `peagle-runtime-contract-mismatch`). Flip when acceptance recovers. The production multi-stream lock-removal + flow batcher work here is independent of V0/V1 and stacks cleanly with whichever engine wins. Details: see [vLLM V1 engine port — alone is a regression; only worth it as the gateway to speculative decoding](#vllm-v1-engine-port--alone-is-a-regression-only-worth-it-as-the-gateway-to-speculative-decoding).
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
+- **Production multi-stream serving: shipped.** Removed the per-request global lock and added a cross-request flow+HiFT batcher. Single RTX 3090 now sustains 8 concurrent `/generate-stream` clients at sub-1.5 s TTFA and 22× realtime audio throughput. Independent of the single-request RTF wins; both axes ship. See [Production multi-stream serving (single GPU)](#production-multi-stream-serving-single-gpu).
 - **Open quality work: two streaming-specific loudness artifacts.** AWQ ships clean. Per-piece RMS diagnostic isolates two artifacts: (1) turn-0 soft-hard transition caused by `first_chunk_size=4` emitting a 40 ms near-silent piece; (2) end-of-turn hot flush when the `finalize=True` re-run renders >1 s of trailing audio with a different attention mask than the chunked body. See [Residual loudness inconsistency — two streaming-specific artifacts, both in piece boundaries](#residual-loudness-inconsistency--two-streaming-specific-artifacts-both-in-piece-boundaries) for the full table and fix candidates. Recommended combo: drop/silence the turn-0 first piece (40 ms code change, TTFA-neutral) + bump `STREAM_CHUNK_SIZE` 150 → 250 (env flip, removes the 5 s flush case).
 
 ## Critical implementation gotchas
@@ -465,8 +535,10 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 - `soulxpodcast/utils/parser.py` — `podcast_format_parser` (user dict → internal format).
 - `soulxpodcast/models/modules/flow.py` — `CausalMaskedDiffWithXvec` (encoder + CFM decoder).
 - `soulxpodcast/models/modules/hifigan.py` — `HiFTGenerator` vocoder.
+- `soulxpodcast/utils/flow_batcher.py` — `FlowHiftBatcher`: single shared worker + dedicated CUDA stream batches flow+HiFT across concurrent requests. Opt-in via `FLOW_HIFT_BATCHING=true`. See [Production multi-stream serving (single GPU)](#production-multi-stream-serving-single-gpu).
+- `soulxpodcast/utils/dataloader.py` — `PodcastInferHandler.process_dataitem(d)` is the stateless single-item entry point used by the streaming API; replaced the older `update_datasource + dataset[0]` pattern that required serialising concurrent requests.
 - `api/main.py` — FastAPI app. `/generate` (sync), `/generate-stream` (chunked streaming, accepts `chunk_size`/`first_chunk_size` per-request), `/generate-async` (Redis task queue), `/task/{id}`, `/download/{filename}`.
-- `api/service.py` — `SoulXPodcastService`. `generate_speech_podcast` (one-shot) + `stream_speech_podcast` (streaming generator).
+- `api/service.py` — `SoulXPodcastService`. `generate_speech_podcast` (one-shot, still under `_generation_lock` for the non-streaming path) + `stream_speech_podcast` (streaming generator, **no lock**; thread-safe via `process_dataitem`).
 - `Dockerfile.serve` — production image (`vllm/vllm-openai:v0.10.1` base, RAS-patched vLLM, `python3 run_api.py` entrypoint).
 - `docker-compose.yml` — production stack (tts + redis). GPU reservation via `deploy.resources`.
 - `docker-compose.dev.yml` — local dev overlay: exposes Redis, mounts external model paths, symlink resolution volume, overrides `REDIS_URL`/`MODEL_PATH`/`MTP_CHECKPOINT`.
@@ -484,6 +556,8 @@ All dev scripts live under `scripts/` (organized by topic). Each has a small
     - `multi_turn_bistream_test.py` — full 4-turn Cantonese dialect dialogue with speaker switching.
     - `profile_latency.py` — per-stage latency profiling.
     - `bench_stream.py` — HTTP API streaming benchmark (TTFA/wall/RTF); `--chunk N`, `--first-chunk N`, `--long` flags.
+    - `bench_concurrent.py` — **concurrent-stream** HTTP benchmark; drives N parallel `/generate-stream` clients, reports per-client TTFA/wall/RTF + system audio throughput. The production-relevant test for max QPS on a single GPU.
+    - `test_flow_batcher.py` — equivalence + structural-sanity tests for `FlowHiftBatcher`: B=1 bit-exact vs inline; B=2 shape/finiteness/per-row-distinctness/energy checks.
     - `gen_stream_vs_sync.py` — A/B `/generate` (sync) vs `/generate-stream` on the same dialogue+seed; flags any streaming-path audio regression (used to detect the flow-cache loudness issue).
 - `scripts/lora/` — LoRA sweep, averaging, and tests
     - `lora_sweep.py` — generate audio for every adapter checkpoint via `set_adapter()` (no merge).
