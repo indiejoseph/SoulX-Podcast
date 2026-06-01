@@ -53,7 +53,7 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
 
-**Key finding:** AWQ-INT4 LLM + Chatterbox MeanFlow flow is the dominant configuration. RTF=**0.164** on long content (**6.1× real-time**), RTF=0.261 on short (~6.5 s audio), TTFA=**0.49 s**. Improvement over AWQ + CFM-4 baseline: -21% long RTF, -24% short RTF, -26% TTFA. MeanFlow drops CFG entirely (basic_euler does single forward per step, no batch doubling), which dwarfs the step-count reduction as the source of speedup. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 MODEL_PATH=<awq+meanflow-checkpoint>`.
+**Key finding:** AWQ-INT4 LLM + Chatterbox MeanFlow flow + vLLM chunked prefill is the dominant configuration. RTF=**0.162** on long content (**6.2× real-time**), RTF=0.261 on short (~6.5 s audio), TTFA=**0.49 s**. Improvement over AWQ + CFM-4 baseline: -22% long RTF, -24% short RTF, -27% TTFA. The two stacked wins: MeanFlow drops CFG entirely (basic_euler does single forward per step, no batch doubling), and chunked prefill lets the V0 scheduler interleave a new-turn prefill with the previous turn's decode tail. Default config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 VLLM_ENABLE_CHUNKED_PREFILL=true MODEL_PATH=<awq+meanflow-checkpoint>`.
 
 ### Inference runtime comparison summary
 
@@ -66,7 +66,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM CUDA graphs, 4 steps + turn-0-only first_chunk | 0.303 | 0.445 | 0.65s | intermediate |
 | vLLM CUDA graphs, 4 steps + skip final-partial finalize=False | 0.265 | 0.405 | 0.64s | flow+HiFT (pre-AWQ bf16 best) |
 | vLLM AWQ-INT4 + CUDA graphs, 4 steps, both fixes | 0.208 | 0.343 | 0.66s | flow+HiFT (pre-MeanFlow best) |
-| **vLLM AWQ + MeanFlow (Chatterbox drop-in), 1 step, both fixes** | **0.164** | **0.261** | **0.49s** | **🏆 flow+HiFT collapsed (no CFG)** |
+| vLLM AWQ + MeanFlow (Chatterbox drop-in), 1 step, both fixes | 0.164 | 0.261 | 0.49s | flow+HiFT collapsed (pre-chunked-prefill) |
+| **vLLM AWQ + MeanFlow + chunked prefill, 1 step, both fixes** | **0.162** | **0.261** | **0.49s** | **🏆 LLM-bound, prefill overlaps decode tail** |
 
 **Why FLOW_STEPS=4 gives diminishing returns:** halving steps from 8→4 saved only ~0.10s/call (4%) on warm flow calls. Most of the 2.2s/call is fixed overhead — encoder conditioning, mel feature extraction, HiFT vocoder — not the ODE step count. Further step reduction (2 steps) would give minimal benefit. The next lever is either fewer flow calls (larger chunk, higher TTFA) or flow architecture changes.
 
@@ -97,12 +98,13 @@ The user-flagged hypothesis turned out correct: Chatterbox's `s3gen_meanflow.saf
 
 | Config | Dialogue | TTFA | Wall | RTF |
 |---|---|---|---|---|
-| AWQ + CFM, FLOW_STEPS=4 (previous best) | short ~6.5 s | 0.66 s | 2.26 s | 0.343 |
+| AWQ + CFM, FLOW_STEPS=4 (pre-MeanFlow best) | short ~6.5 s | 0.66 s | 2.26 s | 0.343 |
 | **AWQ + MeanFlow, FLOW_STEPS=1** | short ~6.5 s | **0.49 s** | **1.68 s** | **0.261** |
-| AWQ + CFM, FLOW_STEPS=4 (previous best) | long ~32 s | 0.67 s | 6.53 s | 0.208 |
-| **AWQ + MeanFlow, FLOW_STEPS=1** | long ~32 s | **0.49 s** | **5.36 s** | **0.164** |
+| AWQ + CFM, FLOW_STEPS=4 (pre-MeanFlow best) | long ~32 s | 0.67 s | 6.53 s | 0.208 |
+| AWQ + MeanFlow, FLOW_STEPS=1 (pre-chunked-prefill) | long ~32 s | 0.49 s | 5.36 s | 0.164 |
+| **AWQ + MeanFlow + chunked prefill, FLOW_STEPS=1** | long ~32 s | **0.49 s** | **5.29 s** | **0.162** |
 
-**Improvement:** -24% short RTF, -21% long RTF, -26% TTFA. Long content now runs **6.1× real-time** with sub-500 ms TTFA. All measured via `scripts/inference/bench_stream.py` against the production `/generate-stream` endpoint with the same dialogue and seed used for previous baselines.
+**Improvement:** -24% short RTF, -22% long RTF, -27% TTFA — stacked from MeanFlow (the bulk) and chunked prefill (last 4% on long). Long content now runs **6.2× real-time** with sub-500 ms TTFA. All measured via `scripts/inference/bench_stream.py` against the production `/generate-stream` endpoint with the same dialogue and seed used for previous baselines.
 
 **Flow+HiFT direct timing** (no LLM, same speech tokens replayed through each flow, fp16):
 
@@ -388,7 +390,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 
 - **Phase 0 inference optimization has hit a quality floor.** Flow chunk cache was tried and rejected. AWQ-INT4 is now shipped (-22% long RTF, no quality regression). Further flow-side optimizations are unlikely to yield wall savings without quality regression.
 - **LLM is now ~75-85% of wall** after MeanFlow collapsed the flow share to ~20% (mostly hidden under LLM via B3 dual streams). vLLM-side env knobs are exhausted on Ampere — fp8 KV / FlashInfer benched and rejected (see [vLLM-side LLM optimization — exhausted on Ampere](#vllm-side-llm-optimization--exhausted-on-ampere)).
-- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 5.5× regression on current AWQ+MeanFlow RTF 0.164 — net loss even after MTP's ~1.8×. The viable moves are:
+- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 5.6× regression on current AWQ+MeanFlow+chunked-prefill RTF 0.162 — net loss even after MTP's ~1.8×. The viable moves are:
   - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B). vLLM 0.10 supports it natively; typical 1.5–2× on memory-bandwidth-bound decode. Stacks on top of AWQ+MeanFlow → projected RTF ~0.10-0.13 long. The existing P-EAGLE branch is partially built but stuck on a runtime/train acceptance gap; either fix that or train a fresh tiny draft.
   - **Larger chunks (250–400 tokens):** halves flow call count, saves ~5-10% wall at the cost of higher TTFA. Free config change. Lower-priority now that flow is no longer the bottleneck.
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
