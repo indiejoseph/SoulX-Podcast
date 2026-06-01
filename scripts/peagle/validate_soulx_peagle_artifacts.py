@@ -297,6 +297,7 @@ def main() -> None:
     parser.add_argument("--expected-draft-arch", default="llama")
     parser.add_argument("--expected-target-layer-ids", nargs="+", default=None)
     parser.add_argument("--expected-prepare-mode", default=None)
+    parser.add_argument("--expected-prepare-variant", default=None)
     parser.add_argument("--json-output", default=None)
     args = parser.parse_args()
 
@@ -424,6 +425,13 @@ def main() -> None:
             errors.append(
                 "prepare_summary.prepare_mode: expected "
                 f"{args.expected_prepare_mode!r}, got {actual_prepare_mode!r}"
+            )
+    if args.expected_prepare_variant is not None:
+        actual_prepare_variant = summary.get("prepare_variant")
+        if actual_prepare_variant != args.expected_prepare_variant:
+            errors.append(
+                "prepare_summary.prepare_variant: expected "
+                f"{args.expected_prepare_variant!r}, got {actual_prepare_variant!r}"
             )
 
     report = {

@@ -108,6 +108,22 @@ def apply_dialect_prefix(text: str, lang: str, *, skip_dialect_prefix: bool) -> 
     return text
 
 
+def parse_speech_tokens(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [int(x) for x in value.split()] if value else []
+    return [int(x) for x in value]
+
+
+def count_speech_tokens(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.split()) if value else 0
+    return len(value)
+
+
 def get_openai_client(endpoint: str):
     client = getattr(_thread_local, "client", None)
     if client is not None:
@@ -333,6 +349,12 @@ def build_resume_config(args: argparse.Namespace, *, served_model: str) -> dict[
         "min_speech_tokens": args.min_speech_tokens,
         "max_speech_tokens": args.max_speech_tokens,
         "generation_max_tokens": args.generation_max_tokens,
+        "prefix_reserve_tokens": args.prefix_reserve_tokens,
+        "max_prompt_speech_tokens": args.max_prompt_speech_tokens,
+        "max_prompt_text_chars": args.max_prompt_text_chars,
+        "max_prompt_text_tokens": args.max_prompt_text_tokens,
+        "max_turn_text_chars": args.max_turn_text_chars,
+        "max_turn_text_tokens": args.max_turn_text_tokens,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "top_p": args.top_p,
@@ -481,6 +503,29 @@ def parse_lang_mix(spec: str, available_langs: list[str]) -> dict[str, float]:
     return weights
 
 
+def choose_unblocked_row(
+    candidates: list[int],
+    blocked: set[int],
+    rng: random.Random,
+) -> int | None:
+    """Pick a row not in blocked without scanning large language pools.
+
+    Some zh/en corpora have many single-utterance speakers. Falling back to
+    ``[r for r in candidates if r not in blocked]`` inside every dialogue
+    attempt turns prefix construction into an O(num_dialogues * lang_rows)
+    CPU loop. With only a handful of blocked prompt rows, rejection sampling
+    succeeds almost immediately.
+    """
+    for _ in range(32):
+        row = rng.choice(candidates)
+        if row not in blocked:
+            return row
+    for row in candidates:
+        if row not in blocked:
+            return row
+    return None
+
+
 def build_multispeaker_prefixes(
     *,
     hf_ds,
@@ -511,15 +556,28 @@ def build_multispeaker_prefixes(
 
     speaker_token_ids = resolve_speaker_token_ids(tokenizer, args.num_speakers)
     semantic_token_end_id = special["semantic_token_end"]
+    prefix_budget = args.seq_length - max(args.min_speech_tokens, args.prefix_reserve_tokens)
+    if prefix_budget <= 0:
+        raise ValueError(
+            f"Invalid prefix budget: seq_length={args.seq_length}, "
+            f"prefix_reserve_tokens={args.prefix_reserve_tokens}"
+        )
 
     log.info("Scanning dataset for language + speaker grouping (%d rows)", len(hf_ds))
     rows_lang: list[str] = []
     rows_speaker: list[str | None] = []
+    rows_text: list[str] = []
     by_lang: dict[str, list[int]] = defaultdict(list)
     by_lang_speaker: dict[tuple[str, str], list[int]] = defaultdict(list)
+    prompt_by_lang: dict[str, list[int]] = defaultdict(list)
+    prompt_by_lang_speaker: dict[tuple[str, str], list[int]] = defaultdict(list)
+    prompt_speech_by_row: dict[int, list[int]] = {}
+    prompt_prefilter_reasons: Counter[str] = Counter()
     for i in tqdm(range(len(hf_ds)), desc="Indexing rows"):
         row = hf_ds[i]
         lang = str(row.get("lang", ""))
+        text_value = str(row.get("text", ""))
+        rows_text.append(text_value)
         if not lang:
             rows_lang.append("")
             rows_speaker.append(None)
@@ -530,11 +588,39 @@ def build_multispeaker_prefixes(
         by_lang[lang].append(i)
         if sid:
             by_lang_speaker[(lang, sid)].append(i)
+        speech_value = row.get("speech_tokens")
+        speech_count = count_speech_tokens(speech_value)
+        if speech_count <= 0:
+            prompt_prefilter_reasons["empty_prompt_speech"] += 1
+            continue
+        if speech_count > args.max_prompt_speech_tokens:
+            prompt_prefilter_reasons["prompt_speech_too_long"] += 1
+            continue
+        text_chars = len(text_value)
+        if args.max_prompt_text_chars and text_chars > args.max_prompt_text_chars:
+            prompt_prefilter_reasons["prompt_text_too_long"] += 1
+            continue
+        prompt_speech_by_row[i] = parse_speech_tokens(speech_value)
+        prompt_by_lang[lang].append(i)
+        if sid:
+            prompt_by_lang_speaker[(lang, sid)].append(i)
 
-    available_langs = sorted(lang for lang, idxs in by_lang.items() if len(idxs) >= 3)
+    if prompt_prefilter_reasons:
+        log.info(
+            "Prompt prefilter skipped rows: %s",
+            dict(prompt_prefilter_reasons.most_common()),
+        )
+
+    min_rows_per_lang = args.num_speakers + 1
+    available_langs = sorted(
+        lang
+        for lang, idxs in by_lang.items()
+        if len(idxs) >= min_rows_per_lang and len(prompt_by_lang.get(lang, [])) >= args.num_speakers
+    )
     if not available_langs:
         raise RuntimeError(
-            "No language has >=3 rows; cannot build any multi-speaker dialogue"
+            f"No language has >={min_rows_per_lang} rows; cannot build any "
+            "multi-speaker dialogue"
         )
 
     lang_weights = parse_lang_mix(args.lang_mix, available_langs)
@@ -567,108 +653,182 @@ def build_multispeaker_prefixes(
     rng = random.Random(args.seed)
     prefixes: list[tuple[int, list[int]]] = []
     dialog_idx = 0
-    rejected_prefix_overflow = 0
+    total_rejections: Counter[str] = Counter()
+    prompt_segment_cache: dict[int, list[int] | None] = {}
+    turn_text_cache: dict[int, list[int] | None] = {}
+
+    def get_prompt_segment(row_idx: int) -> list[int] | None:
+        cached = prompt_segment_cache.get(row_idx)
+        if cached is not None or row_idx in prompt_segment_cache:
+            return cached
+        row_speech = prompt_speech_by_row.get(row_idx)
+        if not row_speech:
+            prompt_segment_cache[row_idx] = None
+            return None
+        if len(row_speech) > args.max_prompt_speech_tokens:
+            prompt_segment_cache[row_idx] = None
+            return None
+        row_text = apply_dialect_prefix(
+            rows_text[row_idx],
+            rows_lang[row_idx],
+            skip_dialect_prefix=args.skip_dialect_prefix,
+        )
+        text_ids = tokenizer(row_text, add_special_tokens=False)["input_ids"]
+        if args.max_prompt_text_tokens and len(text_ids) > args.max_prompt_text_tokens:
+            prompt_segment_cache[row_idx] = None
+            return None
+        segment = [special["text_start"]]
+        segment.extend(int(t) for t in text_ids)
+        segment.append(special["text_end"])
+        segment.append(special["semantic_token_start"])
+        segment.extend(int(t) + speech_token_offset for t in row_speech)
+        segment.append(semantic_token_end_id)
+        prompt_segment_cache[row_idx] = segment
+        return segment
+
+    def get_turn_text_ids(row_idx: int) -> list[int] | None:
+        cached = turn_text_cache.get(row_idx)
+        if cached is not None or row_idx in turn_text_cache:
+            return cached
+        turn_text = apply_dialect_prefix(
+            rows_text[row_idx],
+            rows_lang[row_idx],
+            skip_dialect_prefix=args.skip_dialect_prefix,
+        )
+        if args.max_turn_text_chars and len(turn_text) > args.max_turn_text_chars:
+            turn_text_cache[row_idx] = None
+            return None
+        turn_text_ids = tokenizer(turn_text, add_special_tokens=False)["input_ids"]
+        if args.max_turn_text_tokens and len(turn_text_ids) > args.max_turn_text_tokens:
+            turn_text_cache[row_idx] = None
+            return None
+        out = [int(t) for t in turn_text_ids]
+        turn_text_cache[row_idx] = out
+        return out
 
     for lang, quota in quotas.items():
         candidates = by_lang.get(lang, [])
-        if len(candidates) < 3:
-            log.warning("Skipping lang=%s — only %d rows", lang, len(candidates))
+        prompt_candidates = prompt_by_lang.get(lang, [])
+        if len(candidates) < min_rows_per_lang or len(prompt_candidates) < args.num_speakers:
+            log.warning(
+                "Skipping lang=%s — rows=%d prompt_rows=%d need rows>=%d prompt_rows>=%d",
+                lang,
+                len(candidates),
+                len(prompt_candidates),
+                min_rows_per_lang,
+                args.num_speakers,
+            )
             continue
         # Pool keyed by speaker for distinct-speaker pairing
         speaker_pool: dict[str, list[int]] = {
+            sid: rows for (lng, sid), rows in prompt_by_lang_speaker.items() if lng == lang
+        }
+        turn_speaker_pool: dict[str, list[int]] = {
             sid: rows for (lng, sid), rows in by_lang_speaker.items() if lng == lang
         }
         speakers_with_data = sorted(speaker_pool.keys())
 
         produced = 0
         attempts = 0
+        rejections: Counter[str] = Counter()
         attempt_cap = max(quota * 3, 100)
         while produced < quota and attempts < attempt_cap:
             attempts += 1
-            spk0_row: int
-            spk1_row: int
-            turn_spk_idx = rng.randint(0, args.num_speakers - 1) if args.num_speakers == 2 else rng.randint(0, 1)
+            if attempts % 10000 == 0:
+                log.info(
+                    "Lang %s: attempts=%d produced=%d/%d rejects=%s",
+                    lang,
+                    attempts,
+                    produced,
+                    quota,
+                    dict(rejections.most_common(5)),
+                )
+            prompt_rows: list[int]
+            turn_spk_idx = rng.randint(0, args.num_speakers - 1)
 
-            if len(speakers_with_data) >= 2:
-                spk_pair = rng.sample(speakers_with_data, 2)
-                spk0_row = rng.choice(speaker_pool[spk_pair[0]])
-                spk1_row = rng.choice(speaker_pool[spk_pair[1]])
+            if len(speakers_with_data) >= args.num_speakers:
+                spk_ids = rng.sample(speakers_with_data, args.num_speakers)
+                prompt_rows = [rng.choice(speaker_pool[sid]) for sid in spk_ids]
                 # Turn row: prefer a different utterance from the chosen turn speaker
-                turn_speaker_id = spk_pair[turn_spk_idx]
-                turn_pool = [r for r in speaker_pool[turn_speaker_id] if r != (spk0_row if turn_spk_idx == 0 else spk1_row)]
-                if not turn_pool:
+                turn_speaker_id = spk_ids[turn_spk_idx]
+                turn_row = choose_unblocked_row(
+                    turn_speaker_pool.get(turn_speaker_id, []),
+                    {prompt_rows[turn_spk_idx]},
+                    rng,
+                )
+                if turn_row is None:
                     # Speaker has only one utterance — fall back to any other row
-                    turn_pool = [r for r in candidates if r not in (spk0_row, spk1_row)]
-                    if not turn_pool:
+                    prompt_row_set = set(prompt_rows)
+                    fallback_row = choose_unblocked_row(candidates, prompt_row_set, rng)
+                    if fallback_row is None:
+                        rejections["no_turn_row"] += 1
                         continue
-                turn_row = rng.choice(turn_pool)
+                    turn_row = fallback_row
             else:
-                # No speaker info → just pick three distinct rows from the same lang
-                picks = rng.sample(candidates, 3)
-                spk0_row, spk1_row, turn_row = picks[0], picks[1], picks[2]
+                # No speaker info → pick distinct rows from the same language.
+                if len(prompt_candidates) < args.num_speakers or len(candidates) < min_rows_per_lang:
+                    rejections["not_enough_candidates"] += 1
+                    continue
+                prompt_rows = rng.sample(prompt_candidates, args.num_speakers)
+                prompt_row_set = set(prompt_rows)
+                fallback_row = choose_unblocked_row(candidates, prompt_row_set, rng)
+                if fallback_row is None:
+                    rejections["no_turn_row"] += 1
+                    continue
+                turn_row = fallback_row
 
-            spk0_data = hf_ds[spk0_row]
-            spk1_data = hf_ds[spk1_row]
-            turn_data = hf_ds[turn_row]
-
-            speakers_data = [spk0_data, spk1_data]
             prefix: list[int] = [special["task_podcast"]]
 
             ok = True
-            for spk_idx, row_data in enumerate(speakers_data):
-                row_text = apply_dialect_prefix(
-                    str(row_data["text"]),
-                    str(row_data["lang"]),
-                    skip_dialect_prefix=args.skip_dialect_prefix,
-                )
-                text_ids = tokenizer(row_text, add_special_tokens=False)["input_ids"]
-                row_speech = row_data.get("speech_tokens") or []
-                if not row_speech:
+            for spk_idx, row_idx in enumerate(prompt_rows):
+                segment = get_prompt_segment(row_idx)
+                if segment is None:
+                    rejections["invalid_prompt_row"] += 1
                     ok = False
                     break
                 prefix.append(speaker_token_ids[spk_idx])
-                prefix.append(special["text_start"])
-                prefix.extend(int(t) for t in text_ids)
-                prefix.append(special["text_end"])
-                prefix.append(special["semantic_token_start"])
-                prefix.extend(int(t) + speech_token_offset for t in row_speech)
-                prefix.append(semantic_token_end_id)
+                prefix.extend(segment)
             if not ok:
                 continue
 
-            turn_text = apply_dialect_prefix(
-                str(turn_data["text"]),
-                str(turn_data["lang"]),
-                skip_dialect_prefix=args.skip_dialect_prefix,
-            )
-            turn_text_ids = tokenizer(turn_text, add_special_tokens=False)["input_ids"]
+            turn_text_ids = get_turn_text_ids(turn_row)
+            if turn_text_ids is None:
+                rejections["invalid_turn_text"] += 1
+                continue
             prefix.append(speaker_token_ids[turn_spk_idx])
             prefix.append(special["text_start"])
-            prefix.extend(int(t) for t in turn_text_ids)
+            prefix.extend(turn_text_ids)
             prefix.append(special["text_end"])
             prefix.append(special["semantic_token_start"])
 
-            if len(prefix) >= args.seq_length - args.min_speech_tokens:
-                rejected_prefix_overflow += 1
+            if len(prefix) >= prefix_budget:
+                rejections["prefix_overflow"] += 1
                 continue
 
             prefixes.append((dialog_idx, [int(tok) for tok in prefix]))
             dialog_idx += 1
             produced += 1
+            if produced % 10000 == 0:
+                log.info(
+                    "Lang %s: produced %d/%d dialogues (attempts=%d)",
+                    lang,
+                    produced,
+                    quota,
+                    attempts,
+                )
 
         log.info(
-            "Lang %s: produced %d/%d dialogues (attempts=%d)",
+            "Lang %s: produced %d/%d dialogues (attempts=%d rejects=%s)",
             lang,
             produced,
             quota,
             attempts,
+            dict(rejections.most_common(8)),
         )
+        total_rejections.update(rejections)
 
-    if rejected_prefix_overflow:
-        log.warning(
-            "Rejected %d dialogues whose prefix exceeded seq_length - min_speech_tokens",
-            rejected_prefix_overflow,
-        )
+    if total_rejections:
+        log.warning("Rejected multi-speaker prefix attempts: %s", dict(total_rejections.most_common()))
 
     if not prefixes:
         raise RuntimeError("No valid multi-speaker dialogues were produced")
@@ -689,6 +849,50 @@ def main() -> None:
     parser.add_argument("--seq-length", type=int, default=2048)
     parser.add_argument("--min-speech-tokens", type=int, default=8)
     parser.add_argument("--max-speech-tokens", type=int, default=750)
+    parser.add_argument(
+        "--prefix-reserve-tokens",
+        type=int,
+        default=256,
+        help=(
+            "Minimum target-generation room to leave when building multi-speaker "
+            "prefixes. This avoids sending near-full prompts to vLLM only to have "
+            "them fail seq_length after generation."
+        ),
+    )
+    parser.add_argument(
+        "--max-prompt-speech-tokens",
+        type=int,
+        default=320,
+        help=(
+            "Maximum reference speech-token length for each speaker prompt in "
+            "--multi-speaker mode. Long prompt clips make prefix construction slow "
+            "and leave too little room for generated target speech."
+        ),
+    )
+    parser.add_argument(
+        "--max-prompt-text-chars",
+        type=int,
+        default=1024,
+        help="Cheap prefilter for overlong prompt text rows before tokenization; 0 disables.",
+    )
+    parser.add_argument(
+        "--max-prompt-text-tokens",
+        type=int,
+        default=384,
+        help="Maximum tokenized text length for each speaker prompt; 0 disables.",
+    )
+    parser.add_argument(
+        "--max-turn-text-chars",
+        type=int,
+        default=2048,
+        help="Cheap prefilter for overlong target-turn text before tokenization; 0 disables.",
+    )
+    parser.add_argument(
+        "--max-turn-text-tokens",
+        type=int,
+        default=768,
+        help="Maximum tokenized text length for the target turn; 0 disables.",
+    )
     parser.add_argument("--speech-vocab-size", type=int, default=6561)
     parser.add_argument("--generation-max-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -761,7 +965,19 @@ def main() -> None:
     model = resolve_model_id(args.endpoint, args.served_model)
     resume_config = build_resume_config(args, served_model=model)
     if args.resume and records_path.exists():
-        validate_resume_config(records_meta_path, resume_config)
+        try:
+            validate_resume_config(records_meta_path, resume_config)
+        except (FileNotFoundError, ValueError) as exc:
+            if not args.overwrite:
+                raise
+            log.warning(
+                "Discarding incompatible generated-trajectory resume records "
+                "because --overwrite was passed: %s",
+                exc,
+            )
+            records_path.unlink(missing_ok=True)
+            records_meta_path.unlink(missing_ok=True)
+            args.resume = False
     records_meta_path.write_text(
         json.dumps(resume_config, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -889,6 +1105,15 @@ def main() -> None:
         "filtered_samples": len(prefixes) - len(records),
         "filtered_reasons": dict(filtered_reasons),
         "seq_length": args.seq_length,
+        "min_speech_tokens": args.min_speech_tokens,
+        "max_speech_tokens": args.max_speech_tokens,
+        "generation_max_tokens": args.generation_max_tokens,
+        "prefix_reserve_tokens": args.prefix_reserve_tokens,
+        "max_prompt_speech_tokens": args.max_prompt_speech_tokens,
+        "max_prompt_text_chars": args.max_prompt_text_chars,
+        "max_prompt_text_tokens": args.max_prompt_text_tokens,
+        "max_turn_text_chars": args.max_turn_text_chars,
+        "max_turn_text_tokens": args.max_turn_text_tokens,
         "max_seq_len": max_seq_len,
         "avg_seq_len": total_tokens / len(records),
         "avg_loss_tokens": total_loss_tokens / len(records),

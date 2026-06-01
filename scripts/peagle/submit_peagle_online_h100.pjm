@@ -25,7 +25,7 @@ HOST="${HOST:-127.0.0.1}"
 ENDPOINT="${ENDPOINT:-http://${HOST}:${PORT}/v1}"
 
 # Keep vLLM below full-GPU reservation so the trainer can share the H100.
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.55}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 
 # H100-oriented defaults. Lower these first if memory becomes tight.
@@ -44,23 +44,45 @@ GENERATION_TOP_K="${GENERATION_TOP_K:-100}"
 GENERATION_TOP_P="${GENERATION_TOP_P:-0.9}"
 GENERATION_REPETITION_PENALTY="${GENERATION_REPETITION_PENALTY:-1.25}"
 GENERATION_MAX_TOKENS="${GENERATION_MAX_TOKENS:-}"
+MIN_SPEECH_TOKENS="${MIN_SPEECH_TOKENS:-8}"
+MAX_SPEECH_TOKENS="${MAX_SPEECH_TOKENS:-750}"
+PREFIX_RESERVE_TOKENS="${PREFIX_RESERVE_TOKENS:-256}"
+MAX_PROMPT_SPEECH_TOKENS="${MAX_PROMPT_SPEECH_TOKENS:-320}"
+MAX_PROMPT_TEXT_CHARS="${MAX_PROMPT_TEXT_CHARS:-1024}"
+MAX_PROMPT_TEXT_TOKENS="${MAX_PROMPT_TEXT_TOKENS:-384}"
+MAX_TURN_TEXT_CHARS="${MAX_TURN_TEXT_CHARS:-2048}"
+MAX_TURN_TEXT_TOKENS="${MAX_TURN_TEXT_TOKENS:-768}"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-6562}"
 SPEECH_VOCAB_SIZE="${SPEECH_VOCAB_SIZE:-6561}"
 MIN_SPEECH_DRAFT_TOKENS="${MIN_SPEECH_DRAFT_TOKENS:-6000}"
 MAX_NON_SPEECH_DRAFT_TOKENS="${MAX_NON_SPEECH_DRAFT_TOKENS:-16}"
 RESET_CHECKPOINTS="${RESET_CHECKPOINTS:-0}"
 AUTO_RESET_INCOMPATIBLE_CHECKPOINTS="${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS:-1}"
+MULTI_SPEAKER="${MULTI_SPEAKER:-1}"
+NUM_SPEAKERS="${NUM_SPEAKERS:-2}"
+NUM_DIALOGUES="${NUM_DIALOGUES:-}"
+LANG_MIX="${LANG_MIX:-yue:1,zh:1,en:1}"
 if [[ -z "${PEAGLE_TRAINING_CONTRACT_VERSION:-}" ]]; then
   if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
-    PEAGLE_TRAINING_CONTRACT_VERSION="3-generated"
+    if [[ "${MULTI_SPEAKER}" == "1" || "${MULTI_SPEAKER}" == "true" ]]; then
+      PEAGLE_TRAINING_CONTRACT_VERSION="4-generated-multispeaker"
+    else
+      PEAGLE_TRAINING_CONTRACT_VERSION="3-generated"
+    fi
   else
     PEAGLE_TRAINING_CONTRACT_VERSION="2"
   fi
 fi
 if [[ "${TRAJECTORY_SOURCE}" == "generated" ]]; then
   EXPECTED_PREPARE_MODE="generated_trajectory"
+  if [[ "${MULTI_SPEAKER}" == "1" || "${MULTI_SPEAKER}" == "true" ]]; then
+    EXPECTED_PREPARE_VARIANT="multispeaker"
+  else
+    EXPECTED_PREPARE_VARIANT="single_utterance"
+  fi
 else
   EXPECTED_PREPARE_MODE="fast_map"
+  EXPECTED_PREPARE_VARIANT=""
 fi
 ALLOW_OVERLARGE_DRAFT_VOCAB="${ALLOW_OVERLARGE_DRAFT_VOCAB:-0}"
 EPOCHS="${EPOCHS:-5}"
@@ -68,7 +90,7 @@ LR="${LR:-6e-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 SAVE_BEST="${SAVE_BEST:-1}"
-ON_GENERATE="${ON_GENERATE:-cache}"  # cache = generate once and reuse; delete = pure online
+ON_GENERATE="${ON_GENERATE:-delete}"  # cache = generate once and reuse; delete = pure online
 REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
 # PJM on this cluster does not propagate inline shell assignments from
@@ -103,12 +125,25 @@ echo "  RESET_CHECKPOINTS=${RESET_CHECKPOINTS}"
 echo "  AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=${AUTO_RESET_INCOMPATIBLE_CHECKPOINTS}"
 echo "  PEAGLE_TRAINING_CONTRACT_VERSION=${PEAGLE_TRAINING_CONTRACT_VERSION}"
 echo "  EXPECTED_PREPARE_MODE=${EXPECTED_PREPARE_MODE}"
+echo "  EXPECTED_PREPARE_VARIANT=${EXPECTED_PREPARE_VARIANT}"
+echo "  MULTI_SPEAKER=${MULTI_SPEAKER}"
+echo "  NUM_SPEAKERS=${NUM_SPEAKERS}"
+echo "  NUM_DIALOGUES=${NUM_DIALOGUES}"
+echo "  LANG_MIX=${LANG_MIX}"
 echo "  WANDB=${WANDB}"
 echo "  LOGGER=${LOGGER}"
 echo "  RUN_NAME=${RUN_NAME}"
 echo "  WANDB_PROJECT=${WANDB_PROJECT}"
 echo "  SPECULATIVE_METHOD=${SPECULATIVE_METHOD}"
 echo "  GENERATION_CONCURRENCY=${GENERATION_CONCURRENCY}"
+echo "  MIN_SPEECH_TOKENS=${MIN_SPEECH_TOKENS}"
+echo "  MAX_SPEECH_TOKENS=${MAX_SPEECH_TOKENS}"
+echo "  PREFIX_RESERVE_TOKENS=${PREFIX_RESERVE_TOKENS}"
+echo "  MAX_PROMPT_SPEECH_TOKENS=${MAX_PROMPT_SPEECH_TOKENS}"
+echo "  MAX_PROMPT_TEXT_CHARS=${MAX_PROMPT_TEXT_CHARS}"
+echo "  MAX_PROMPT_TEXT_TOKENS=${MAX_PROMPT_TEXT_TOKENS}"
+echo "  MAX_TURN_TEXT_CHARS=${MAX_TURN_TEXT_CHARS}"
+echo "  MAX_TURN_TEXT_TOKENS=${MAX_TURN_TEXT_TOKENS}"
 
 if [[ "${TRAJECTORY_SOURCE}" != "generated" && "${TRAJECTORY_SOURCE}" != "teacher" ]]; then
   echo "TRAJECTORY_SOURCE must be 'generated' or 'teacher', got '${TRAJECTORY_SOURCE}'" >&2
@@ -200,6 +235,23 @@ if [[ -n "${GENERATION_MAX_TOKENS}" ]]; then
   GENERATION_MAX_TOKEN_ARGS=(--generation-max-tokens "${GENERATION_MAX_TOKENS}")
 fi
 
+MULTI_SPEAKER_ARGS=()
+if [[ "${TRAJECTORY_SOURCE}" == "generated" \
+      && ( "${MULTI_SPEAKER}" == "1" || "${MULTI_SPEAKER}" == "true" ) ]]; then
+  MULTI_SPEAKER_ARGS=(--multi-speaker --num-speakers "${NUM_SPEAKERS}")
+  if [[ -n "${NUM_DIALOGUES}" ]]; then
+    MULTI_SPEAKER_ARGS+=(--num-dialogues "${NUM_DIALOGUES}")
+  fi
+  if [[ -n "${LANG_MIX}" ]]; then
+    MULTI_SPEAKER_ARGS+=(--lang-mix "${LANG_MIX}")
+  fi
+fi
+
+EXPECTED_PREPARE_VARIANT_ARGS=()
+if [[ -n "${EXPECTED_PREPARE_VARIANT}" ]]; then
+  EXPECTED_PREPARE_VARIANT_ARGS=(--expected-prepare-variant "${EXPECTED_PREPARE_VARIANT}")
+fi
+
 RESUME_GENERATED_ARGS=()
 if [[ "${RESUME_GENERATED_PREPARE}" == "1" || "${RESUME_GENERATED_PREPARE}" == "true" ]]; then
   RESUME_GENERATED_ARGS=(--resume-generated-prepare)
@@ -236,7 +288,8 @@ validate_preprocessed() {
     --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
     --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
     --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
-    --expected-prepare-mode "${EXPECTED_PREPARE_MODE}"
+    --expected-prepare-mode "${EXPECTED_PREPARE_MODE}" \
+    "${EXPECTED_PREPARE_VARIANT_ARGS[@]}"
 }
 
 validate_checkpoint() {
@@ -256,6 +309,7 @@ validate_checkpoint() {
     --expected-num-layers "${NUM_LAYERS}" \
     --expected-draft-arch "${DRAFT_ARCH}" \
     "${EXPECTED_TARGET_LAYER_ARGS[@]}" \
+    "${EXPECTED_PREPARE_VARIANT_ARGS[@]}" \
     --checkpoint "${WORK_DIR}/checkpoints/checkpoint_best"
 }
 
@@ -274,6 +328,9 @@ prepare_dataset() {
   fi
   PREPARE_OVERWRITE_ARGS=()
   if [[ "${FORCE_PREPARE}" == "1" || -e "${PREPROCESSED_DIR}" ]]; then
+    PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
+  fi
+  if [[ "${TRAJECTORY_SOURCE}" == "generated" && -e "${PREPROCESSED_DIR}.generated_records.jsonl" ]]; then
     PREPARE_OVERWRITE_ARGS=(--overwrite-preprocessed)
   fi
 
@@ -296,10 +353,18 @@ prepare_dataset() {
       --generation-repetition-penalty "${GENERATION_REPETITION_PENALTY}" \
       --request-timeout "${REQUEST_TIMEOUT}" \
       --max-retries "${MAX_RETRIES}" \
-      --max-speech-tokens 750 \
+      --min-speech-tokens "${MIN_SPEECH_TOKENS}" \
+      --max-speech-tokens "${MAX_SPEECH_TOKENS}" \
+      --prefix-reserve-tokens "${PREFIX_RESERVE_TOKENS}" \
+      --max-prompt-speech-tokens "${MAX_PROMPT_SPEECH_TOKENS}" \
+      --max-prompt-text-chars "${MAX_PROMPT_TEXT_CHARS}" \
+      --max-prompt-text-tokens "${MAX_PROMPT_TEXT_TOKENS}" \
+      --max-turn-text-chars "${MAX_TURN_TEXT_CHARS}" \
+      --max-turn-text-tokens "${MAX_TURN_TEXT_TOKENS}" \
       --seed "${SEED}" \
       "${MAX_SAMPLE_ARGS[@]}" \
       "${GENERATION_MAX_TOKEN_ARGS[@]}" \
+      "${MULTI_SPEAKER_ARGS[@]}" \
       "${RESUME_GENERATED_ARGS[@]}" \
       "${PREPARE_OVERWRITE_ARGS[@]}"
   else
@@ -315,7 +380,8 @@ prepare_dataset() {
       --prepare-seq-length "${PREPARE_SEQ_LENGTH}" \
       --prepare-num-proc "${PREPARE_NUM_PROC}" \
       --prepare-map-batch-size "${PREPARE_MAP_BATCH_SIZE}" \
-      --max-speech-tokens 750 \
+      --min-speech-tokens "${MIN_SPEECH_TOKENS}" \
+      --max-speech-tokens "${MAX_SPEECH_TOKENS}" \
       --seed "${SEED}" \
       "${MAX_SAMPLE_ARGS[@]}" \
       "${PREPARE_OVERWRITE_ARGS[@]}"
@@ -501,6 +567,7 @@ echo "Training P-EAGLE with online hidden-state generation"
   --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
   --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
   --expected-prepare-mode "${EXPECTED_PREPARE_MODE}" \
+  "${EXPECTED_PREPARE_VARIANT_ARGS[@]}" \
   "${TARGET_LAYER_ARGS[@]}" \
   "${LOGGER_ARGS[@]}" \
   "${SAVE_BEST_ARGS[@]}"
@@ -522,7 +589,8 @@ echo "Writing vLLM speculative config"
   --speech-vocab-size "${SPEECH_VOCAB_SIZE}" \
   --min-speech-draft-tokens "${MIN_SPEECH_DRAFT_TOKENS}" \
   --max-non-speech-draft-tokens "${MAX_NON_SPEECH_DRAFT_TOKENS}" \
-  --expected-prepare-mode "${EXPECTED_PREPARE_MODE}"
+  --expected-prepare-mode "${EXPECTED_PREPARE_MODE}" \
+  "${EXPECTED_PREPARE_VARIANT_ARGS[@]}"
 
 echo "Inspecting trained P-EAGLE runtime contract"
 EXPECTED_TARGET_LAYER_ARGS=()

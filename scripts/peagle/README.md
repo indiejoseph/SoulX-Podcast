@@ -275,7 +275,8 @@ normal per-request positions. Any checkpoint trained before this patch should be
 discarded with `RESET_CHECKPOINTS=1`; the hidden-state cache and preprocessed
 dataset can be reused for teacher-forced training. The generated-trajectory
 path should use a fresh `WORK_DIR`. The PJM script records
-`PEAGLE_TRAINING_CONTRACT_VERSION=3-generated` for generated data and
+`PEAGLE_TRAINING_CONTRACT_VERSION=4-generated-multispeaker` for the default
+multi-speaker generated data, validates `prepare_variant=multispeaker`, and
 automatically moves older/no-marker checkpoints aside when
 `AUTO_RESET_INCOMPATIBLE_CHECKPOINTS=1`.
 

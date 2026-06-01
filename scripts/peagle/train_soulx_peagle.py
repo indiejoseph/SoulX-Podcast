@@ -127,6 +127,8 @@ def validate_preprocessed(args: argparse.Namespace, *, write_mapping: bool) -> N
         ]
     if args.expected_prepare_mode:
         cmd += ["--expected-prepare-mode", args.expected_prepare_mode]
+    if args.expected_prepare_variant:
+        cmd += ["--expected-prepare-variant", args.expected_prepare_variant]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -164,6 +166,8 @@ def validate_checkpoint(args: argparse.Namespace) -> None:
         cmd += ["--expected-target-layer-ids", *target_layer_ids]
     if args.expected_prepare_mode:
         cmd += ["--expected-prepare-mode", args.expected_prepare_mode]
+    if args.expected_prepare_variant:
+        cmd += ["--expected-prepare-variant", args.expected_prepare_variant]
     run(cmd, dry_run=args.dry_run)
 
 
@@ -229,6 +233,18 @@ def prepare_generated(args: argparse.Namespace) -> None:
         str(args.min_speech_tokens),
         "--max-speech-tokens",
         str(args.max_speech_tokens),
+        "--prefix-reserve-tokens",
+        str(args.prefix_reserve_tokens),
+        "--max-prompt-speech-tokens",
+        str(args.max_prompt_speech_tokens),
+        "--max-prompt-text-chars",
+        str(args.max_prompt_text_chars),
+        "--max-prompt-text-tokens",
+        str(args.max_prompt_text_tokens),
+        "--max-turn-text-chars",
+        str(args.max_turn_text_chars),
+        "--max-turn-text-tokens",
+        str(args.max_turn_text_tokens),
         "--speech-vocab-size",
         str(args.speech_vocab_size),
         "--seed",
@@ -495,6 +511,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-seq-length", type=int, default=2048)
     parser.add_argument("--min-speech-tokens", type=int, default=8)
     parser.add_argument("--max-speech-tokens", type=int, default=750)
+    parser.add_argument("--prefix-reserve-tokens", type=int, default=256)
+    parser.add_argument("--max-prompt-speech-tokens", type=int, default=320)
+    parser.add_argument("--max-prompt-text-chars", type=int, default=1024)
+    parser.add_argument("--max-prompt-text-tokens", type=int, default=384)
+    parser.add_argument("--max-turn-text-chars", type=int, default=2048)
+    parser.add_argument("--max-turn-text-tokens", type=int, default=768)
     parser.add_argument("--prepare-map-batch-size", type=int, default=2000)
     parser.add_argument("--prepare-num-proc", type=int, default=1)
     parser.add_argument("--generation-concurrency", type=int, default=32)
@@ -528,6 +550,7 @@ def parse_args() -> argparse.Namespace:
         help="Language weights for multi-speaker mode, e.g. 'yue:1,zh:1,en:1'.",
     )
     parser.add_argument("--expected-prepare-mode", default=None)
+    parser.add_argument("--expected-prepare-variant", default=None)
     parser.add_argument("--legacy-prepare-loop", action="store_true")
     parser.add_argument("--shuffle-prepare", action="store_true")
     parser.add_argument("--skip-dialect-prefix", action="store_true")

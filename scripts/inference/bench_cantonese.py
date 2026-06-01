@@ -27,20 +27,22 @@ DATA = {
 
 for i in range(3):
     files = [("prompt_audio", open(f, "rb")) for f in AUDIO]
-    t0 = time.perf_counter()
-    ttfa = None
-    total = 0
-    with requests.post(f"{API}/generate-stream", files=files, data=DATA,
-                       headers=HDR, stream=True, timeout=300) as resp:
-        resp.raise_for_status()
-        for chunk in resp.iter_content(chunk_size=None):
-            if chunk:
-                if ttfa is None and total >= 44:
-                    ttfa = time.perf_counter() - t0
-                total += len(chunk)
-    wall = time.perf_counter() - t0
-    for _, f in files:
-        f.close()
+    try:
+        t0 = time.perf_counter()
+        ttfa = None
+        total = 0
+        with requests.post(f"{API}/generate-stream", files=files, data=DATA,
+                           headers=HDR, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=None):
+                if chunk:
+                    if ttfa is None and total + len(chunk) > 44:
+                        ttfa = time.perf_counter() - t0
+                    total += len(chunk)
+        wall = time.perf_counter() - t0
+    finally:
+        for _, f in files:
+            f.close()
     dur = (total - 44) / (24000 * 2)
     rtf = wall / dur if dur > 0 else 0
     print(f"  run {i+1}: TTFA={ttfa:.2f}s wall={wall:.2f}s audio={dur:.1f}s RTF={rtf:.3f}")
