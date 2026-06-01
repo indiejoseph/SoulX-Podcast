@@ -30,6 +30,7 @@ from pathlib import Path
 
 import torch
 import torchaudio
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -62,6 +63,7 @@ PROMPT_MALE = {
 # Focus on yue — that's where the LLM smoke showed clean divergence at
 # position 1 with both versions terminating cleanly.
 CASES: list[dict] = [
+    # ===== Cantonese (yue) — primary use case, 73% of training corpus =====
     {
         "name": "yue_keoi5_correct",
         "lang": "yue",
@@ -86,7 +88,82 @@ CASES: list[dict] = [
         # Maximally different override: 'baai6' is unrelated.
         "ssml":   '我同<phoneme alphabet="jyutping" ph="b aai6">佢</phoneme>一齊去飲茶。',
     },
+
+    # ===== Mandarin (zh) — training format: pure CJK, NO punctuation =====
+    # Target word: 银行 (yin2 hang2 = "bank"). The character 行 has two
+    # readings — hang2 ("row/industry/bank") or xing2 ("walk/action") — so
+    # this is a classic disambiguation case for phoneme override.
+    {
+        "name": "zh_hang2_correct",
+        "lang": "zh",
+        "prompt": PROMPT_FEMALE,
+        "plain":  "我去银行办事",  # NO period — matches training
+        "ssml":   '我去<phoneme alphabet="pinyin" ph="y in2 h ang2">银行</phoneme>办事',
+    },
+    {
+        "name": "zh_hang2_wrong_xing2",
+        "lang": "zh",
+        "prompt": PROMPT_FEMALE,
+        "plain":  "我去银行办事",
+        # Wrong reading: forces 行 to xing2 — should produce different audio.
+        "ssml":   '我去<phoneme alphabet="pinyin" ph="y in2 x ing2">银行</phoneme>办事',
+    },
+
+    # ===== English (en) — training format: ALL CAPS, NO punctuation =====
+    # 200/200 sampled training rows are uppercase + no terminal punct.
+    # The previous "Hello world today." test was an OOD format that the
+    # model had never seen — that's why EOS failed, not the inpaint.
+    {
+        "name": "en_world_correct",
+        "lang": "en",
+        "prompt": PROMPT_MALE,
+        "plain":  "HELLO WORLD TODAY",
+        "ssml":   'HELLO <phoneme alphabet="cmu" ph="W ER L D">WORLD</phoneme> TODAY',
+    },
+    {
+        "name": "en_world_wrong",
+        "lang": "en",
+        "prompt": PROMPT_MALE,
+        "plain":  "HELLO WORLD TODAY",
+        # Maximally different override.
+        "ssml":   'HELLO <phoneme alphabet="cmu" ph="B AA T">WORLD</phoneme> TODAY',
+    },
 ]
+
+
+def trim_trailing_silence(
+    wav: torch.Tensor,
+    sample_rate: int = 24000,
+    silence_db: float = -40.0,
+    min_keep_sec: float = 0.1,
+    pad_tail_sec: float = 0.1,
+) -> torch.Tensor:
+    """Crop trailing low-energy samples from a mono/stereo waveform.
+
+    Used because the LLM can fail to emit ``<|semantic_token_end|>`` and
+    keeps generating silence-like speech tokens until the max_new_tokens
+    cap — the audio is fine, just has a long quiet tail.
+
+    Strategy: find the last sample whose absolute amplitude exceeds the
+    threshold (silence_db dBFS), then keep up to ``pad_tail_sec`` after
+    that. ``min_keep_sec`` is a floor so we don't accidentally over-trim
+    a near-silent intentional ending.
+    """
+    if wav.numel() == 0:
+        return wav
+    abs_wav = wav.abs()
+    if abs_wav.dim() == 2:  # (C, T)
+        env = abs_wav.amax(dim=0)
+    else:
+        env = abs_wav
+    threshold = 10.0 ** (silence_db / 20.0)
+    above = (env > threshold).nonzero(as_tuple=False)
+    if above.numel() == 0:
+        return wav[..., : int(min_keep_sec * sample_rate)]
+    last_loud = int(above[-1].item())
+    end = min(env.numel(), last_loud + int(pad_tail_sec * sample_rate))
+    end = max(end, int(min_keep_sec * sample_rate))
+    return wav[..., :end]
 
 
 def parse_args():
@@ -100,7 +177,11 @@ def parse_args():
         default="outputs/step_0030000/composer.pt",
     )
     p.add_argument("--output_dir", default="outputs/inpaint_audio")
-    p.add_argument("--max_new_tokens", type=int, default=400)
+    p.add_argument("--max_new_tokens", type=int, default=120)
+    p.add_argument("--silence_db", type=float, default=-40.0,
+                   help="dBFS below which we treat samples as silence for trimming")
+    p.add_argument("--no_trim", action="store_true",
+                   help="Skip trailing-silence trim (keep raw HiFT output)")
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_p", type=float, default=0.95)
     p.add_argument("--repetition_penalty", type=float, default=1.1)
@@ -278,7 +359,16 @@ def main():
                 seed=args.seed,
                 fp16_flow=args.fp16_flow,
             )
-            dur_sec = debug["wav_samples"] / 24000.0
+            raw_dur = debug["wav_samples"] / 24000.0
+            if not args.no_trim:
+                wav_2d = wav.squeeze(0) if wav.dim() == 3 else wav  # → (C, T)
+                wav_2d = trim_trailing_silence(
+                    wav_2d, sample_rate=24000, silence_db=args.silence_db
+                )
+                wav = wav_2d
+            dur_sec = wav.shape[-1] / 24000.0
+            debug["trimmed_dur_sec"] = dur_sec
+            debug["raw_dur_sec"] = raw_dur
             out_path = out_dir / f"{name}.wav"
             torchaudio.save(str(out_path), wav.float(), 24000)
             log.info(

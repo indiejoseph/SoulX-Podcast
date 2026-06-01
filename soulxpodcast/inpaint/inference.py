@@ -213,6 +213,11 @@ class InpaintInferenceEngine:
                 "using composer's view."
             )
             full_phone_mask = mask_check
+        # NOTE: composer outputs at norm ~300 vs text_emb ~1.5 — huge by
+        # naive comparison, but the LLM was trained ON those magnitudes
+        # (the composer is paired with the LLM during training). DO NOT
+        # renormalise at inference; that creates a train/infer mismatch
+        # and breaks the cases that worked.
         inputs_embeds = apply_phoneme_inpaint(text_emb, composed, full_phone_mask)
 
         # 5. Generate. EOS = <|semantic_token_end|>; we cap with max_new_tokens.
