@@ -47,7 +47,8 @@ Short dialogue = 3-turn Mandarin (~6s audio). Long dialogue = 6-turn Mandarin (~
 | vLLM AWQ-INT4 | off | on | 4 | 150 | short | 0.66s | 2.26s | 0.343 | `awq_marlin` kernel, dtype=fp16 |
 | vLLM AWQ-INT4 | off | on | 4 | 150 | long | 0.67s | 6.53s | 0.208 | pre-MeanFlow best |
 | **vLLM AWQ + MeanFlow** | off | on | 1 | 150 | short | **0.49s** | **1.68s** | **0.261** | Chatterbox drop-in, no CFG, 1 step |
-| **vLLM AWQ + MeanFlow** | off | on | 1 | 150 | long | **0.49s** | **5.36s** | **0.164** | **🏆 current best** |
+| vLLM AWQ + MeanFlow | off | on | 1 | 150 | long | 0.49s | 5.36s | 0.164 | pre-chunked-prefill |
+| **vLLM AWQ + MeanFlow + chunked prefill** | off | on | 1 | 150 | long | **0.49s** | **5.29s** | **0.162** | **🏆 current best** |
 
 ¹ vLLM `enforce_eager=True`: CUDA graphs disabled, same RTF as HF+MTP.  
 ² Warm runs; first request (cold graph) TTFA ~1.6s.
@@ -194,12 +195,25 @@ Baseline reference (this section, fresh container instance, N=4 warm avg):
 
 3. **AWQ INT4 already extracted the weight-read bandwidth win.** Current ~3.0 ms/token is within ~17% of the theoretical floor (1.91 GiB weights / 936 GB/s mem bandwidth = 2.0 ms minimum). The remaining 17% gap is Python + scheduler + sampling overhead — not addressable by vLLM env flags.
 
+**Chunked prefill — measured, kept (-4% long RTF):**
+
+Benched after the earlier "no win" conclusion when the user pushed back. With `enable_chunked_prefill=True` (vLLM default `max_num_batched_tokens=2048`), N=6 long-content runs (1 cold + 5 warm):
+
+| Config | Long RTF | Long TTFA | Long wall | Notes |
+|---|---|---|---|---|
+| Chunked prefill OFF (V0 default) | 0.169 | 0.51 s | 5.32 s | baseline |
+| **Chunked prefill ON, max_batch=2048 (default)** | **0.162** | **0.49 s** | 5.29 s | **-4% RTF, -4% TTFA** |
+| Chunked prefill ON, max_batch=8192 | 0.171 | 0.50 s | 5.33 s | regression — too few scheduler steps |
+
+The win comes from the scheduler being able to interleave a new-turn prefill with the previous turn's decode tail across the multi-turn dialogue. Single-request, but multi-turn → real overlap potential the V0 scheduler exploits when chunked. Larger `max_num_batched_tokens` removes the chunking benefit (back to baseline) — vLLM docs confirm: *"Smaller values (e.g., 2048) achieve better inter-token latency."* Default is optimal.
+
+**Now shipped** as `VLLM_ENABLE_CHUNKED_PREFILL=true` in `docker-compose.yml` and `.env.serve.example`. Audio quality unchanged (Cantonese sample at [outputs/chunked_prefill_bench/awq_meanflow_chunked_cantonese.wav](outputs/chunked_prefill_bench/awq_meanflow_chunked_cantonese.wav), peak 0.70, finite, intelligible).
+
 **Other knobs that were considered and skipped without measurement:**
 
 | Knob | Why not | Notes |
 |---|---|---|
 | `block_size` (KV cache block size) | Single-request decode; default 16 has negligible indirection overhead | Larger blocks waste memory at sequence ends |
-| `enable_chunked_prefill` | Our prefills are 1000-2000 tokens, not large enough to benefit from chunking | Targets multi-thousand-token prefills |
 | `max_num_seqs` | Affects concurrent throughput, not single-request latency | Already at default |
 | `--num-scheduler-steps` | V0 engine; not available in our V0 path | Would need V1 engine + RAS patch rewrite |
 | FlashInfer attention (with fp16 KV) | V1 backend; our RAS patches target V0 | Switching engine versions is a multi-day port |
@@ -364,10 +378,11 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | AWQ-INT4 (`awq_marlin` kernel) | RTF 0.265→0.208 long, 0.405→0.343 short, -50% model VRAM | ✅ yes — new default |
 | MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
 | fp8_e5m2 KV cache (Ampere) | wash on warm (XFormers fallback) or -7% (FlashInfer); cold TTFA 28s with FlashInfer | ❌ not on Ampere — fp8 + FA incompatible, no native fp8 hw on sm_86. Plumbed via `VLLM_KV_CACHE_DTYPE` for future Ada/Hopper deploy. |
+| Chunked prefill (`enable_chunked_prefill=True`, default `max_num_batched_tokens=2048`) | RTF 0.169→0.162 long (-4%), TTFA 0.51s→0.49s (-4%), short unchanged | ✅ yes — new default. Multi-turn dialogue lets the scheduler interleave new-turn prefill with previous-turn decode tail. |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
-**Current best:** RTF=**0.164** (long, ~32 s audio, **6.1× real-time**) / RTF=**0.261** (short, ~6.5 s audio) / TTFA=**0.49 s**. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 STREAM_CHUNK_SIZE=150 MODEL_PATH=<awq+meanflow-checkpoint>`. Auto-detected MeanFlow path: the SoulXPodcastService sniffs `flow.pt` keys at startup; presence of `decoder.estimator.time_embed_mixer.weight` switches the model to MeanFlow inference automatically (no env var, just point MODEL_PATH at a checkpoint converted via `scripts/inference/convert_chatterbox_meanflow.py`).
+**Current best:** RTF=**0.162** (long, ~32 s audio, **6.2× real-time**) / RTF=**0.261** (short, ~6.5 s audio) / TTFA=**0.49 s**. Config: `LLM_ENGINE=vllm VLLM_ENFORCE_EAGER=false FLOW_STEPS=1 STREAM_CHUNK_SIZE=150 VLLM_ENABLE_CHUNKED_PREFILL=true MODEL_PATH=<awq+meanflow-checkpoint>`. Auto-detected MeanFlow path: the SoulXPodcastService sniffs `flow.pt` keys at startup; presence of `decoder.estimator.time_embed_mixer.weight` switches the model to MeanFlow inference automatically (no env var, just point MODEL_PATH at a checkpoint converted via `scripts/inference/convert_chatterbox_meanflow.py`).
 
 ## Implications for PLAN.md phases
 

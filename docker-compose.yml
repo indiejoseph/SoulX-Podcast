@@ -45,6 +45,13 @@ services:
       # attention-backend override is set via shell/.env only — do not plumb
       # it through compose with a default empty value.
       VLLM_KV_CACHE_DTYPE: "${VLLM_KV_CACHE_DTYPE:-}"
+      # Chunked prefill: -4% RTF on long content (multi-turn dialogue) by
+      # letting the scheduler interleave new-turn prefill with previous-turn
+      # decode tail. Default 2048 max_num_batched_tokens (vLLM default) gave
+      # the best results in our bench; larger values (8192) regressed to
+      # baseline. Leave VLLM_MAX_NUM_BATCHED_TOKENS unset to use the default.
+      VLLM_ENABLE_CHUNKED_PREFILL: "${VLLM_ENABLE_CHUNKED_PREFILL:-true}"
+      VLLM_MAX_NUM_BATCHED_TOKENS: "${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
       TORCH_COMPILE: "${TORCH_COMPILE:-false}"
       STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-150}"
       STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"

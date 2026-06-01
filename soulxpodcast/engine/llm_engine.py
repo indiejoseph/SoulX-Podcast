@@ -136,6 +136,22 @@ class VLLMEngine:
             _kv_dtype = os.environ.get("VLLM_KV_CACHE_DTYPE", "").strip()
             if _kv_dtype:
                 engine_kwargs["kv_cache_dtype"] = _kv_dtype
+            # Optional chunked prefill. vLLM V1 auto-enables this; V0 (our
+            # engine, required for the Soul-AILab RAS patches) defaults to off.
+            # For single-request multi-turn TTS, chunked prefill matters only
+            # if turn N's prefill can overlap with turn N-1's decode tail — our
+            # forward_longform_streaming runs turns sequentially so the overlap
+            # window is small. Expose as opt-in so we can A/B benchmark.
+            #   VLLM_ENABLE_CHUNKED_PREFILL=true|false
+            #   VLLM_MAX_NUM_BATCHED_TOKENS=<int>  (per-step token budget)
+            _chunked = os.environ.get("VLLM_ENABLE_CHUNKED_PREFILL", "").strip().lower()
+            if _chunked in ("true", "1", "yes"):
+                engine_kwargs["enable_chunked_prefill"] = True
+            elif _chunked in ("false", "0", "no"):
+                engine_kwargs["enable_chunked_prefill"] = False
+            _mnbt = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
+            if _mnbt:
+                engine_kwargs["max_num_batched_tokens"] = int(_mnbt)
             # Optional attention backend override; vLLM auto-selects FLASH_ATTN
             # on Ampere with fp16/bf16 and supported head_dim. Override only if
             # you know the auto-pick is wrong for your hardware.
