@@ -24,9 +24,31 @@ from transformers import EosTokenCriteria, RepetitionPenaltyLogitsProcessor
 # Compose passes through `${VLLM_USE_V1:-}` which becomes an empty string when
 # unset, and vLLM's envs.py does `int(os.getenv("VLLM_USE_V1", "1"))` which
 # crashes on empty string.
+# Defensive cleanup: docker-compose `${VAR:-}` passes through unset vars as
+# literal empty strings, and several vLLM envs do `int(os.getenv(...))` with no
+# empty-string guard — `int("")` crashes during ModelConfig validation. Unset
+# any of these that arrived as empty strings so vLLM falls back to its own
+# defaults instead. (Plumbed via docker-compose.bench.yml; production compose
+# avoids the empty-string pattern for these specifically.)
+for _v in (
+    "VLLM_ENABLE_V1_MULTIPROCESSING",
+    "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+    "VLLM_V1_USE_PREFILL_DECODE_ATTENTION",
+    "VLLM_COMPILATION_LEVEL",
+    "VLLM_ATTENTION_BACKEND",
+):
+    if _v in os.environ and os.environ[_v].strip() == "":
+        del os.environ[_v]
+
 _vuse_v1 = os.environ.get("VLLM_USE_V1", "").strip()
 if _vuse_v1 not in ("0", "1"):
     _vuse_v1 = "0"
+# Force V1 if speculative decoding is requested — vLLM 0.10.1 has no V0
+# spec_decode runtime (vllm/spec_decode/ is empty; everything lives at
+# vllm/v1/spec_decode/). Auto-flip so the user only needs one env var.
+_spec_ngram = os.environ.get("VLLM_SPEC_NGRAM", "").strip().lower() in ("true", "1", "yes")
+if _spec_ngram and _vuse_v1 != "1":
+    _vuse_v1 = "1"
 os.environ["VLLM_USE_V1"] = _vuse_v1
 try:
     from vllm import EngineArgs
@@ -180,6 +202,26 @@ class VLLMEngine:
             # you know the auto-pick is wrong for your hardware.
             #   VLLM_ATTENTION_BACKEND=FLASH_ATTN | FLASHINFER | XFORMERS | TRITON_ATTN_VLLM_V1
             # (also natively respected by vllm itself if set in env)
+            # N-gram speculative decoding (V1-only, see module-level VLLM_USE_V1
+            # auto-flip above). Cheap to enable: no draft model, just a string
+            # match over the running output to propose continuations. Promising
+            # for TTS because the speech-token stream has heavy repetition
+            # (sustained vowels, breath/pause tokens) so prompt_lookup_min=2
+            # already has decent hit rate. Tune via:
+            #   VLLM_SPEC_NGRAM=true|false
+            #   VLLM_SPEC_NUM_SPECULATIVE_TOKENS=<int>  (proposal length, default 5)
+            #   VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MAX=<int> (default 4)
+            #   VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MIN=<int> (default 2)
+            if _spec_ngram:
+                _spec_k = int(os.environ.get("VLLM_SPEC_NUM_SPECULATIVE_TOKENS", "5"))
+                _spec_max = int(os.environ.get("VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MAX", "4"))
+                _spec_min = int(os.environ.get("VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MIN", "2"))
+                engine_kwargs["speculative_config"] = {
+                    "method": "ngram",
+                    "num_speculative_tokens": _spec_k,
+                    "prompt_lookup_max": _spec_max,
+                    "prompt_lookup_min": _spec_min,
+                }
             import json as _json
             cfg_path = os.path.join(model, "config.json")
             if os.path.exists(cfg_path):
