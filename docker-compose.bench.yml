@@ -34,3 +34,4 @@ services:
       # Bench-only knobs. Production compose deliberately omits these because
       # vLLM rejects an empty-string VLLM_ATTENTION_BACKEND.
       VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      VLLM_USE_V1: "${VLLM_USE_V1:-}"

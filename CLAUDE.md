@@ -227,6 +227,45 @@ The win comes from the scheduler being able to interleave a new-turn prefill wit
 
 When the deployment GPU moves to Ada/Hopper, `VLLM_KV_CACHE_DTYPE=fp8_e5m2` is expected to deliver a real ~10-20% decode-time speedup with native FA-fp8 — re-run the bench above to confirm.
 
+### vLLM V1 engine port — investigated and rejected (regresses ~73% on long content)
+
+The earlier "vLLM-side exhausted on Ampere" section flagged a V1 engine port as a potential future lever (V1 has newer default optimizations: `-O3` compilation level, native chunked prefill, V1-only attention backends). The port was investigated in detail before committing time to it. **V1 is structurally worse for our single-request TTS workload.**
+
+**V1 architectural compatibility check (good news):**
+
+| Concern | Result |
+|---|---|
+| AWQ Marlin support | ✅ Shared quantization layer; works in V1 |
+| LLMEngine `add_request` signature | ✅ Byte-for-byte identical to V0 |
+| LLMEngine `step()` return type | ✅ Both return `list[RequestOutput]` |
+| `from_engine_args` factory | ✅ Same shape on both engines |
+| Soul-AILab RAS sampler patches | ❌ V0-only (target `vllm/model_executor/sampling_metadata.py` + `layers/sampler.py`); V1 has its own sampler at `vllm/v1/sample/sampler.py` |
+
+The RAS sampler is the only patch site that doesn't auto-transfer, but V1 has a clean plugin extension point: `vllm.v1.sample.logits_processor.interface.LogitsProcessor`. RAS could be ported to a ~50 LoC plugin (`apply(logits)` masks tokens whose count in `last win_size` exceeds `win_size * tau_r`). The behavioral difference vs V0 RAS (probabilistic two-step resample) is the V1 plugin would be deterministic suppression — likely fine for our use case.
+
+**V1 perf bench (RAS silently disabled — V0 RAS patches don't apply in V1 path):**
+
+Same model, same dialogue, same seed, only engine differs:
+
+| Engine | Long RTF | Short RTF | TTFA |
+|---|---|---|---|
+| **V0 (current — RAS active, AWQ + MeanFlow + chunked prefill)** | **0.162** | **0.261** | **0.49 s** |
+| V1 (RAS disabled, default `compilation_level=3`, native chunked prefill) | **0.280 (+73%)** | **0.404 (+55%)** | **0.59 s (+20%)** |
+
+**Why V1 is slower for us:** V1's design is throughput-optimized via a separate `EngineCore` process (`pid=126` in startup logs) communicating with the API process via IPC. The `step()` call pays IPC round-trip cost. For multi-tenant batch serving where many requests amortize IPC across a single decode step, this wins. For single-request inference where each decode step is one token from one request, IPC cost is paid every ~3 ms — overwhelming the gains from `-O3` compilation. V0 keeps the engine in-process; per-step overhead is plain Python function calls.
+
+**V0 vs V1 design priorities** (from the architecture, not docs):
+- V0: low single-request latency, in-process engine, direct Python scheduler calls
+- V1: high concurrent-request throughput, separate engine process, async coordination
+
+Our production workload is **single dialogue, single client** — V0's design priority matches. The investigation file map for anyone revisiting:
+- V0 LLMEngine class: `vllm/engine/llm_engine.py` (what `from vllm import LLMEngine` resolves to)
+- V1 LLMEngine class: `vllm/v1/engine/llm_engine.py`
+- V1 sampler extension point: `vllm/v1/sample/logits_processor/interface.py`
+- Force selection: `os.environ["VLLM_USE_V1"] = "0"` (in our `soulxpodcast/engine/llm_engine.py`)
+
+**Conclusion:** Don't port. V0 stays the right engine for this workload. Revisit only if the deployment shifts to high-concurrency batch serving where multiple TTS requests share a single GPU instance.
+
 ### Next LLM lever: speculative decoding
 
 The only remaining LLM-side lever that doesn't require new hardware is **speculative decoding** with a small draft model (e.g. Qwen3-0.6B). vLLM 0.10 supports it natively via `speculative_config=`. Realistic gain: **1.5-2× LLM throughput → RTF ~0.10-0.13 on long content.** Stacks on AWQ + MeanFlow.
@@ -381,6 +420,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
 | fp8_e5m2 KV cache (Ampere) | wash on warm (XFormers fallback) or -7% (FlashInfer); cold TTFA 28s with FlashInfer | ❌ not on Ampere — fp8 + FA incompatible, no native fp8 hw on sm_86. Plumbed via `VLLM_KV_CACHE_DTYPE` for future Ada/Hopper deploy. |
 | Chunked prefill (`enable_chunked_prefill=True`, default `max_num_batched_tokens=2048`) | RTF 0.169→0.162 long (-4%), TTFA 0.51s→0.49s (-4%), short unchanged | ✅ yes — new default. Multi-turn dialogue lets the scheduler interleave new-turn prefill with previous-turn decode tail. |
+| vLLM V1 engine port | Same model: long RTF 0.162→0.280 (+73%), short 0.261→0.404 (+55%), TTFA 0.49→0.59s | ❌ V1 is throughput-optimized via separate engine process (IPC per step); regresses single-request latency. Stay on V0. |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
@@ -396,6 +436,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
   - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
   - **Hardware upgrade to sm_89+ (Ada/Hopper)** unlocks native fp8 KV cache + fp8 GEMM. Plumbing already in place via `VLLM_KV_CACHE_DTYPE`.
+- **vLLM V1 engine port: rejected.** V1 is throughput-optimized via a separate engine process with IPC per `step()` call; for our single-request workload this regresses RTF by ~73% on long content. RAS sampler patches would also need a rewrite as a V1 `LogitsProcessor` plugin (~50 LoC, clean extension point). Revisit only if deployment shifts to concurrent batch serving. Details: see [vLLM V1 engine port — investigated and rejected](#vllm-v1-engine-port--investigated-and-rejected-regresses-73-on-long-content).
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
