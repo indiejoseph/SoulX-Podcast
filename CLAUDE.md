@@ -227,9 +227,11 @@ The win comes from the scheduler being able to interleave a new-turn prefill wit
 
 When the deployment GPU moves to Ada/Hopper, `VLLM_KV_CACHE_DTYPE=fp8_e5m2` is expected to deliver a real ~10-20% decode-time speedup with native FA-fp8 — re-run the bench above to confirm.
 
-### vLLM V1 engine port — investigated and rejected (regresses ~73% on long content)
+### vLLM V1 engine port — alone is a regression; only worth it as the gateway to speculative decoding
 
-The earlier "vLLM-side exhausted on Ampere" section flagged a V1 engine port as a potential future lever (V1 has newer default optimizations: `-O3` compilation level, native chunked prefill, V1-only attention backends). The port was investigated in detail before committing time to it. **V1 is structurally worse for our single-request TTS workload.**
+The earlier "vLLM-side exhausted on Ampere" section flagged a V1 engine port as a potential future lever (V1 has newer default optimizations: `-O3` compilation level, native chunked prefill, V1-only attention backends). The port was investigated in detail.
+
+**Update (corrected from a previous misframing in this file):** V1 alone regresses RTF by ~73% on long content, BUT **speculative decoding is V1-only in vLLM 0.10.1** — `vllm/spec_decode/` (V0 runtime) is empty in this version; all spec-decode runtime code lives at `vllm/v1/spec_decode/`. V0 still exposes `SpeculativeConfig` in `EngineArgs` but has no worker to execute it. So lever #2 (V1 port) is not a separate optimization — it is the **prerequisite for lever #1 (speculative decoding)**. The decision is whether the spec-decode acceptance rate recovers enough to overcome V1's per-step IPC overhead.
 
 **V1 architectural compatibility check (good news):**
 
