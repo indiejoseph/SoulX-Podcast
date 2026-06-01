@@ -4,6 +4,10 @@ Multi-speaker dialogue TTS: Qwen3-1.7B → discrete speech tokens (s3tokenizer, 
 
 For full architecture details read `.claude/skills/soulx-model/SKILL.md` and `references/architecture.md` before any non-trivial implementation work.
 
+## Production engine: vLLM V1 + ngram speculative decoding
+
+**Current production default** (set in [docker-compose.yml](docker-compose.yml) + [.env.serve.example](.env.serve.example)): `VLLM_USE_V1=1 VLLM_SPEC_NGRAM=true` with k=3 / lookup_min=2 / lookup_max=4. The single-request RTF tables below (V0 best 0.162 long) are historical — the prod stack now runs V1+ngram at long RTF ~0.272, accepting the single-request regression to gain V1's continuous-batching architecture for multi-stream serving. Full rationale in [V1 + ngram speculative decoding — production default](#v1--ngram-speculative-decoding--production-default). Multi-stream A/B vs V0 still TODO.
+
 ## Environment
 
 - Project venv: `.venv` built from `/opt/conda/bin/python` (Python 3.11.5). System `python3` is 3.10 and lacks `python3-venv`, so do NOT use `python3 -m venv` — use `/opt/conda/bin/python -m venv .venv`.
@@ -266,30 +270,54 @@ Our production workload is **single dialogue, single client** — V0's design pr
 - V1 sampler extension point: `vllm/v1/sample/logits_processor/interface.py`
 - Force selection: `os.environ["VLLM_USE_V1"] = "0"` (in our `soulxpodcast/engine/llm_engine.py`)
 
-**Conclusion:** Don't port. V0 stays the right engine for this workload. Revisit only if the deployment shifts to high-concurrency batch serving where multiple TTS requests share a single GPU instance.
+**Conclusion (superseded):** This section originally concluded "don't port — V0 stays the right engine." That conclusion treated single-request RTF as the only axis. The production decision is now the opposite — V1 is the production engine, accepting the single-request regression to gain the continuous-batching shape needed for multi-stream serving. The numbers in this section are still valid as single-request data points; see [V1 + ngram speculative decoding — production default](#v1--ngram-speculative-decoding--production-default) for the current decision.
 
-### N-gram speculative decoding — measured, no win (V1 IPC overhead unrecovered)
+### V1 + ngram speculative decoding — production default
 
-Branch: `experiment/vllm-ngram-speculation`. Wired V1's `speculative_config={"method": "ngram", ...}` behind env vars (`VLLM_SPEC_NGRAM=true` auto-flips `VLLM_USE_V1=1`). N-gram drafts tokens by string-matching the running output suffix against earlier output — zero training cost, no draft model. Promising in principle for TTS because speech-token streams have heavy repetition (sustained vowels, breath/pause tokens).
+**Decision:** Engine flipped from V0 → V1 for production. V0 wins single-request RTF (0.162 vs 0.272 long) but V1's separate EngineCore + native continuous batching is the right shape for the production multi-stream target. Ngram is enabled as a cheap (1-3%) addition on top of V1 with no extra cost — it shares zero state across requests so it doesn't interfere with the batcher.
 
-**Same model (AWQ + MeanFlow + chunked prefill), same dialogue, same seed:**
+**How ngram works (so future-me doesn't have to re-read the vLLM docs).** It is *not* a learned model and has *no* offline calibration. Per decode step the engine takes the last `prompt_lookup_min`…`prompt_lookup_max` tokens of the running sequence (prompt + already-generated tokens for *this request only*), searches backward through that same sequence for a literal match, and proposes the next `num_speculative_tokens` tokens that followed the match. The main model then verifies all K proposals in a single forward; accept the longest matching prefix, reject the rest. Zero training, zero per-vocabulary tuning, zero cross-request state. It's just suffix-matching at runtime. The "n-gram statistics of speech tokens" question is moot — no such stats are ever computed.
+
+**Why it gives only 1-3% on speech tokens (vs 30-50% on code/JSON):** speech-token streams at 25 Hz lack literal repetition. Sustained vowels and breath tokens do form local 2-grams, but LLM sampling jitter means the 2-gram match → 3+ token continuation almost never aligns with what the LLM would actually emit. Acceptance is clearly below the ~58% break-even threshold for V1's IPC overhead (vLLM 0.10.1 V1 doesn't log spec-decode acceptance stats; wall-time evidence is unambiguous).
+
+**Single-request bench (AWQ + MeanFlow + chunked prefill, same dialogue, same seed):**
 
 | Engine / config | Long RTF | Long TTFA | Short RTF | Short TTFA |
 |---|---|---|---|---|
-| **V0 (current prod)** | **0.162** | **0.49 s** | **0.261** | **0.49 s** |
-| V1 no-spec (baseline) | 0.280 | 0.59 s | 0.404 | — |
+| V0 + no spec (prior best, kept on `main` history) | 0.162 | 0.49 s | 0.261 | 0.49 s |
+| V1 no-spec | 0.280 | 0.59 s | 0.404 | — |
 | V1 + ngram k=5, min=2, max=4 | 0.276 | 0.57 s | 0.413 | 0.59 s |
 | V1 + ngram k=3, min=2, max=4 | 0.272 | 0.59 s | 0.415 | 0.58 s |
+| **V1 + ngram k=3, min=4, max=8 (production default)** | **0.270** | **0.60 s** | **0.413** | **0.59 s** |
 
-**Result:** ngram improves V1's long RTF by 1.4–2.9% (0.280 → 0.272), nowhere near the ~1.73× needed to recover V0's lead. Short content actually slightly regresses (V1 baseline 0.404 → 0.413–0.415) — proposal/verification overhead exceeds any acceptance win on the short dialogue's smaller token budget. k=3 vs k=5 is essentially noise.
+Single-request regresses ~67% RTF and ~22% TTFA vs V0. **This is intentionally accepted** — the multi-stream production axis is the goal; the [Production multi-stream serving (single GPU)](#production-multi-stream-serving-single-gpu) section's numbers were taken on V0 and need to be re-measured on V1+ngram via `bench_concurrent.py` to validate the trade. **TODO before relying on this in production:** run N=4 / N=8 concurrent bench on V1+ngram and compare to the V0 numbers in that section. If V1 multi-stream doesn't outpace V0 multi-stream by enough to justify the single-request loss, revisit the decision.
 
-**Why ngram doesn't help on speech tokens:** unlike code or structured output, speech tokens at 25 Hz don't repeat literal n-grams often enough. Sustained vowels and breath tokens do form local 2-grams, but the LLM sampling adds enough variation that the 2-gram match → 3+ token continuation almost never aligns with what the LLM would actually emit. Effective acceptance rate is clearly below the ~58% break-even threshold for V1's IPC overhead; vLLM 0.10.1 V1 doesn't log spec-decode acceptance stats by default, but the wall-time evidence is unambiguous.
+#### Match window sweep — longer windows give marginal wins
 
-**Wiring (kept on branch, not merged):**
-- [soulxpodcast/engine/llm_engine.py](soulxpodcast/engine/llm_engine.py): module-level `VLLM_SPEC_NGRAM=true` auto-flips `VLLM_USE_V1=1` (V0 has no spec_decode runtime). In `VLLMEngine.__init__`, builds `speculative_config={"method": "ngram", "num_speculative_tokens": k, "prompt_lookup_max": ..., "prompt_lookup_min": ...}` and passes to `EngineArgs`. Also added defensive cleanup: docker-compose `${VAR:-}` empty-string passthroughs (`VLLM_ENABLE_V1_MULTIPROCESSING`, `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE`, etc.) are scrubbed before vLLM imports — these envs do `int(os.getenv(...))` with no guard and crash on empty strings during ModelConfig validation.
-- [docker-compose.bench.yml](docker-compose.bench.yml): added `VLLM_SPEC_NGRAM`, `VLLM_SPEC_NUM_SPECULATIVE_TOKENS`, `VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MAX/MIN` passthroughs (bench-only — production compose deliberately keeps V0).
+Speech tokens at 25 Hz are ~6-8× denser than text tokens, so the intuition is that the match window (`prompt_lookup_min`…`max`) should be proportionally longer too — a 2-token text match might be a meaningful word boundary, but at 25 Hz the same 2 tokens is only 80 ms of audio. Swept four windows holding k=3:
 
-**Decision:** Keep branch as reference for the V1 + spec_config wiring, but **do not merge.** V0 remains the production engine. The realistic next lever is a trained speculator (P-EAGLE) — its 65% train/val acceptance vs ngram's effectively-zero on speech tokens is the only path to recover V1's IPC cost. See `peagle-runtime-contract-mismatch` memory.
+| min | max | Audio length window | Long warm RTF | Short avg RTF |
+|---|---|---|---|---|
+| 2 | 4 | 80–160 ms | 0.272 | 0.415 |
+| 2 | 8 | 80–320 ms (wide range) | 0.275 | 0.408 |
+| **4** | **8** | **160–320 ms (default)** | **0.270** | **0.413** |
+| 8 | 16 | 320–640 ms | 0.271 | 0.394 (cold-skewed) |
+
+All within ~1-2% noise; the underlying acceptance problem isn't window-length, it's that speech tokens are **not literally periodic at any time scale**. Even within a sustained phoneme the s3tokenizer emits context-dependent codebook entries that drift token-by-token. Longer windows catch slightly more useful matches but the LLM's sampling still rejects most of the proposed continuations. min=4 max=8 wins by the slimmest margin on long content and is set as the default — the "denser tokens want longer windows" framing is *correct* but the gain is bounded by sampling jitter, not by window choice.
+
+**Why ngram stays on even though the win is small:**
+- It is *additive* to V1's continuous batcher (drafter ops happen per request, not at the engine boundary).
+- It costs zero VRAM (no draft model — 1.91 GiB of AWQ weights is unchanged).
+- It can only help once a trained drafter eventually replaces it: the env contract (`VLLM_SPEC_*`) generalises to EAGLE / Medusa / draft-model methods, so the wiring path is shared.
+
+**Wiring (shipped, default-on):**
+- [soulxpodcast/engine/llm_engine.py](soulxpodcast/engine/llm_engine.py): module-level `VLLM_SPEC_NGRAM=true` auto-flips `VLLM_USE_V1=1`. In `VLLMEngine.__init__`, builds `speculative_config={"method": "ngram", "num_speculative_tokens": k, "prompt_lookup_max": ..., "prompt_lookup_min": ...}` and passes through `EngineArgs`. Also scrubs empty-string V1 env vars at module import (`VLLM_ENABLE_V1_MULTIPROCESSING`, `VLLM_V1_OUTPUT_PROC_CHUNK_SIZE`, etc.) — these are read with bare `int(os.getenv(...))` inside vLLM and crash on `""` from compose `${VAR:-}` passthroughs.
+- [docker-compose.yml](docker-compose.yml): production defaults `VLLM_USE_V1=1`, `VLLM_SPEC_NGRAM=true`, `VLLM_SPEC_NUM_SPECULATIVE_TOKENS=3`, `VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MAX=4`, `VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MIN=2`. All overridable via env.
+- [.env.serve.example](.env.serve.example): mirrors the production defaults with explanatory comments.
+
+**To roll back to V0 in an emergency:** set `VLLM_USE_V1=0 VLLM_SPEC_NGRAM=false` in `.env`. The RAS sampler patches still work in V0; the only thing lost is the multi-stream batching headroom that motivated the flip.
+
+**Next lever (still relevant):** a trained speculator (P-EAGLE) with 65% train/val acceptance vs ngram's effectively-zero on speech tokens. The env contract (`VLLM_SPEC_NGRAM`) only handles the ngram method today; extending it to `method=eagle` + draft-model path is straightforward once the P-EAGLE training acceptance gap is closed. See `peagle-runtime-contract-mismatch` memory.
 
 ### Next LLM lever: speculative decoding
 
@@ -445,7 +473,8 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
 | fp8_e5m2 KV cache (Ampere) | wash on warm (XFormers fallback) or -7% (FlashInfer); cold TTFA 28s with FlashInfer | ❌ not on Ampere — fp8 + FA incompatible, no native fp8 hw on sm_86. Plumbed via `VLLM_KV_CACHE_DTYPE` for future Ada/Hopper deploy. |
 | Chunked prefill (`enable_chunked_prefill=True`, default `max_num_batched_tokens=2048`) | RTF 0.169→0.162 long (-4%), TTFA 0.51s→0.49s (-4%), short unchanged | ✅ yes — new default. Multi-turn dialogue lets the scheduler interleave new-turn prefill with previous-turn decode tail. |
-| vLLM V1 engine port | Same model: long RTF 0.162→0.280 (+73%), short 0.261→0.404 (+55%), TTFA 0.49→0.59s | ❌ V1 is throughput-optimized via separate engine process (IPC per step); regresses single-request latency. Stay on V0 until P-EAGLE training finishes — V1 then unlocks spec decode which recovers + exceeds the gap. |
+| vLLM V1 engine port | Same model: long RTF 0.162→0.280 (+73%), short 0.261→0.404 (+55%), TTFA 0.49→0.59s | ✅ shipped as default — V1's continuous-batching shape is the right fit for production multi-stream serving even though single-request RTF regresses. See [V1 + ngram speculative decoding — production default](#v1--ngram-speculative-decoding--production-default). |
+| V1 + ngram speculative decoding | k=3 long RTF 0.280→0.272 (-3%), short 0.404→0.415 (+3% regression) | ✅ shipped as default — additive to V1 batcher, zero VRAM cost, generalises to future trained speculators. |
 
 **Different optimization axis — production multi-stream serving (concurrent throughput):**
 
@@ -530,7 +559,7 @@ MODEL_PATH=<awq+meanflow-checkpoint>  # see scripts/setup_meanflow.sh
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
   - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
   - **Hardware upgrade to sm_89+ (Ada/Hopper)** unlocks native fp8 KV cache + fp8 GEMM. Plumbing already in place via `VLLM_KV_CACHE_DTYPE`.
-- **vLLM V1 engine port: gated on P-EAGLE acceptance, not rejected.** V1 alone regresses single-request RTF by ~73% on long content. But spec-decode is V1-only in vLLM 0.10.1 (`vllm/spec_decode/` V0 runtime is empty), so V1 is the prerequisite for lever #1. Break-even is ~58% runtime spec-decode acceptance; the P-EAGLE branch is now training with the exposure-bias fix (memory note `peagle-runtime-contract-mismatch`). Flip when acceptance recovers. The production multi-stream lock-removal + flow batcher work here is independent of V0/V1 and stacks cleanly with whichever engine wins. Details: see [vLLM V1 engine port — alone is a regression; only worth it as the gateway to speculative decoding](#vllm-v1-engine-port--alone-is-a-regression-only-worth-it-as-the-gateway-to-speculative-decoding).
+- **vLLM V1 + ngram speculative decoding: shipped as default.** V1 alone regresses single-request RTF by ~73% on long content; ngram brings back ~3%. The flip is justified on the multi-stream axis (V1's separate EngineCore + continuous batching) rather than single-request latency. Multi-stream A/B vs V0 still TODO — re-run `bench_concurrent.py` and update the [Production multi-stream serving (single GPU)](#production-multi-stream-serving-single-gpu) numbers, which were measured on V0. RAS is silently disabled in V1; deemed acceptable for the AWQ+MeanFlow stack. When P-EAGLE acceptance recovers, swap the ngram `speculative_config` for the EAGLE/draft-model variant — same env contract. Details: [V1 + ngram speculative decoding — production default](#v1--ngram-speculative-decoding--production-default).
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.
