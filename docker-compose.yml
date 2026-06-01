@@ -37,6 +37,14 @@ services:
       # Default 1 = MeanFlow distilled 1-step path (basic_euler, no CFG).
       # Set FLOW_STEPS=4 if MODEL_PATH still has a legacy CFM flow.pt.
       FLOW_STEPS: "${FLOW_STEPS:-1}"
+      # vLLM KV cache dtype. Unset/empty = auto = matches model dtype (fp16).
+      # fp8_e5m2 halves KV bandwidth at decode time at the cost of a dequant
+      # kernel; on Ampere (sm_8x) no native fp8 hardware so the win is
+      # marginal. See CLAUDE.md for measured numbers.
+      # NB: vLLM rejects an empty string for VLLM_ATTENTION_BACKEND, so the
+      # attention-backend override is set via shell/.env only — do not plumb
+      # it through compose with a default empty value.
+      VLLM_KV_CACHE_DTYPE: "${VLLM_KV_CACHE_DTYPE:-}"
       TORCH_COMPILE: "${TORCH_COMPILE:-false}"
       STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-150}"
       STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"

@@ -174,6 +174,51 @@ AWQ does NOT regress streaming dynamic range. The peak being ~5.5 dB hotter (0.9
 
 **Reproducibility note:** the AWQ checkpoint's heavy-file symlinks (`flow.pt`, `hift.pt`, `campplus.onnx`, `flow.cache.pt`, `flow.decoder.estimator.fp32.onnx`) point at the absolute path they were created under (`/notebooks/projects/SoulX-Podcast/pretrained_models/...`). The [docker-compose.bench.yml](docker-compose.bench.yml) overlay bind-mounts the host `pretrained_models/` tree at that absolute path so the symlinks resolve inside the container. Rolling AWQ into `docker-compose.yml` as the default needs the same mount or relative symlinks.
 
+### vLLM-side LLM optimization — exhausted on Ampere
+
+After shipping AWQ + MeanFlow, the LLM is now ~75-85% of long-content wall (~3-4 s of the 5.36 s total). Standard vLLM tuning knobs were exercised against the prod stack (AWQ + MeanFlow + CUDA graphs + chunk=150, RTX 3090). **None deliver a measurable win on this hardware.**
+
+Baseline reference (this section, fresh container instance, N=4 warm avg):
+
+| Path | Long RTF | Short RTF | TTFA | Cold run 1 |
+|---|---|---|---|---|
+| FlashAttention + fp16 KV (default) | **0.169** | **0.263** | **0.49 s** | TTFA 1.06 s |
+| fp8_e5m2 KV + XFormers (FA falls back) | 0.169 | 0.250 | 0.48 s | wall 6.41 s |
+| fp8_e5m2 KV + FlashInfer (vLLM's recommended fp8 path) | **0.180** | 0.259 | 0.49 s | **TTFA 28.3 s** |
+
+**Three structural reasons no win is available on Ampere:**
+
+1. **FlashAttention is already auto-selected.** vLLM logs `Using Flash Attention backend.` on Ampere fp16 with `head_dim=128`. Nothing to switch to that's faster.
+
+2. **fp8 KV cache is incompatible with FlashAttention.** vLLM explicitly errors: `Cannot use FlashAttention backend for FP8 KV cache.` Falls back to either XFormers (wash on warm, much worse cold) or FlashInfer (slower on warm, **catastrophic 28 s cold TTFA** from FlashInfer JIT compilation). On Hopper/Ada (sm_89+) the FA-fp8 path exists with native hardware support; **RTX 3090 (sm_86) has no fp8 hardware** so the dequant kernel overhead eats the bandwidth saving.
+
+3. **AWQ INT4 already extracted the weight-read bandwidth win.** Current ~3.0 ms/token is within ~17% of the theoretical floor (1.91 GiB weights / 936 GB/s mem bandwidth = 2.0 ms minimum). The remaining 17% gap is Python + scheduler + sampling overhead — not addressable by vLLM env flags.
+
+**Other knobs that were considered and skipped without measurement:**
+
+| Knob | Why not | Notes |
+|---|---|---|
+| `block_size` (KV cache block size) | Single-request decode; default 16 has negligible indirection overhead | Larger blocks waste memory at sequence ends |
+| `enable_chunked_prefill` | Our prefills are 1000-2000 tokens, not large enough to benefit from chunking | Targets multi-thousand-token prefills |
+| `max_num_seqs` | Affects concurrent throughput, not single-request latency | Already at default |
+| `--num-scheduler-steps` | V0 engine; not available in our V0 path | Would need V1 engine + RAS patch rewrite |
+| FlashInfer attention (with fp16 KV) | V1 backend; our RAS patches target V0 | Switching engine versions is a multi-day port |
+
+**Infrastructure added anyway** (so the knobs are available when the hardware is):
+- `VLLMEngine.__init__` reads `VLLM_KV_CACHE_DTYPE` env (`auto` / `fp8_e5m2` / `fp8_e4m3` / `int8`) and threads it into `EngineArgs(kv_cache_dtype=...)`. Empty/unset = `auto` (matches model dtype).
+- `docker-compose.yml` exposes the env var passthrough. **No default value** so vLLM auto-picks correctly.
+- `docker-compose.bench.yml` adds `VLLM_ATTENTION_BACKEND` passthrough (bench-only — vLLM rejects an empty-string value, so production compose deliberately omits it).
+
+When the deployment GPU moves to Ada/Hopper, `VLLM_KV_CACHE_DTYPE=fp8_e5m2` is expected to deliver a real ~10-20% decode-time speedup with native FA-fp8 — re-run the bench above to confirm.
+
+### Next LLM lever: speculative decoding
+
+The only remaining LLM-side lever that doesn't require new hardware is **speculative decoding** with a small draft model (e.g. Qwen3-0.6B). vLLM 0.10 supports it natively via `speculative_config=`. Realistic gain: **1.5-2× LLM throughput → RTF ~0.10-0.13 on long content.** Stacks on AWQ + MeanFlow.
+
+The codebase already has a P-EAGLE speculator experiment (see `experiment/vllm-peagle-speculator` branch + `peagle-runtime-contract-mismatch.md` memory). Runtime acceptance was 24% vs train/val 65%; the cached-hidden-state A/B between PyTorch and vLLM in-process drafter forward is the decisive next test. Alternatively, train a fresh small draft from scratch — single-day job once data + recipe are in place.
+
+After speculative decoding lands, Phase 0 is genuinely exhausted: the next wall reductions require either training (Phase 1 token-interleaved bi-streaming, Phase 2 sequential MTP) or hardware (sm_89+ for fp8 path).
+
 ### Residual loudness inconsistency — two streaming-specific artifacts, both in piece boundaries
 
 After ripping out the flow chunk cache AND switching to AWQ, listening A/B on the streamed output exposed two specific complaints:
@@ -318,6 +363,7 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 | Skip final-partial finalize=False on turns 2+ | RTF 0.303→0.262 long, 0.445→0.391 short | ✅ yes |
 | AWQ-INT4 (`awq_marlin` kernel) | RTF 0.265→0.208 long, 0.405→0.343 short, -50% model VRAM | ✅ yes — new default |
 | MeanFlow flow weights (Chatterbox drop-in) | end-to-end RTF 0.208→0.164 long, 0.343→0.261 short, TTFA 0.66s→0.49s; flow+HiFT 2.86× faster at FLOW_STEPS=1 | ✅ yes — new default; audio intelligible cross-lingually; ~1.5 dB hotter, recommend post-vocoder peak limiter |
+| fp8_e5m2 KV cache (Ampere) | wash on warm (XFormers fallback) or -7% (FlashInfer); cold TTFA 28s with FlashInfer | ❌ not on Ampere — fp8 + FA incompatible, no native fp8 hw on sm_86. Plumbed via `VLLM_KV_CACHE_DTYPE` for future Ada/Hopper deploy. |
 | Flow chunk cache (per-chunk K/V + conv cache) | -50.6% flow+HiFT wall long, but +2.5 dB output dynamic range vs sync | ❌ rejected — audio quality regression |
 | FLOW_STEPS 4→2 | ODE steps are only ~5% of call time | ❌ negligible |
 
@@ -326,12 +372,13 @@ All practical vLLM/inference-level speedups have been tried. Summary:
 ## Implications for PLAN.md phases
 
 - **Phase 0 inference optimization has hit a quality floor.** Flow chunk cache was tried and rejected. AWQ-INT4 is now shipped (-22% long RTF, no quality regression). Further flow-side optimizations are unlikely to yield wall savings without quality regression.
-- **Flow+HiFT is now ~70% of wall** since AWQ collapsed the LLM share. The remaining flow share is dominated by encoder + CFM ODE fixed-overhead per call; halving step count further saves <5%.
-- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 4.3× regression on current AWQ RTF 0.208 — net loss even after MTP's ~1.8×. The viable moves are:
-  - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B) — vLLM 0.10 supports this natively, no patch needed; typical 1.5–2× on memory-bandwidth-bound decode. Stacks on top of AWQ.
-  - **Larger chunks (250–400 tokens):** halves flow call count, saves ~20–30% wall at the cost of higher TTFA. Free config change.
+- **LLM is now ~75-85% of wall** after MeanFlow collapsed the flow share to ~20% (mostly hidden under LLM via B3 dual streams). vLLM-side env knobs are exhausted on Ampere — fp8 KV / FlashInfer benched and rejected (see [vLLM-side LLM optimization — exhausted on Ampere](#vllm-side-llm-optimization--exhausted-on-ampere)).
+- **Concrete next steps (must stay vLLM-compatible).** MTP forces a fallback to HF (RTF 0.904 long), which is a 5.5× regression on current AWQ+MeanFlow RTF 0.164 — net loss even after MTP's ~1.8×. The viable moves are:
+  - **Speculative decoding** with a smaller draft model (e.g. Qwen3-0.6B). vLLM 0.10 supports it natively; typical 1.5–2× on memory-bandwidth-bound decode. Stacks on top of AWQ+MeanFlow → projected RTF ~0.10-0.13 long. The existing P-EAGLE branch is partially built but stuck on a runtime/train acceptance gap; either fix that or train a fresh tiny draft.
+  - **Larger chunks (250–400 tokens):** halves flow call count, saves ~5-10% wall at the cost of higher TTFA. Free config change. Lower-priority now that flow is no longer the bottleneck.
   - **Token-interleaved bi-streaming (Phase 1)** — biggest swing but requires retraining; lets LLM and flow run at sub-token granularity instead of needing the B3 overlap to hide flow.
   - Larger vLLM batch sizes help concurrent-request throughput, not single-dialogue latency.
+  - **Hardware upgrade to sm_89+ (Ada/Hopper)** unlocks native fp8 KV cache + fp8 GEMM. Plumbing already in place via `VLLM_KV_CACHE_DTYPE`.
 - **The path to faster LLM goes through training.** Phase 1 (token-interleaved bi-streaming) and Phase 2 (Sequential MTP) both require retraining/fine-tuning.
 - **Phase 2 (Sequential MTP) is the cheaper next move** — adds K-1 lightweight mixing layers, trains heads-only Medusa-1 style with base frozen. Realistic ~1.8× per-step speedup with prosody preserved. **Caveat:** MTP currently forces HF engine, losing the AWQ win. Would need vLLM MTP integration (or accept HF + MTP + AWQ-quantized HF weights) to net out positive.
 - **Phase 1 (token-interleaved grammar) is the bigger swing** — needs forced-alignment data pipeline and full base-model retraining. Months of work. Only do it after Phase 2 proves insufficient.

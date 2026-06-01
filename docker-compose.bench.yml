@@ -30,3 +30,7 @@ services:
       # mutate our working tree.
       - ./soulxpodcast:/app/soulxpodcast:ro
       - ./api:/app/api:ro
+    environment:
+      # Bench-only knobs. Production compose deliberately omits these because
+      # vLLM rejects an empty-string VLLM_ATTENTION_BACKEND.
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"

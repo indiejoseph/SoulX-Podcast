@@ -126,6 +126,21 @@ class VLLMEngine:
                 tensor_parallel_size=config.tensor_parallel_size,
                 enable_prefix_caching=True,
             )
+            # Optional fp8 KV cache. On Ampere (no native fp8 hardware) this
+            # still halves KV-read bandwidth at decode time at the cost of a
+            # dequant kernel. Empirically a wash-to-small-win on single-request
+            # TTS; expose as opt-in to allow benchmarking.
+            #   VLLM_KV_CACHE_DTYPE=auto    (default — matches model dtype)
+            #   VLLM_KV_CACHE_DTYPE=fp8_e5m2
+            #   VLLM_KV_CACHE_DTYPE=fp8_e4m3
+            _kv_dtype = os.environ.get("VLLM_KV_CACHE_DTYPE", "").strip()
+            if _kv_dtype:
+                engine_kwargs["kv_cache_dtype"] = _kv_dtype
+            # Optional attention backend override; vLLM auto-selects FLASH_ATTN
+            # on Ampere with fp16/bf16 and supported head_dim. Override only if
+            # you know the auto-pick is wrong for your hardware.
+            #   VLLM_ATTENTION_BACKEND=FLASH_ATTN | FLASHINFER | XFORMERS | TRITON_ATTN_VLLM_V1
+            # (also natively respected by vllm itself if set in env)
             import json as _json
             cfg_path = os.path.join(model, "config.json")
             if os.path.exists(cfg_path):
