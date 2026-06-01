@@ -1190,91 +1190,104 @@ class SoulXPodcastService:
         if not self.is_loaded():
             raise RuntimeError("Model is not loaded")
 
-        with self._generation_lock:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            random.seed(seed)
+        # No global lock: the streaming path used to wrap the entire request
+        # (LLM + flow + HiFT + HTTP streaming) under self._generation_lock,
+        # which strictly serialized concurrent /generate-stream clients and
+        # broke vLLM continuous batching. Concurrent bench at N=4 showed a
+        # clean staircase TTFA pattern (0.5/5.5/10.5/15.6s) consistent with
+        # full serialization. The lock is removed; the only shared state it
+        # was protecting — self.dataset.update_datasource + self.dataset[0]
+        # — is replaced with self.dataset.process_dataitem(dataitem), which
+        # is stateless (no self.datas mutation).
+        #
+        # Trade-off: torch.manual_seed / np.random.seed / random.seed touch
+        # process-global state. Two concurrent requests with different seeds
+        # will race and one seed will win for the LLM's randomness. This
+        # breaks per-request reproducibility but not correctness. For "max
+        # QPS production" the trade is correct; clients that need
+        # deterministic output should serialize their own requests.
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
-            num_speakers = len(prompt_audio_paths)
-            target_text_list = parse_dialogue_text(dialogue_text, num_speakers)
+        num_speakers = len(prompt_audio_paths)
+        target_text_list = parse_dialogue_text(dialogue_text, num_speakers)
 
-            spks, texts = [], []
-            for target_text in target_text_list:
-                pattern = r'(\[S[1-9]\])(.+)'
-                match = re.match(pattern, target_text)
-                if match:
-                    text, spk = match.group(2), int(match.group(1)[2]) - 1
-                    spks.append(spk)
-                    texts.append(text)
-                else:
-                    raise ValueError(f"Invalid dialogue text format: {target_text}")
+        spks, texts = [], []
+        for target_text in target_text_list:
+            pattern = r'(\[S[1-9]\])(.+)'
+            match = re.match(pattern, target_text)
+            if match:
+                text, spk = match.group(2), int(match.group(1)[2]) - 1
+                spks.append(spk)
+                texts.append(text)
+            else:
+                raise ValueError(f"Invalid dialogue text format: {target_text}")
 
-            dataitem = {
-                "key": "api_stream",
-                "prompt_text": prompt_texts,
-                "prompt_wav": prompt_audio_paths,
-                "text": texts,
-                "spk": spks,
-            }
-            self.dataset.update_datasource([dataitem])
-            data = self.dataset[0]
+        dataitem = {
+            "key": "api_stream",
+            "prompt_text": prompt_texts,
+            "prompt_wav": prompt_audio_paths,
+            "text": texts,
+            "spk": spks,
+        }
+        data = self.dataset.process_dataitem(dataitem)
 
-            import s3tokenizer
-            prompt_mels_for_llm, prompt_mels_lens_for_llm = s3tokenizer.padding(data["log_mel"])
-            spk_emb_for_flow = torch.tensor(data["spk_emb"])
-            # Move flow mels to CUDA so _stream_synth_chunk always gets CUDA
-            # tensors regardless of which branch the per-prompt mel-alignment
-            # check takes (forward_longform does .cuda() at its flow call site;
-            # forward_longform_streaming infers device from prompt_mel instead).
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            prompt_mels_for_flow = torch.nn.utils.rnn.pad_sequence(
-                data["mel"], batch_first=True, padding_value=0
-            ).to(device)
-            text_tokens_for_llm = data["text_tokens"]
-            prompt_text_tokens_for_llm = data["prompt_text_tokens"]
-            spk_ids = data["spks_list"]
+        import s3tokenizer
+        prompt_mels_for_llm, prompt_mels_lens_for_llm = s3tokenizer.padding(data["log_mel"])
+        spk_emb_for_flow = torch.tensor(data["spk_emb"])
+        # Move flow mels to CUDA so _stream_synth_chunk always gets CUDA
+        # tensors regardless of which branch the per-prompt mel-alignment
+        # check takes (forward_longform does .cuda() at its flow call site;
+        # forward_longform_streaming infers device from prompt_mel instead).
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        prompt_mels_for_flow = torch.nn.utils.rnn.pad_sequence(
+            data["mel"], batch_first=True, padding_value=0
+        ).to(device)
+        text_tokens_for_llm = data["text_tokens"]
+        prompt_text_tokens_for_llm = data["prompt_text_tokens"]
+        spk_ids = data["spks_list"]
 
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                top_k=top_k,
-                top_p=top_p,
-                use_ras=True,
-                win_size=25,
-                tau_r=0.2,
-            )
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            top_k=top_k,
+            top_p=top_p,
+            use_ras=True,
+            win_size=25,
+            tau_r=0.2,
+        )
 
-            processed_data = {
-                "prompt_mels_for_llm": prompt_mels_for_llm,
-                "prompt_mels_lens_for_llm": prompt_mels_lens_for_llm,
-                "prompt_text_tokens_for_llm": prompt_text_tokens_for_llm,
-                "text_tokens_for_llm": text_tokens_for_llm,
-                "prompt_mels_for_flow_ori": prompt_mels_for_flow,
-                "spk_emb_for_flow": spk_emb_for_flow,
-                "sampling_params": sampling_params,
-                "spk_ids": spk_ids,
-                "use_dialect_prompt": False,
-            }
+        processed_data = {
+            "prompt_mels_for_llm": prompt_mels_for_llm,
+            "prompt_mels_lens_for_llm": prompt_mels_lens_for_llm,
+            "prompt_text_tokens_for_llm": prompt_text_tokens_for_llm,
+            "text_tokens_for_llm": text_tokens_for_llm,
+            "prompt_mels_for_flow_ori": prompt_mels_for_flow,
+            "spk_emb_for_flow": spk_emb_for_flow,
+            "sampling_params": sampling_params,
+            "spk_ids": spk_ids,
+            "use_dialect_prompt": False,
+        }
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Skip the per-request torch.cuda.empty_cache(): it acquires the
+        # CUDA allocator lock and stalls all other concurrent CUDA work.
+        # The model's own memory budgeting + vLLM's KV cache manager handle
+        # fragmentation correctly without this hammer.
 
-            if output_format == "wav":
-                yield wav_header(None)
+        if output_format == "wav":
+            yield wav_header(None)
 
-            for event in self.model.forward_longform_streaming(
-                **processed_data,
-                chunk_size=chunk_size if chunk_size is not None else api_config.stream_chunk_size,
-                first_chunk_size=first_chunk_size if first_chunk_size is not None else api_config.stream_first_chunk_size,
-                flow_streaming=api_config.flow_streaming,
-                flow_steps=api_config.flow_steps,
-            ):
-                chunk_bytes = tensor_to_pcm16_bytes(event["audio"])
-                if chunk_bytes:
-                    yield chunk_bytes
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        for event in self.model.forward_longform_streaming(
+            **processed_data,
+            chunk_size=chunk_size if chunk_size is not None else api_config.stream_chunk_size,
+            first_chunk_size=first_chunk_size if first_chunk_size is not None else api_config.stream_first_chunk_size,
+            flow_streaming=api_config.flow_streaming,
+            flow_steps=api_config.flow_steps,
+        ):
+            chunk_bytes = tensor_to_pcm16_bytes(event["audio"])
+            if chunk_bytes:
+                yield chunk_bytes
 
 
 _service: Optional[SoulXPodcastService] = None

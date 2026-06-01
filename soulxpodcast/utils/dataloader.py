@@ -80,7 +80,19 @@ class PodcastDataset(Dataset):
         return len(self.datas)
 
     def __getitem__(self, idx):
-        data = self.datas[idx]
+        return self.process_data(self.datas[idx])
+
+    def process_data(self, data):
+        """Stateless processing of one dataitem.
+
+        Extracted from the original ``__getitem__`` body so concurrent callers
+        don't need to race on ``self.datas``. Caller passes the dataitem dict
+        directly; method touches no shared state on ``self`` beyond the
+        thread-safe-by-construction ONNX/text_tokenizer handles.
+
+        Returns the same dict the historical ``__getitem__`` returned (None on
+        per-item error so the legacy code path is preserved).
+        """
         try:
             prompt_text_ids_list, dialect_prompt_text_ids_list, spk_emb_list, mel_list, mel_len_list, log_mel_list = (
                 [], [], [], [], [], []
@@ -196,3 +208,13 @@ class PodcastInferHandler(PodcastDataset):
 
     def update_datasource(self, data_list):
         self.datas = data_list
+
+    def process_dataitem(self, dataitem):
+        """Thread-safe single-item version of ``__getitem__``.
+
+        Use this from concurrent request handlers instead of
+        ``update_datasource([d]) + dataset[0]``. The base ``process_data`` is
+        stateless — multiple threads can call this method on the same
+        ``PodcastInferHandler`` instance without serializing.
+        """
+        return self.process_data(dataitem)
