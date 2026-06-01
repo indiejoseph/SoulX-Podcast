@@ -15,10 +15,25 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteriaList
 from transformers import EosTokenCriteria, RepetitionPenaltyLogitsProcessor
 
-# SoulX-Podcast relies on the patched vLLM 0.10.1 V0 sampler for RAS fields.
-os.environ["VLLM_USE_V1"] = "0"
-try:    
-    from vllm import EngineArgs, LLMEngine
+# SoulX-Podcast defaults to V0 for the patched vLLM 0.10.1 RAS sampler.
+# Setting VLLM_USE_V1=1 in env switches to V1 (which requires reimplementing
+# RAS as a LogitsProcessor plugin — RAS is silently disabled in V1 today).
+# V1 is the prerequisite for speculative decoding (V0 has no spec_decode
+# runtime in vLLM 0.10.1).
+# Defensive: treat unset OR empty-string OR non-{0,1} values as default "0".
+# Compose passes through `${VLLM_USE_V1:-}` which becomes an empty string when
+# unset, and vLLM's envs.py does `int(os.getenv("VLLM_USE_V1", "1"))` which
+# crashes on empty string.
+_vuse_v1 = os.environ.get("VLLM_USE_V1", "").strip()
+if _vuse_v1 not in ("0", "1"):
+    _vuse_v1 = "0"
+os.environ["VLLM_USE_V1"] = _vuse_v1
+try:
+    from vllm import EngineArgs
+    if os.environ.get("VLLM_USE_V1") == "1":
+        from vllm.v1.engine.llm_engine import LLMEngine
+    else:
+        from vllm import LLMEngine
     from vllm import SamplingParams as VllmSamplingParams
     from vllm.inputs import TokensPrompt as TokensPrompt
     SUPPORT_VLLM = True
@@ -152,6 +167,14 @@ class VLLMEngine:
             _mnbt = os.environ.get("VLLM_MAX_NUM_BATCHED_TOKENS", "").strip()
             if _mnbt:
                 engine_kwargs["max_num_batched_tokens"] = int(_mnbt)
+            # V1-specific: torch.compile / CUDA graph level. V1 default is
+            # "level=3" (== -O3, today equivalent to -O2 per vLLM docs). For
+            # small models at batch=1 this often costs more than it saves.
+            # Allow override to bench cheaper compilation strategies.
+            #   VLLM_COMPILATION_LEVEL=0|1|2|3
+            _comp_level = os.environ.get("VLLM_COMPILATION_LEVEL", "").strip()
+            if _comp_level:
+                engine_kwargs["compilation_config"] = {"level": int(_comp_level)}
             # Optional attention backend override; vLLM auto-selects FLASH_ATTN
             # on Ampere with fp16/bf16 and supported head_dim. Override only if
             # you know the auto-pick is wrong for your hardware.

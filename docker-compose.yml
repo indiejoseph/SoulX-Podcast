@@ -45,6 +45,12 @@ services:
       # attention-backend override is set via shell/.env only — do not plumb
       # it through compose with a default empty value.
       VLLM_KV_CACHE_DTYPE: "${VLLM_KV_CACHE_DTYPE:-}"
+      # Cross-request batcher for flow + HiFT. When unset/false, each request
+      # runs its own inline flow+HiFT call (legacy path). When true, a single
+      # worker thread batches concurrent chunks into one batched forward —
+      # required for multi-stream throughput. See soulxpodcast/utils/flow_batcher.py.
+      FLOW_HIFT_BATCHING: "${FLOW_HIFT_BATCHING:-}"
+      FLOW_HIFT_BATCH_SIZE: "${FLOW_HIFT_BATCH_SIZE:-4}"
       # Chunked prefill: -4% RTF on long content (multi-turn dialogue) by
       # letting the scheduler interleave new-turn prefill with previous-turn
       # decode tail. Default 2048 max_num_batched_tokens (vLLM default) gave

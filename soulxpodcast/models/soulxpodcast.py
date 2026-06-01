@@ -505,7 +505,36 @@ class SoulXPodcast(torch.nn.Module):
                              prompt_mel, prompt_mel_len_t, spk_emb, finalize: bool,
                              streaming: bool, flow_steps: int):
         """Run flow+HiFT on (prompt_speech_tokens + generated_speech_tokens).
-        Returns the full waveform; caller slices off already-emitted portion."""
+        Returns the full waveform; caller slices off already-emitted portion.
+
+        Routing:
+        - Default: inline flow+HiFT on the caller's CUDA stream (current behaviour).
+        - ``FLOW_HIFT_BATCHING=true``: route through the process-wide
+          ``FlowHiftBatcher``. Single worker thread + single CUDA stream batches
+          flow+HiFT across concurrent requests, which is the production path for
+          multi-stream serving. See ``soulxpodcast/utils/flow_batcher.py``.
+        """
+        from soulxpodcast.utils.flow_batcher import get_global_batcher
+        batcher = get_global_batcher(
+            self.flow, self.hift, fp16_flow=self.config.hf_config.fp16_flow,
+        )
+        if batcher is not None:
+            # Batched path. Caller is in their own request thread; submit and
+            # wait. The batcher pads, runs one batched forward, and resolves
+            # this Future with the per-request wav slice.
+            future = batcher.submit(
+                prompt_speech_tokens=prompt_speech_tokens,
+                generated_speech_tokens=generated_speech_tokens,
+                prompt_mel=prompt_mel,
+                prompt_mel_len_t=prompt_mel_len_t,
+                spk_emb=spk_emb,
+                finalize=finalize,
+                streaming=streaming,
+                flow_steps=flow_steps,
+            )
+            return future.result()
+
+        # ---- legacy inline path (unchanged) -------------------------------
         _time_stages = os.getenv("PROFILE_FLOW_STAGES")
         device = prompt_mel.device
         flow_input = torch.tensor(
