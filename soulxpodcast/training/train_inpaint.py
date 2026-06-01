@@ -51,7 +51,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -97,9 +97,22 @@ class TrainConfig:
     aux_weight: float = 0.3
     label_smoothing: float = 0.1
     init_from_text_embed: bool = True
+    # Resume a prior composer (loads composer weights only — NOT optimizer
+    # / scheduler / step count). Use for "continuation fine-tuning" on a
+    # rebalanced subset to specialise an existing checkpoint.
+    resume_composer: str = ""
     # Dataset
     phoneme_keep_prob: float = 0.25
     lang_filter: str = ""             # "" = all langs (yue,zh,en); else comma-separated
+    # Language-rebalanced sampling. One of:
+    #   "none"     — uniform sampling (matches the corpus distribution)
+    #   "balanced" — each language gets equal expected representation
+    #                (per-row weight = 1 / count[lang]).
+    #   "sqrt"     — sqrt-tempered rebalance: minority langs are boosted
+    #                but not all the way to uniform. Per-row weight =
+    #                1 / sqrt(count[lang]). Safer when the minority lang
+    #                is tiny — avoids overfitting on the few rows.
+    lang_balance: str = "none"
     max_total_tokens: int = 2048
     max_speech_tokens: int = 750
     eval_fraction: float = 0.01       # held-out fraction (capped at 2000 rows)
@@ -138,6 +151,12 @@ def parse_args() -> TrainConfig:
     p.add_argument("--aux_weight", type=float, default=0.3)
     p.add_argument("--label_smoothing", type=float, default=0.1)
     p.add_argument("--no_init_from_text_embed", action="store_true")
+    p.add_argument("--resume_composer", type=str, default="",
+                   help="Path to a prior composer.pt to warm-start from "
+                        "(loads composer weights only — optimizer / scheduler "
+                        "start fresh).")
+    p.add_argument("--lang_balance", choices=["none", "balanced", "sqrt"], default="none",
+                   help="Per-row sampling weight scheme based on language frequency.")
     p.add_argument("--phoneme_keep_prob", type=float, default=0.25)
     p.add_argument("--lang_filter", type=str, default="")
     p.add_argument("--max_total_tokens", type=int, default=2048)
@@ -458,10 +477,49 @@ def train(cfg: TrainConfig):
     eval_ds = Subset(eval_ds_obj, eval_idx)
     eval_ds_full = Subset(eval_ds_full_obj, eval_idx)
 
+    # ---- Optional language-rebalanced sampler ------------------------ #
+    sampler = None
+    do_shuffle = True
+    if cfg.lang_balance != "none":
+        import math
+        from collections import Counter
+
+        lang_per_train_idx = [full_ds.rows[i]["lang"] for i in train_idx]
+        lang_counts = Counter(lang_per_train_idx)
+        log.info(f"lang counts in train split: {dict(lang_counts)}")
+
+        if cfg.lang_balance == "balanced":
+            weight_for = {lang: 1.0 / cnt for lang, cnt in lang_counts.items()}
+        elif cfg.lang_balance == "sqrt":
+            weight_for = {lang: 1.0 / math.sqrt(cnt) for lang, cnt in lang_counts.items()}
+        else:
+            raise ValueError(f"unknown lang_balance: {cfg.lang_balance}")
+
+        sample_weights = torch.tensor(
+            [weight_for[lang] for lang in lang_per_train_idx], dtype=torch.float64
+        )
+        # Effective dataset size = same as a full epoch; sampler runs with
+        # replacement so minority langs get oversampled in expectation.
+        sampler = WeightedRandomSampler(
+            weights=sample_weights, num_samples=len(train_ds), replacement=True
+        )
+        do_shuffle = False  # sampler controls ordering
+        # Log the expected per-lang draws under this scheme.
+        total_w = sample_weights.sum().item()
+        per_lang_draws = {
+            lang: weight_for[lang] * cnt / total_w * len(train_ds)
+            for lang, cnt in lang_counts.items()
+        }
+        log.info(
+            f"lang_balance={cfg.lang_balance}  expected per-epoch draws: "
+            + ", ".join(f"{lang}={int(n):,}" for lang, n in per_lang_draws.items())
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=do_shuffle,
+        sampler=sampler,
         num_workers=cfg.num_workers,
         pin_memory=True,
         collate_fn=lambda b: collate(b, pad_token_id=tokenizer.pad_token_id or 0),
@@ -516,6 +574,25 @@ def train(cfg: TrainConfig):
     ).to("cuda", dtype=dtype)
     if cfg.init_from_text_embed:
         composer.init_from_text_embed(model.get_input_embeddings())
+    if cfg.resume_composer:
+        log.info(f"resuming composer weights from {cfg.resume_composer}")
+        prior = torch.load(cfg.resume_composer, map_location="cuda", weights_only=False)
+        prior_cfg = prior.get("config", {})
+        if prior_cfg.get("d_model") not in (None, composer.d_model):
+            raise ValueError(
+                f"resume_composer d_model={prior_cfg.get('d_model')} != "
+                f"current {composer.d_model}"
+            )
+        if prior_cfg.get("slots_per_token") not in (None, composer.K):
+            raise ValueError(
+                f"resume_composer slots_per_token={prior_cfg.get('slots_per_token')} != "
+                f"current {composer.K}"
+            )
+        composer.load_state_dict(prior["composer"])
+        log.info(
+            f"  loaded {sum(p.numel() for p in composer.parameters())/1e6:.2f}M composer params "
+            f"(prior step={prior.get('step', '?')}). Optimizer & scheduler start fresh."
+        )
     composer.train()
 
     n_train = sum(p.numel() for p in composer.parameters() if p.requires_grad)
