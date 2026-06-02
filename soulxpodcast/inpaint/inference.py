@@ -337,12 +337,18 @@ class InpaintInferenceEngine:
         alphabet: str,
         K: int,
     ) -> tuple[list[list[int]], int]:
-        """Per-span placement using the same broadcast rule as the trainer.
+        """Per-span placement, matching the dataset adapter's alignment rule.
 
-        Each span's phoneme tokens are encoded via PhonemeTokenizer and
-        written into every BPE token covering the span's char range.
-        Overflow past K is silently truncated.
+        - Chinese (jyutping / pinyin) spans: broadcast the span's (initial,
+          final) ids across every BPE token covering its char range. Matches
+          ``inpaint_dataset._align_chinese``.
+        - English (cmu) spans: SYLLABLE-DISTRIBUTE — for multi-BPE multi-
+          syllable words, syllable groups are spread across BPEs in order.
+          Matches ``inpaint_dataset._align_english`` which the composer
+          was trained on.
         """
+        from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
+
         T_text = len(text_offsets)
         per_token = [[0] * K for _ in range(T_text)]
         cursor = [0] * T_text
@@ -357,17 +363,7 @@ class InpaintInferenceEngine:
         kept = 0
         for span in spans:
             cs, ce = span.char_start, span.char_end
-            # The span's chars in `text` (the post-prefix surface). The span
-            # came from the SSML parse before normalisation; if normalisation
-            # changed character positions (e.g. space stripping for zh/yue),
-            # we use a simple alignment heuristic by re-locating the surface
-            # substring in `text`.
             ph_tokens = list(span.ph_tokens)
-            try:
-                ids = self.phone_tok.encode_span(span.alphabet, ph_tokens)
-            except ValueError as exc:
-                log.warning(f"skipping unparseable span {span}: {exc}")
-                continue
 
             # Collect BPE tokens overlapping the span's char range.
             token_set: list[int] = []
@@ -382,9 +378,47 @@ class InpaintInferenceEngine:
             if not token_set:
                 continue
 
-            wrote = self._write_unit(per_token, cursor, token_set, ids, K)
-            if wrote:
-                kept += 1
+            if span.alphabet == "cmu":
+                # Per-syllable distribution across the span's BPE tokens.
+                try:
+                    syll_groups = encode_arpabet_per_syllable(ph_tokens)
+                except ValueError as exc:
+                    log.warning(f"skipping unparseable cmu span {span}: {exc}")
+                    continue
+                if not syll_groups:
+                    continue
+                n_bpes = len(token_set)
+                n_sylls = len(syll_groups)
+                if n_bpes <= 1 or n_sylls <= 1:
+                    flat = [i for grp in syll_groups for i in grp]
+                    if self._write_unit(per_token, cursor, token_set, flat, K):
+                        kept += 1
+                else:
+                    base = n_sylls // n_bpes
+                    extra = n_sylls % n_bpes
+                    wrote_any = False
+                    idx = 0
+                    for bi, bpe_token in enumerate(token_set):
+                        take = base + (1 if bi < extra else 0)
+                        if take == 0:
+                            continue
+                        group = syll_groups[idx : idx + take]
+                        idx += take
+                        flat = [i for grp in group for i in grp]
+                        if self._write_unit(per_token, cursor, [bpe_token], flat, K):
+                            wrote_any = True
+                    if wrote_any:
+                        kept += 1
+            else:
+                # Chinese: broadcast (initial, final) across all BPE tokens
+                # covering the span — matches _align_chinese training behavior.
+                try:
+                    ids = self.phone_tok.encode_span(span.alphabet, ph_tokens)
+                except ValueError as exc:
+                    log.warning(f"skipping unparseable span {span}: {exc}")
+                    continue
+                if self._write_unit(per_token, cursor, token_set, ids, K):
+                    kept += 1
 
         return per_token, kept
 
