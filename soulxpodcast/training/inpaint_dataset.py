@@ -264,13 +264,21 @@ def _align_english(
     rng: Optional[random.Random] = None,
 ) -> tuple[list[list[int]], int, int]:
     """One word = one unit. Each word's ARPAbet stream is syllabified and
-    position-tagged via ``PhonemeTokenizer``, then broadcast across every
-    BPE token covering the word's char range. Tail beyond K is dropped.
+    position-tagged via ``PhonemeTokenizer``.
+
+    Multi-BPE words **distribute syllable groups across the word's BPE
+    tokens** instead of broadcasting the entire phoneme block into every
+    BPE — long words like "INTERNATIONAL" use multiple text time-space
+    positions, so the composer doesn't have to squeeze a 4-syllable
+    word into one BPE's K-slot block. Single-BPE words still pack all
+    syllables into one block.
 
     With ``keep_prob < 1`` each word is independently kept with
     probability ``keep_prob`` (sparse-annotation training).
     Returns ``(per_token_slots, n_words_kept, n_words_seen)``.
     """
+    from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
+
     T_text = len(text_offsets)
     per_token = [[0] * K for _ in range(T_text)]
     cursor = [0] * T_text
@@ -310,7 +318,13 @@ def _align_english(
         seen += 1
         if rng_.random() >= keep_prob:
             continue
-        ids = tokenizer_obj.encode_span("cmu", pwords[word_idx])
+
+        # Per-syllable ids — list of lists, one inner list per syllable.
+        syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
+        if not syll_groups:
+            continue
+
+        # Collect unique BPE tokens covering this word's char range, in order.
         token_set: list[int] = []
         already: set[int] = set()
         for ci in range(cs, ce):
@@ -322,8 +336,34 @@ def _align_english(
                     token_set.append(t)
         if not token_set:
             continue
-        if _write_unit_into_tokens(per_token, cursor, token_set, ids, K):
-            kept += 1
+
+        n_bpes = len(token_set)
+        n_sylls = len(syll_groups)
+        if n_bpes <= 1 or n_sylls <= 1:
+            # Single BPE OR single syllable — pack all ids into the first BPE.
+            flat = [i for grp in syll_groups for i in grp]
+            if _write_unit_into_tokens(per_token, cursor, token_set, flat, K):
+                kept += 1
+        else:
+            # Multi-BPE multi-syllable: assign syllable groups to BPEs in order.
+            # Each BPE gets ceil(n_sylls / n_bpes) syllables (last BPE may
+            # get fewer). Each BPE's slot block holds only ITS portion of
+            # the word's phonemes — no broadcast.
+            base = n_sylls // n_bpes
+            extra = n_sylls % n_bpes
+            wrote_any = False
+            cursor_idx = 0
+            for bi, bpe_token in enumerate(token_set):
+                take = base + (1 if bi < extra else 0)
+                if take == 0:
+                    continue
+                group = syll_groups[cursor_idx : cursor_idx + take]
+                cursor_idx += take
+                flat = [i for grp in group for i in grp]
+                if _write_unit_into_tokens(per_token, cursor, [bpe_token], flat, K):
+                    wrote_any = True
+            if wrote_any:
+                kept += 1
     return per_token, kept, seen
 
 

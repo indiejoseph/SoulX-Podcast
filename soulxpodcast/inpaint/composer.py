@@ -175,9 +175,13 @@ class PhonemeComposer(nn.Module):
         ids = phone_token.view(B, L, self.K)               # (B, L, K)
         slot_emb = self.phone_emb(ids)                     # (B, L, K, d)
 
-        # Pad rows (id=0) already produce zero embeddings via padding_idx=0,
-        # so empty slots contribute nothing to the concat — no mask needed
-        # on the embeddings themselves.
+        # Pad rows (id=0) produce zero embeddings via padding_idx=0, so
+        # empty slots contribute nothing to the concat — no extra mask
+        # needed on the embeddings themselves. Consonant vs vowel
+        # information is already implicit in the embedding because
+        # vowel / consonant ids live in disjoint global id ranges (see
+        # `_vocab.py`); the MLP learns the C/V distinction from the
+        # embedding's location in vector space.
         cat = slot_emb.reshape(B, L, self.K * self.d_model)  # (B, L, K*d)
 
         composed = self.composer(cat)                       # (B, L, d)

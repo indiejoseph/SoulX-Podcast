@@ -102,6 +102,17 @@ def _cmu_id_for(phoneme: str, role: str) -> int:
     raise ValueError(f"unknown role {role!r} for consonant {phoneme!r}")
 
 
+def encode_arpabet_per_syllable(phonemes: list[str]) -> list[list[int]]:
+    """Syllabify and emit one position-tagged id list PER SYLLABLE.
+
+    Used by the dataset aligner to distribute syllable groups across the
+    BPE tokens of a multi-BPE English word — rather than cramming the
+    whole word's ids into a single BPE's slot block.
+    """
+    sylls = syllabify_arpabet(phonemes)
+    return [[_cmu_id_for(ph, role) for (ph, role) in s] for s in sylls]
+
+
 def encode_arpabet_word(phonemes: list[str]) -> list[int]:
     """Syllabify one English word's phoneme stream and return position-tagged ids.
 
