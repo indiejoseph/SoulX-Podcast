@@ -1,0 +1,76 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=5:00:00
+#PJM -j
+
+# Pronunciation-inpaint composer — V3, from-scratch with language
+# rebalancing baked in from step 0.
+#
+# Lessons from v1 (30K, uniform sampling) and v2 (10K continuation,
+# sqrt rebalance):
+#
+#   v1: yue ✓ / en-correct-phoneme ✓ / zh inpaint silent / en baseline
+#       broken (HK-LoRA backbone limitation, unrelated to inpaint).
+#   v2: substantial MLP rewrite (60-85%) but zh inpaint STILL silent —
+#       the optimiser found a path that preserved yue and kept the
+#       silent-Pinyin solution. Suggests resume from a yue-dominated
+#       checkpoint is the wrong starting point; the composer needs to
+#       see zh+en gradient signal from random init to learn proper
+#       Pinyin/ARPAbet representations.
+#
+# V3 = clean restart with `--lang_balance sqrt` from step 0:
+#   * per-language expected draws (358K corpus): en~115K / zh~43K / yue~201K
+#     vs v1's natural 85K / 12K / 261K.
+#   * zh sees ~4x its natural rate, en ~1.7x. Mild enough to not
+#     overfit on the 11K zh rows over a full 30K-step run (each zh row
+#     seen ~12x at eff_batch=32).
+#   * Composer learns Pinyin from random init alongside yue/en — no
+#     local-minimum trap.
+#
+# Sizing: same v1 footprint — ~3.5 h wall on H100 at the prior pace.
+# Leaving 5h elapse for safety.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v3_balanced \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --aux_weight 0.3 \
+    --label_smoothing 0.1 \
+    --slots_per_token 8 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_run_name inpaint-h100-v3-balanced
