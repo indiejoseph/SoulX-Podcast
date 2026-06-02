@@ -1,0 +1,86 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=5:00:00
+#PJM -j
+
+# Pronunciation-inpaint composer — V4, concat+linear composer (matches
+# upstream CosyVoice-Inpaint architecture) + from-scratch + sqrt rebalance.
+#
+# Architectural change from v1/v2/v3 (which used mean-pool composition):
+#
+#   OLD (v1/v2/v3):  pooled = mean(slot_emb)  # symmetric, role-blind
+#                    composed = MLP(pooled)
+#
+#   NEW (v4):        cat = concat(slot_emb, dim=-1)  # POSITION PRESERVED
+#                    composed = Linear(K*d → d)(cat) → GELU → Linear(d → d)
+#
+# Each slot index ``k`` in [0..K-1] now feeds the same dedicated weight
+# block of the first linear. The MLP learns slot-role-specific feature
+# transformations (slot 0 = initial-position for CJK / first-ARPAbet for
+# English; slot 1 = final-position / second-ARPAbet; etc.).
+#
+# Why: v1/v2/v3 all failed for Mandarin inpaint (silent output) — root
+# cause was the mean-pool's commutativity destroying the (initial, final)
+# distinction. Cantonese had enough data (261K rows) for phone_emb rows
+# to separate naturally and survive mean-pool; Mandarin (11.7K rows)
+# didn't, so the composer collapsed to silent-token attractors on rare
+# (initial, final) combinations. concat+linear is robust to data
+# sparsity because each slot has dedicated weights regardless of how
+# many syllables in that role were seen during training.
+#
+# Reference: CosyVoice-Inpaint pron_inpaint/modeling.py::compose_phoneme
+# (the working open-source implementation we're aligning with).
+#
+# Composer param count:
+#   v1-v3 (mean-pool):   9.58 M
+#   v4    (concat+lin):  38.94 M  (+29M in the first Linear(K*d → d))
+#
+# Still tiny vs the 1.7B backbone; same training cost per step.
+#
+# Other hyperparams unchanged from v3: lr=5e-4, 30K steps, warmup=500,
+# B=16x2, sdpa, no grad-ckpt, lang_balance=sqrt.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v4_concat \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --aux_weight 0.3 \
+    --label_smoothing 0.1 \
+    --slots_per_token 8 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_run_name inpaint-h100-v4-concat

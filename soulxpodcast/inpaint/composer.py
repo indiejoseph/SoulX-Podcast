@@ -6,16 +6,29 @@ embedding at the corresponding position. The LLM backbone stays
 frozen during training; only this module's parameters receive
 gradients (see ``.claude/skills/cosyvoice-inpaint/SKILL.md`` §2).
 
-Slot layout, identical to the upstream CosyVoice-Inpaint convention
-but with ``K`` slots per text token instead of upstream's fixed 4
-``[onset, nucleus, coda, tone]``:
+Slot layout, K=8 per text token:
 
     phone_token: LongTensor (B, K * L)
                   per-text-token block: [slot_0, slot_1, ..., slot_{K-1}]
                   id 0 means "no phoneme at this slot"
 
-Composition is mean-pool over non-pad slots → 2-layer MLP, matching
-the design notes in ``references/soulx-adaptation.md`` §4.
+Composition: **concat + linear** (matches the upstream CosyVoice-Inpaint
+``concat_linear`` mode at
+``third_party/CosyVoice-Inpaint/pron_inpaint/modeling.py::compose_phoneme``).
+Each slot index ``i ∈ [0..K-1]`` always feeds the same dedicated weight
+block of the first ``Linear(K*d → d)`` layer, so the MLP can learn
+slot-specific feature transformations (e.g., slot 0 = initial-position,
+slot 1 = final-position for Chinese; slot N = N-th ARPAbet position for
+English). This preserves slot identity by construction.
+
+We deliberately do NOT mean-pool the slots, because mean-pool is
+commutative — it destroys the (initial, final) vs (final, initial)
+distinction that the LLM needs to disambiguate phoneme content. With
+abundant data (Cantonese, 261K rows) the phone_emb rows separate enough
+that even mean-pool works; with sparse data (Mandarin, 11.7K rows) it
+collapses to silent-token attractors. The upstream ``concat_linear``
+approach is robust to data sparsity because each slot has dedicated
+weights regardless of how many syllables in that role were seen.
 
 Auxiliary head: a 3-way linear classifier on the composed embedding
 predicting the alphabet (cmu / jyutping / pinyin). Used only by the
@@ -78,6 +91,12 @@ def _build_id_to_alphabet_label() -> Tensor:
 class PhonemeComposer(nn.Module):
     """Composes per-text-token phoneme slots into a single d_model embedding.
 
+    Architecture (matches upstream CosyVoice-Inpaint ``concat_linear``):
+
+      slot_emb[k] = phone_emb(ids[..., k])                # (B, L, K, d)
+      cat        = concat(slot_emb, dim=-1)               # (B, L, K*d) — POSITION PRESERVED
+      composed   = Linear(K*d → d)(cat) → GELU → Linear(d → d)
+
     Forward returns ``(composed, mask)`` where ``composed`` is shape
     ``(B, L, d_model)`` (zero at positions with no phoneme slot) and
     ``mask`` is a bool ``(B, L)`` that is True wherever the composed
@@ -91,8 +110,14 @@ class PhonemeComposer(nn.Module):
         self.vocab_size = TOTAL_VOCAB_SIZE
 
         self.phone_emb = nn.Embedding(TOTAL_VOCAB_SIZE, d_model, padding_idx=0)
+        # Concat + linear: each slot index always feeds the same weight block,
+        # so the MLP can learn slot-role-specific feature transformations.
+        # Linear(K*d → d) ≈ K separate Linear(d → d) heads that sum, but
+        # implemented as a single matmul. Each slot's weight block:
+        #   block_k = composer.0.weight[:, k*d : (k+1)*d]
+        # gets gradient signal whenever slot k is non-pad in any training example.
         self.composer = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(self.K * d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -126,7 +151,7 @@ class PhonemeComposer(nn.Module):
         self.phone_emb.weight.data[0].zero_()
 
     def forward(self, phone_token: Tensor) -> tuple[Tensor, Tensor]:
-        """Compose per-text-token phoneme embeddings.
+        """Compose per-text-token phoneme embeddings via concat + linear.
 
         Args:
             phone_token: LongTensor of shape ``(B, K * L)``.
@@ -137,7 +162,9 @@ class PhonemeComposer(nn.Module):
                       non-pad slot.
         """
         if phone_token.dim() != 2:
-            raise ValueError(f"phone_token must be 2-D (B, K*L); got shape {tuple(phone_token.shape)}")
+            raise ValueError(
+                f"phone_token must be 2-D (B, K*L); got shape {tuple(phone_token.shape)}"
+            )
         B, KL = phone_token.shape
         if KL % self.K != 0:
             raise ValueError(
@@ -145,16 +172,20 @@ class PhonemeComposer(nn.Module):
             )
         L = KL // self.K
 
-        ids = phone_token.view(B, L, self.K)
-        slot_emb = self.phone_emb(ids)  # (B, L, K, D)
-        slot_mask = ids != 0  # (B, L, K)
+        ids = phone_token.view(B, L, self.K)               # (B, L, K)
+        slot_emb = self.phone_emb(ids)                     # (B, L, K, d)
 
-        denom = slot_mask.sum(dim=-1, keepdim=True).clamp_min(1).to(slot_emb.dtype)
-        pooled = (slot_emb * slot_mask.unsqueeze(-1).to(slot_emb.dtype)).sum(dim=-2) / denom
+        # Pad rows (id=0) already produce zero embeddings via padding_idx=0,
+        # so empty slots contribute nothing to the concat — no mask needed
+        # on the embeddings themselves.
+        cat = slot_emb.reshape(B, L, self.K * self.d_model)  # (B, L, K*d)
 
-        composed = self.composer(pooled)  # (B, L, D)
-        position_mask = slot_mask.any(dim=-1)  # (B, L)
-        # zero positions that had no phoneme so callers can trust composed[~mask] == 0
+        composed = self.composer(cat)                       # (B, L, d)
+
+        # Position mask: True where this text token has at least one phoneme slot.
+        position_mask = (ids != 0).any(dim=-1)              # (B, L)
+        # Zero positions that had no phoneme so callers can trust
+        # ``composed[~mask] == 0`` for safe inject downstream.
         composed = composed * position_mask.unsqueeze(-1).to(composed.dtype)
         return composed, position_mask
 
