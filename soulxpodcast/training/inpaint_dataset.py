@@ -86,6 +86,59 @@ LANG_TO_ALPHABET = {"en": "cmu", "zh": "pinyin", "yue": "jyutping"}
 # (punctuation pass-through).
 NON_PHONEME_TOKENS = frozenset({".", ",", "!", "?", "|"})
 
+# Per-language speech-token IDs identified as "silence padding" via
+# audit of dataset position distributions. These are s3tokenizer
+# codebook entries that decode to flat / low-energy audio and are
+# heavily over-represented at the start/end of utterances in each
+# language's source recordings (most severely in zh AISHELL-3-style
+# studio takes).
+#
+# Stripping these from the leading and trailing runs of each row's
+# speech_tokens prevents the composer from learning the degenerate
+# "predict silence" strategy during training — which was the v4 zh
+# mode-collapse root cause.
+#
+# Derived from `tmp/dataset.jsonl` audit: top tokens appearing at row
+# position 0 or row position -1 with >5% frequency, plus the dominant
+# repeating-run tokens (4299/4218/6486).
+SILENCE_TOKEN_IDS: dict[str, frozenset[int]] = {
+    # Derived by scanning tmp/dataset.jsonl: tokens that appear in the
+    # first 10 or last 10 positions of rows in that language with
+    # boundary-share ≥0.1% AND ≥2× their global unigram frequency.
+    # Broad set deliberately included to capture variant silence/breath
+    # codes (zh in particular has ~66 silence-coding ids clustered
+    # around 3700-3900 for intake-breath and 4200-4300 for fade-out).
+    "zh": frozenset({
+        3969, 6402, 4227, 3972, 6405, 3975, 4105, 4106, 6159, 3729,
+        6162, 3732, 3863, 1944, 1947, 1950, 5919, 4131, 1701, 4134,
+        1704, 4137, 1707, 3888, 3891, 6324, 3892, 3894, 3895, 4024,
+        4025, 1594, 1595, 2109, 6078, 6079, 2112, 3648, 6082, 6081,
+        3651, 3781, 3782, 1734, 4296, 4299, 5835, 1869, 5838, 3704,
+        4308, 6486, 4056, 2025, 1514, 2028, 2031, 3700, 3701, 2037,
+        4215, 2040, 1785, 4218, 4212, 1788,
+    }),
+    # yue has minimal silence padding — just 4 tokens at ~1% each
+    "yue": frozenset({2031, 1950, 4218, 4137}),
+    # en (audiobook) silence vocabulary
+    "en": frozenset({
+        4218, 2031, 4299, 2112, 4137, 1950, 3648, 3651, 5838, 5835,
+        1707, 3975, 3894, 1788, 3645, 6405, 6486, 3732, 1704, 3891,
+        5919, 2922, 5109, 3888, 1461, 5832,
+    }),
+}
+
+
+def _trim_silence_run(speech_tokens: list[int], silence_set: frozenset[int]) -> list[int]:
+    """Strip leading and trailing runs of silence-codebook tokens."""
+    n = len(speech_tokens)
+    i = 0
+    while i < n and speech_tokens[i] in silence_set:
+        i += 1
+    j = n
+    while j > i and speech_tokens[j - 1] in silence_set:
+        j -= 1
+    return speech_tokens[i:j]
+
 
 @dataclass
 class InpaintDatasetConfig:
@@ -108,6 +161,13 @@ class InpaintDatasetConfig:
     # __getitem__ uses a fresh `random.random()` so dropout differs every
     # epoch and across DataLoader workers.
     deterministic_dropout: bool = False
+    # Strip leading/trailing runs of silence-coding s3tokenizer tokens
+    # (per ``SILENCE_TOKEN_IDS`` table). Prevents the composer from
+    # learning the degenerate "predict silence" strategy when training
+    # on languages whose source audio has heavy silence padding (zh
+    # AISHELL-3 style). On by default for v5+; set False to reproduce
+    # v1-v4 behaviour.
+    strip_silence_tokens: bool = True
 
 
 def _is_cjk(ch: str) -> bool:
@@ -414,6 +474,13 @@ class InpaintDataset(Dataset):
         text = normalise_text(row["text"], lang)
         phonemes: list[str] = row["phonemes"]
         speech_raw: list[int] = row["speech_tokens"]
+
+        # Strip leading/trailing silence tokens so the composer can't learn
+        # the degenerate "predict silence" shortcut (v4 zh mode-collapse cause).
+        if self.cfg.strip_silence_tokens:
+            silence_set = SILENCE_TOKEN_IDS.get(lang, frozenset())
+            if silence_set:
+                speech_raw = _trim_silence_run(speech_raw, silence_set)
 
         if not (self.cfg.min_speech_tokens <= len(speech_raw) <= self.cfg.max_speech_tokens):
             return None
