@@ -15,7 +15,7 @@ Composer checkpoint format (from :mod:`soulxpodcast.training.train_inpaint`):
     {
       "step":      int,
       "config":    {"d_model": int, "slots_per_token": int,
-                    "vocab_size": int, "aux_weight": float},
+                    "vocab_size": int},
       "composer":  state_dict,
       "optimizer": ...,
       "scheduler": ...,
@@ -121,7 +121,15 @@ class InpaintInferenceEngine:
         self.composer = PhonemeComposer(
             d_model=cfg["d_model"], slots_per_token=cfg["slots_per_token"]
         ).to(self.device, dtype=dtype)
-        self.composer.load_state_dict(ckpt["composer"])
+        # Non-strict load — older checkpoints (pre-v7) carry the removed
+        # alphabet_head and id_to_alphabet_label keys. We ignore them.
+        missing, unexpected = self.composer.load_state_dict(
+            ckpt["composer"], strict=False
+        )
+        for name, keys in (("missing", missing), ("unexpected", unexpected)):
+            if keys:
+                log.info(f"  {name} composer keys: "
+                         f"{len(keys)} — {keys[:6]}{'...' if len(keys) > 6 else ''}")
         self.composer.eval()
         self.K = cfg["slots_per_token"]
 

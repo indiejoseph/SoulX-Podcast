@@ -69,8 +69,7 @@ def parse_args():
     p.add_argument("--slots_per_token", type=int, default=8)
     p.add_argument("--steps", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--aux_weight", type=float, default=0.3)
-    p.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     p.add_argument("--seed", type=int, default=0)
@@ -196,7 +195,7 @@ def main():
     trajectory: list[dict[str, float]] = []
     csv_f = open(args.log_csv, "a") if args.log_csv else None
     if csv_f and csv_f.tell() == 0:
-        csv_f.write("step,loss,lm_loss,aux_loss,grad_norm,dt_ms\n")
+        csv_f.write("step,loss,lm_loss,grad_norm,dt_ms\n")
 
     for step in range(args.steps):
         t_step = time.perf_counter()
@@ -228,16 +227,7 @@ def main():
         ).view(B, Tm1)
         denom = shift_mask.sum().clamp_min(1)
         lm_loss = (ce * shift_mask).sum() / denom
-
-        alpha_labels = composer.alphabet_labels(phone_token)
-        alpha_logits = composer.alphabet_head(composed).float()
-        aux_loss = F.cross_entropy(
-            alpha_logits.reshape(-1, alpha_logits.size(-1)),
-            alpha_labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-        loss = lm_loss + args.aux_weight * aux_loss
+        loss = lm_loss
 
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -256,14 +246,13 @@ def main():
             "step": step,
             "loss": float(loss),
             "lm_loss": float(lm_loss),
-            "aux_loss": float(aux_loss),
             "grad_norm": composer_grad_norm,
             "dt_ms": dt,
         }
         trajectory.append(rec)
         if csv_f:
             csv_f.write(
-                f"{step},{rec['loss']:.6f},{rec['lm_loss']:.6f},{rec['aux_loss']:.6f},"
+                f"{step},{rec['loss']:.6f},{rec['lm_loss']:.6f},"
                 f"{rec['grad_norm']:.6f},{rec['dt_ms']:.1f}\n"
             )
 
@@ -274,7 +263,7 @@ def main():
         ):
             log.info(
                 f"step {step:4d}: loss={rec['loss']:7.4f}  lm={rec['lm_loss']:7.4f}  "
-                f"aux={rec['aux_loss']:7.4f}  |grad|={rec['grad_norm']:6.3f}  "
+                f"|grad|={rec['grad_norm']:6.3f}  "
                 f"dt={rec['dt_ms']:5.0f}ms"
             )
         assert torch.isfinite(loss), f"loss is not finite at step {step}: {loss}"

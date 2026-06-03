@@ -122,12 +122,6 @@ def test_composer() -> None:
     assert (merged[~mask] == fake_text_emb[~mask]).all()
     assert (merged[mask] == composed[mask]).all()
 
-    labels = composer.alphabet_labels(phone)
-    assert labels[0, 0].item() == 0  # cmu
-    assert labels[1, 2].item() == 2  # pinyin
-    assert (labels[0, 1:] == -100).all()
-    assert (labels[1, [0, 1, 3, 4]] == -100).all()
-
     fake_text_embedder = torch.nn.Embedding(1000, d_model)
     torch.nn.init.normal_(fake_text_embedder.weight, mean=0.5, std=0.01)
     composer.init_from_text_embed(fake_text_embedder)

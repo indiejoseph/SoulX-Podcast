@@ -30,10 +30,11 @@ collapses to silent-token attractors. The upstream ``concat_linear``
 approach is robust to data sparsity because each slot has dedicated
 weights regardless of how many syllables in that role were seen.
 
-Auxiliary head: a 3-way linear classifier on the composed embedding
-predicting the alphabet (cmu / jyutping / pinyin). Used only by the
-trainer to push alphabet signal into the composed embedding so it
-can't be recovered purely from neighbouring text context.
+Earlier versions (v1-v6) carried a 3-way auxiliary alphabet classifier
+head on the composed embedding. Removed in v7 — the loss was always
+~0 because phoneme ids live in disjoint per-alphabet ranges, so the
+alphabet is trivially decodable from the input id alone. The head was
+solving an already-solved problem and contributed no useful gradient.
 """
 
 from __future__ import annotations
@@ -41,51 +42,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from soulxpodcast.inpaint._vocab import (
-    CMU_BOUNDARY_ID,
-    CMU_CODA_BASE,
-    CMU_ONSET_BASE,
-    CMU_VOWEL_BASE,
-    JP_FINAL_BASE,
-    JP_INITIAL_BASE,
-    N_CMU_CODA,
-    N_CMU_ONSET,
-    N_CMU_VOWEL,
-    N_JP_FINAL,
-    N_JP_INITIAL,
-    N_PY_FINAL,
-    N_PY_INITIAL,
-    PY_FINAL_BASE,
-    PY_INITIAL_BASE,
-    TOTAL_VOCAB_SIZE,
-)
-
-NUM_ALPHABETS: int = 3  # cmu / jyutping / pinyin
-
-# Alphabet label ids used by the auxiliary classifier.
-ALPHABET_LABEL: dict[str, int] = {"cmu": 0, "jyutping": 1, "pinyin": 2}
-LABEL_TO_ALPHABET: dict[int, str] = {v: k for k, v in ALPHABET_LABEL.items()}
-
-
-def _build_id_to_alphabet_label() -> Tensor:
-    """Lookup: global phoneme id → alphabet label (or -100 for pad).
-
-    Used by the trainer to derive alphabet supervision labels per
-    inpainted position from the raw phoneme ids without having to
-    plumb a separate label tensor.
-    """
-    table = torch.full((TOTAL_VOCAB_SIZE,), -100, dtype=torch.long)
-    cmu = ALPHABET_LABEL["cmu"]
-    table[CMU_VOWEL_BASE : CMU_VOWEL_BASE + N_CMU_VOWEL] = cmu
-    table[CMU_ONSET_BASE : CMU_ONSET_BASE + N_CMU_ONSET] = cmu
-    table[CMU_CODA_BASE : CMU_CODA_BASE + N_CMU_CODA] = cmu
-    table[CMU_BOUNDARY_ID] = cmu
-    table[JP_INITIAL_BASE : JP_INITIAL_BASE + N_JP_INITIAL] = ALPHABET_LABEL["jyutping"]
-    table[JP_FINAL_BASE : JP_FINAL_BASE + N_JP_FINAL] = ALPHABET_LABEL["jyutping"]
-    table[PY_INITIAL_BASE : PY_INITIAL_BASE + N_PY_INITIAL] = ALPHABET_LABEL["pinyin"]
-    table[PY_FINAL_BASE : PY_FINAL_BASE + N_PY_FINAL] = ALPHABET_LABEL["pinyin"]
-    # index 0 (pad) stays at -100, which is `ignore_index` for cross_entropy.
-    return table
+from soulxpodcast.inpaint._vocab import TOTAL_VOCAB_SIZE
 
 
 class PhonemeComposer(nn.Module):
@@ -135,11 +92,6 @@ class PhonemeComposer(nn.Module):
         # construction or by `init_from_text_embed`) seeds gamma=1 /
         # beta=0 so step-0 behaviour is unchanged from a pre-LN model.
         self.output_norm = nn.LayerNorm(d_model)
-        self.alphabet_head = nn.Linear(d_model, NUM_ALPHABETS)
-
-        self.register_buffer(
-            "id_to_alphabet_label", _build_id_to_alphabet_label(), persistent=False
-        )
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -228,28 +180,6 @@ class PhonemeComposer(nn.Module):
         # for the inject step regardless of LN bias.
         composed = composed * position_mask.unsqueeze(-1).to(composed.dtype)
         return composed, position_mask
-
-    def alphabet_labels(self, phone_token: Tensor) -> Tensor:
-        """Per-text-token alphabet supervision derived from the first non-pad slot.
-
-        Returns LongTensor ``(B, L)`` with values in ``{0, 1, 2, -100}``
-        where -100 marks positions that have no phoneme (ignore in CE).
-        """
-        if phone_token.dim() != 2:
-            raise ValueError("phone_token must be 2-D (B, K*L)")
-        B, KL = phone_token.shape
-        L = KL // self.K
-        ids = phone_token.view(B, L, self.K)
-        labels = self.id_to_alphabet_label[ids]  # (B, L, K), -100 for pad
-        # take the first non-ignore label along the slot axis
-        is_valid = labels != -100
-        # argmax of bool gives index of first True (or 0 if all False)
-        first_valid = is_valid.float().argmax(dim=-1, keepdim=True)  # (B, L, 1)
-        gathered = labels.gather(-1, first_valid).squeeze(-1)  # (B, L)
-        # rows with no valid slot retain -100
-        has_any = is_valid.any(dim=-1)
-        gathered = torch.where(has_any, gathered, gathered.new_full(gathered.shape, -100))
-        return gathered
 
 
 def apply_phoneme_inpaint(text_emb: Tensor, composed: Tensor, mask: Tensor) -> Tensor:

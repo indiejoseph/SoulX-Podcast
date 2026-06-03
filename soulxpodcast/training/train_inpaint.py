@@ -10,9 +10,12 @@ reader recognises the pattern. Differences from the LoRA trainer:
 - The forward goes via ``inputs_embeds=`` instead of ``input_ids=`` so
   the composer's output can replace the LLM's embedding at phoneme
   positions (``apply_phoneme_inpaint``).
-- Speech-token CE on the LLM logits + an auxiliary 3-way alphabet CE on
-  the composed embedding (forces phoneme-class signal to live in the
-  composer, not in neighbouring text context).
+- Speech-token CE on the LLM logits. v7 masks silence-target positions
+  out of the supervised loss via a precomputed LUT so the composer is
+  never rewarded for predicting silence (root cause of v4-v6 zh mode
+  collapse). The aux 3-way alphabet head used in v1-v6 was removed —
+  its loss was always ~0 (alphabet is trivially decodable from the
+  disjoint per-alphabet vocab ranges).
 - Phoneme dropout is **unit-level** (one CJK character or one English
   word) with default ``phoneme_keep_prob=0.25`` — mirrors the upstream
   CosyVoice-Inpaint recipe and matches the sparse inference distribution.
@@ -34,7 +37,7 @@ Usage (overnight run on a single 3090, ~1 epoch on the full corpus)::
         --batch_size 4 --grad_accum_steps 2 \\
         --max_steps 50000 --eval_every 1000 --save_every 2000 \\
         --lr 5e-4 --warmup_steps 500 \\
-        --phoneme_keep_prob 0.25 --aux_weight 0.3
+        --phoneme_keep_prob 0.25
 """
 
 from __future__ import annotations
@@ -95,7 +98,6 @@ class TrainConfig:
     seed: int = 42
     # Composer
     slots_per_token: int = 8
-    aux_weight: float = 0.3
     # Default 0.0 from v7: on a 160K-vocab LLM, label_smoothing=0.1 adds
     # ~1.5 nats of irreducible CE floor that makes train loss numbers
     # un-interpretable. Composer already has phoneme-dropout + weight
@@ -168,7 +170,6 @@ def parse_args() -> TrainConfig:
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--slots_per_token", type=int, default=8)
-    p.add_argument("--aux_weight", type=float, default=0.3)
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--no_init_from_text_embed", action="store_true")
     p.add_argument("--resume_composer", type=str, default="",
@@ -250,7 +251,6 @@ def forward_step(
     composer: PhonemeComposer,
     batch: dict,
     dtype: torch.dtype,
-    aux_weight: float,
     label_smoothing: float,
     silence_lut: Optional[torch.Tensor] = None,
 ):
@@ -300,18 +300,7 @@ def forward_step(
     denom = shift_mask.sum().clamp_min(1)
     lm_loss = (ce * shift_mask).sum() / denom
 
-    aux_loss = torch.zeros((), device=device, dtype=torch.float32)
-    if phone_mask.any():
-        alpha_labels = composer.alphabet_labels(phone_token)
-        alpha_logits = composer.alphabet_head(composed).float()
-        aux_loss = F.cross_entropy(
-            alpha_logits.reshape(-1, alpha_logits.size(-1)),
-            alpha_labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-    loss = lm_loss + aux_weight * aux_loss
-    return loss, lm_loss.detach(), aux_loss.detach(), int(denom.item())
+    return lm_loss, lm_loss.detach(), int(denom.item())
 
 
 # --------------------------------------------------------------------- #
@@ -325,7 +314,6 @@ def evaluate(
     eval_loader: DataLoader,
     eval_loader_full: DataLoader,
     dtype: torch.dtype,
-    aux_weight: float,
     silence_lut: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
     """Compute eval lm_loss at three phoneme regimes for trend tracking.
@@ -334,15 +322,14 @@ def evaluate(
       - ``eval/lm_loss_dropout``  : composer ON with same p_keep as train
       - ``eval/lm_loss_full``     : composer ON, all units kept (p_keep=1.0)
       - ``eval/lm_loss_text_only``: composer fully OFF (pure text baseline)
-      - ``eval/aux_loss``         : alphabet aux CE (under dropout)
 
     The ``silence_lut`` must match the one used in training (same v7
     silence-exclusion policy) so eval lm_loss is directly comparable to
     train lm_loss.
     """
     composer.eval()
-    sums = {"dropout": 0.0, "full": 0.0, "text_only": 0.0, "aux": 0.0}
-    n = {"dropout": 0, "full": 0, "text_only": 0, "aux": 0}
+    sums = {"dropout": 0.0, "full": 0.0, "text_only": 0.0}
+    n = {"dropout": 0, "full": 0, "text_only": 0}
 
     def _step(batch: dict, want_text_only: bool):
         device = next(composer.parameters()).device
@@ -381,31 +368,23 @@ def evaluate(
         results["inject"] = _lm(emb_inject)
         if want_text_only:
             results["text_only"] = _lm(text_emb)
-        if phone_mask.any():
-            alpha_labels = composer.alphabet_labels(phone_token)
-            alpha_logits = composer.alphabet_head(composed).float()
-            a = F.cross_entropy(
-                alpha_logits.reshape(-1, alpha_logits.size(-1)),
-                alpha_labels.reshape(-1),
-                ignore_index=-100,
-            )
-            results["aux"] = (float(a), int(phone_mask.sum()))
         return results
 
     # ---- dropout-regime + text-only baseline (same dataset, dropout=0.25) ----
     for batch in eval_loader:
+        if not batch:  # collate returns {} when every row in the micro-batch filtered out
+            continue
         out = _step(batch, want_text_only=True)
         ld, nd = out["inject"]
         sums["dropout"] += ld * nd; n["dropout"] += nd
         if "text_only" in out:
             lt, nt = out["text_only"]
             sums["text_only"] += lt * nt; n["text_only"] += nt
-        if "aux" in out:
-            la, na = out["aux"]
-            sums["aux"] += la * na; n["aux"] += na
 
     # ---- full-inject regime (same rows, but keep_prob=1.0) ----
     for batch in eval_loader_full:
+        if not batch:
+            continue
         out = _step(batch, want_text_only=False)
         lf, nf = out["inject"]
         sums["full"] += lf * nf; n["full"] += nf
@@ -416,7 +395,6 @@ def evaluate(
         ("dropout", "eval/lm_loss_dropout"),
         ("full", "eval/lm_loss_full"),
         ("text_only", "eval/lm_loss_text_only"),
-        ("aux", "eval/aux_loss"),
     ]:
         out[key] = sums[k] / max(1, n[k])
     out["eval/gap_vs_text"] = out["eval/lm_loss_dropout"] - out["eval/lm_loss_text_only"]
@@ -445,7 +423,6 @@ def save_checkpoint(
             "d_model": composer.d_model,
             "slots_per_token": composer.K,
             "vocab_size": composer.vocab_size,
-            "aux_weight": cfg.aux_weight,
         },
         "composer": composer.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -723,7 +700,6 @@ def train(cfg: TrainConfig):
     global_step = 0
     accum_loss = 0.0
     accum_lm = 0.0
-    accum_aux = 0.0
     accum_count = 0           # micro-batches since last optimizer step
     window_steps = 0          # gradient steps since last log
     tokens_since_log = 0
@@ -740,15 +716,14 @@ def train(cfg: TrainConfig):
         for batch in train_loader:
             if not batch:
                 continue
-            loss, lm_loss, aux_loss, n_loss_tokens = forward_step(
-                model, composer, batch, dtype, cfg.aux_weight, cfg.label_smoothing,
+            loss, lm_loss, n_loss_tokens = forward_step(
+                model, composer, batch, dtype, cfg.label_smoothing,
                 silence_lut=silence_lut,
             )
             loss = loss / cfg.grad_accum_steps
             loss.backward()
             accum_loss += float(loss)
             accum_lm += float(lm_loss) / cfg.grad_accum_steps
-            accum_aux += float(aux_loss) / cfg.grad_accum_steps
             accum_count += 1
             tokens_since_log += n_loss_tokens
             units_kept_since_log += batch.get("n_phonemes_kept", 0)
@@ -779,11 +754,10 @@ def train(cfg: TrainConfig):
                     n = max(1, window_steps)
                     mean_loss = accum_loss / n
                     mean_lm = accum_lm / n
-                    mean_aux = accum_aux / n
                     log.info(
                         f"step {global_step:6d}/{cfg.max_steps}  "
                         f"loss={mean_loss:.4f}  lm={mean_lm:.4f}  "
-                        f"aux={mean_aux:.4f}  |grad|={grad_norm:.3f}  "
+                        f"|grad|={grad_norm:.3f}  "
                         f"lr={lr_now:.2e}  keep={keep_frac:.2%}  "
                         f"loss_tok/s={tps:.0f}"
                     )
@@ -791,7 +765,6 @@ def train(cfg: TrainConfig):
                         "step": global_step,
                         "loss": mean_loss,
                         "lm_loss": mean_lm,
-                        "aux_loss": mean_aux,
                         "grad_norm": grad_norm,
                         "lr": lr_now,
                         "keep_frac": keep_frac,
@@ -802,13 +775,12 @@ def train(cfg: TrainConfig):
                         wandb_run.log({
                             "train/loss": row["loss"],
                             "train/lm_loss": row["lm_loss"],
-                            "train/aux_loss": row["aux_loss"],
                             "train/grad_norm": row["grad_norm"],
                             "train/lr": row["lr"],
                             "train/keep_frac": row["keep_frac"],
                             "train/loss_tok_per_s": row["loss_tok_per_s"],
                         }, step=global_step)
-                    accum_loss = 0.0; accum_lm = 0.0; accum_aux = 0.0
+                    accum_loss = 0.0; accum_lm = 0.0
                     window_steps = 0
                     tokens_since_log = 0
                     units_kept_since_log = 0; units_seen_since_log = 0
@@ -819,7 +791,7 @@ def train(cfg: TrainConfig):
                     t_eval = time.perf_counter()
                     metrics = evaluate(
                         model, composer, eval_loader, eval_loader_full,
-                        dtype, cfg.aux_weight,
+                        dtype,
                         silence_lut=silence_lut,
                     )
                     dt_eval = time.perf_counter() - t_eval
@@ -830,7 +802,6 @@ def train(cfg: TrainConfig):
                         f"full={metrics['eval/lm_loss_full']:.4f}  "
                         f"gap_vs_text={metrics['eval/gap_vs_text']:+.4f}  "
                         f"full_vs_text={metrics['eval/full_vs_text']:+.4f}  "
-                        f"aux={metrics['eval/aux_loss']:.4f}  "
                         f"({dt_eval:.1f}s)"
                     )
                     eval_log.write(json.dumps({"step": global_step, **metrics}) + "\n")
