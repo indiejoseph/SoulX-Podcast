@@ -128,6 +128,36 @@ SILENCE_TOKEN_IDS: dict[str, frozenset[int]] = {
 }
 
 
+def union_silence_s3_ids() -> frozenset[int]:
+    """Union of per-language silence-coding s3tokenizer ids across all langs.
+
+    Safe to use as a single LUT in loss masking: silence codes are
+    properties of the s3tokenizer codebook (silence/breath/pause units),
+    not of language. yue's silence set is a subset of zh's; en's
+    overlaps with both. Filtering against the union excludes silence
+    everywhere without language-aware per-row branching during training.
+    """
+    out: set[int] = set()
+    for s in SILENCE_TOKEN_IDS.values():
+        out.update(s)
+    return frozenset(out)
+
+
+def build_silence_id_lut(vocab_size: int, speech_token_offset: int) -> "torch.Tensor":
+    """Bool LUT over the full LLM vocab. True where the id corresponds to a
+    silence-coding s3 token (after the +offset shift into LLM-id space).
+
+    Use as: ``is_silence_target = silence_lut[shift_targets]``.
+    """
+    import torch  # local import keeps the dataset module torch-optional
+    lut = torch.zeros(vocab_size, dtype=torch.bool)
+    for s3 in union_silence_s3_ids():
+        llm_id = s3 + speech_token_offset
+        if 0 <= llm_id < vocab_size:
+            lut[llm_id] = True
+    return lut
+
+
 def _trim_silence_run(speech_tokens: list[int], silence_set: frozenset[int]) -> list[int]:
     """Strip leading and trailing runs of silence-codebook tokens."""
     n = len(speech_tokens)
@@ -168,6 +198,13 @@ class InpaintDatasetConfig:
     # AISHELL-3 style). On by default for v5+; set False to reproduce
     # v1-v4 behaviour.
     strip_silence_tokens: bool = True
+    # Remove ALL silence-coding tokens from `speech_tokens` (not just the
+    # leading/trailing runs). Default OFF as of v7 — the trainer's
+    # silence-masked CE loss handles silence at the supervision level,
+    # which is cheaper (no dataset shrinkage) and keeps the LLM's input
+    # distribution aligned with inference. Setting True is still
+    # supported for ablation runs that want to reproduce v6 behaviour.
+    remove_silence_tokens_inline: bool = False
 
 
 def _is_cjk(ch: str) -> bool:
@@ -475,12 +512,22 @@ class InpaintDataset(Dataset):
         phonemes: list[str] = row["phonemes"]
         speech_raw: list[int] = row["speech_tokens"]
 
-        # Strip leading/trailing silence tokens so the composer can't learn
-        # the degenerate "predict silence" shortcut (v4 zh mode-collapse cause).
-        if self.cfg.strip_silence_tokens:
-            silence_set = SILENCE_TOKEN_IDS.get(lang, frozenset())
-            if silence_set:
+        # Remove silence-coding tokens so the composer can't learn the
+        # degenerate "predict silence" shortcut (v4 zh mode-collapse cause).
+        # Two passes, both data-derived from `SILENCE_TOKEN_IDS`:
+        #   1. boundary strip — leading and trailing runs
+        #   2. inline filter   — every remaining silence-token position
+        # AISHELL-3-style zh data has silence tokens scattered through
+        # the interior of utterances (5-10% of all tokens), so a boundary
+        # strip alone leaves enough silence in the supervision signal for
+        # the composer to mode-collapse onto it (verified by the overfit
+        # A/B test in scripts/inpaint/overfit_zh.py).
+        silence_set = SILENCE_TOKEN_IDS.get(lang, frozenset())
+        if silence_set:
+            if self.cfg.strip_silence_tokens:
                 speech_raw = _trim_silence_run(speech_raw, silence_set)
+            if self.cfg.remove_silence_tokens_inline:
+                speech_raw = [t for t in speech_raw if t not in silence_set]
 
         if not (self.cfg.min_speech_tokens <= len(speech_raw) <= self.cfg.max_speech_tokens):
             return None

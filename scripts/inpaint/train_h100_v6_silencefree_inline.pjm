@@ -1,0 +1,85 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=5:00:00
+#PJM -j
+
+# Pronunciation-inpaint composer — V6, with full silence-token removal
+# (leading/trailing run + inline) in the training dataset.
+#
+# Architecture from v4 unchanged (concat+linear composer, per-syllable
+# English distribution). New in v6 vs v5:
+#   * v5 added boundary-only silence-strip (`strip_silence_tokens=True`)
+#   * v6 adds inline silence removal (`remove_silence_tokens_inline=True`)
+#
+# WHY: v5 boundary-only was validated as insufficient via the 3-way
+# overfit A/B on 8 zh rows (scripts/inpaint/overfit_zh.py):
+#
+#   (0) no silence handling     → 100% mode-collapse
+#   (1) boundary strip only     → 100% mode-collapse (just shifts which
+#                                  token wins)
+#   (2) boundary + inline       →  62% mode-collapse, 3/8 rows show
+#                                  proper diverse generation
+#                                  (top token at 3.7–9.1%, 30+ unique
+#                                  speech tokens per generation)
+#
+# AISHELL-3-style studio recordings have inhale/exhale + silence-coded
+# s3tokenizer ids scattered through the interior of every utterance,
+# not just at boundaries. Boundary-strip alone left the dominant zh
+# tokens (4299/4218/6486 and friends) accumulating ~5–10% of supervised
+# targets, which the composer mode-collapsed onto. Removing those
+# tokens inline forces the composer's supervised distribution to
+# exclude them entirely.
+#
+# Silence-token sets per language live in
+# soulxpodcast/training/inpaint_dataset.py::SILENCE_TOKEN_IDS,
+# derived from row-boundary frequency analysis (top tokens at positions
+# [:10] and [-10:] with >0.1% boundary share and >2× global enrichment).
+# The same set is used for both passes.
+#
+# All other hyperparams unchanged from v4/v5: lr=5e-4, 30K steps,
+# warmup=500, lang_balance=sqrt, B=16x2, sdpa, no grad-ckpt.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v6_silencefree_inline \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --aux_weight 0.3 \
+    --label_smoothing 0.1 \
+    --slots_per_token 8 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_run_name inpaint-h100-v6-silencefree-inline

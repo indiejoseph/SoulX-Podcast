@@ -121,6 +121,20 @@ class PhonemeComposer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
+        # Output LayerNorm — anchors the composed embedding's per-token
+        # mean/variance to the same statistical shape the LLM saw during
+        # pretraining at its embed_tokens output. Without it, the
+        # composer's two Linears are free to drift to arbitrary scale /
+        # mean across training, and the frozen LLM has to compensate
+        # via its block-0 input_layernorm. On zh — where the LLM's
+        # silence-prior basin is already close to the natural embedding
+        # manifold — even small drift can tip the LLM into that basin.
+        #
+        # `output_norm.affine` lets training re-shape the post-LN
+        # distribution if useful; `init_as_identity()` (called after
+        # construction or by `init_from_text_embed`) seeds gamma=1 /
+        # beta=0 so step-0 behaviour is unchanged from a pre-LN model.
+        self.output_norm = nn.LayerNorm(d_model)
         self.alphabet_head = nn.Linear(d_model, NUM_ALPHABETS)
 
         self.register_buffer(
@@ -141,6 +155,14 @@ class PhonemeComposer(nn.Module):
         (see CosyVoice-Inpaint ``pron_inpaint/modeling.py``): keeps the
         composed embeddings on the LLM's input-embedding manifold so the
         frozen transformer sees a sane vector from step 1.
+
+        Also calibrates ``output_norm`` so its post-LN output reproduces
+        the LLM's per-row embedding statistics (mean ≈ μ_emb, std ≈ σ_emb
+        per channel). Since the frozen LLM's first decoder block applies
+        its own ``input_layernorm`` over an unconditioned text-token
+        embedding with these stats, matching them at the inject site
+        keeps the conditional path on the same manifold as the
+        unconditional one.
         """
         if text_embed.embedding_dim != self.d_model:
             raise ValueError(
@@ -149,6 +171,16 @@ class PhonemeComposer(nn.Module):
         avg = text_embed.weight.mean(dim=0)
         self.phone_emb.weight.data[1:] += avg.to(self.phone_emb.weight.dtype).unsqueeze(0)
         self.phone_emb.weight.data[0].zero_()
+
+        # Per-channel target: gamma=σ_emb, beta=μ_emb so LN(composed)
+        # has the same per-channel distribution as a natural text-token
+        # embedding.  ``output_norm`` is LayerNorm with default
+        # ``elementwise_affine=True``; both weight and bias are
+        # trainable so the composer can still re-shape if helpful.
+        mu = text_embed.weight.mean(dim=0)  # (d,)
+        sigma = text_embed.weight.std(dim=0).clamp_min(1e-6)
+        self.output_norm.weight.data.copy_(sigma.to(self.output_norm.weight.dtype))
+        self.output_norm.bias.data.copy_(mu.to(self.output_norm.bias.dtype))
 
     def forward(self, phone_token: Tensor) -> tuple[Tensor, Tensor]:
         """Compose per-text-token phoneme embeddings via concat + linear.
@@ -185,11 +217,15 @@ class PhonemeComposer(nn.Module):
         cat = slot_emb.reshape(B, L, self.K * self.d_model)  # (B, L, K*d)
 
         composed = self.composer(cat)                       # (B, L, d)
+        composed = self.output_norm(composed)               # align to LLM embedding stats
 
         # Position mask: True where this text token has at least one phoneme slot.
         position_mask = (ids != 0).any(dim=-1)              # (B, L)
         # Zero positions that had no phoneme so callers can trust
         # ``composed[~mask] == 0`` for safe inject downstream.
+        # NOTE: zeroing happens AFTER the LayerNorm — the LN only sees
+        # genuine slot positions; zeroed positions remain exactly zero
+        # for the inject step regardless of LN bias.
         composed = composed * position_mask.unsqueeze(-1).to(composed.dtype)
         return composed, position_mask
 
