@@ -125,20 +125,15 @@ class TrainConfig:
     max_speech_tokens: int = 750
     eval_fraction: float = 0.01       # held-out fraction (capped at 2000 rows)
     eval_max_rows: int = 2000
-    # Silence-token handling. v5 added boundary-strip; v6 added inline
-    # removal; v7 moved the responsibility from the dataset to the loss
-    # via ``silence_mask_loss`` below — which is cheaper (no dataset
-    # shrinkage) and keeps the LLM input distribution aligned with
-    # inference. Defaults: boundary-strip ON, inline-removal OFF,
-    # loss-mask ON.
-    strip_silence_tokens: bool = True
+    # Silence-token workarounds (v5/v6/v7). All default OFF as of v9 —
+    # the correct fix is to filter silence-heavy rows out of the dataset
+    # up-front (scripts/inpaint/filter_dataset_silence.py) rather than
+    # patch the loss or per-row transform. Upstream CosyVoice-Inpaint
+    # uses plain CE on clean data; v9 reverts to that. Flags kept for
+    # ablation but should not be flipped on for clean-data runs.
+    strip_silence_tokens: bool = False
     remove_silence_tokens_inline: bool = False
-    # v7 silence-masked CE: exclude silence-target positions from the
-    # supervised CE so the composer is never rewarded for predicting
-    # silence (root cause of zh mode-collapse in v4-v6). Builds a single
-    # union LUT across all language silence sets — silence ids are
-    # language-agnostic codebook properties.
-    silence_mask_loss: bool = True
+    silence_mask_loss: bool = False
     # Memory / runtime
     gradient_checkpointing: bool = True
     attn_implementation: str = "flash_attention_2"  # "flash_attention_2" | "sdpa" | "eager"
@@ -184,18 +179,18 @@ def parse_args() -> TrainConfig:
     p.add_argument("--max_speech_tokens", type=int, default=750)
     p.add_argument("--eval_fraction", type=float, default=0.01)
     p.add_argument("--eval_max_rows", type=int, default=2000)
-    p.add_argument("--no_strip_silence_tokens", dest="strip_silence_tokens",
-                   action="store_false")
-    p.set_defaults(strip_silence_tokens=True)
+    p.add_argument("--strip_silence_tokens",
+                   dest="strip_silence_tokens", action="store_true",
+                   help="(legacy v5) boundary-strip silence tokens from each row.")
+    p.set_defaults(strip_silence_tokens=False)
     p.add_argument("--remove_silence_tokens_inline",
                    dest="remove_silence_tokens_inline", action="store_true",
                    help="(legacy v6) drop silence tokens from speech_tokens entirely.")
     p.set_defaults(remove_silence_tokens_inline=False)
-    p.add_argument("--no_silence_mask_loss",
-                   dest="silence_mask_loss", action="store_false",
-                   help="(ablation) supervise every speech position incl. silence; "
-                        "reproduces v4-v6 loss objective.")
-    p.set_defaults(silence_mask_loss=True)
+    p.add_argument("--silence_mask_loss",
+                   dest="silence_mask_loss", action="store_true",
+                   help="(legacy v7) exclude silence-target positions from CE.")
+    p.set_defaults(silence_mask_loss=False)
     p.add_argument("--no_gradient_checkpointing", action="store_true")
     p.add_argument("--attn_implementation", default="flash_attention_2",
                    choices=["flash_attention_2", "sdpa", "eager"])

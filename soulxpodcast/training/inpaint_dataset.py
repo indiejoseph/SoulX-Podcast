@@ -191,19 +191,12 @@ class InpaintDatasetConfig:
     # __getitem__ uses a fresh `random.random()` so dropout differs every
     # epoch and across DataLoader workers.
     deterministic_dropout: bool = False
-    # Strip leading/trailing runs of silence-coding s3tokenizer tokens
-    # (per ``SILENCE_TOKEN_IDS`` table). Prevents the composer from
-    # learning the degenerate "predict silence" strategy when training
-    # on languages whose source audio has heavy silence padding (zh
-    # AISHELL-3 style). On by default for v5+; set False to reproduce
-    # v1-v4 behaviour.
-    strip_silence_tokens: bool = True
-    # Remove ALL silence-coding tokens from `speech_tokens` (not just the
-    # leading/trailing runs). Default OFF as of v7 — the trainer's
-    # silence-masked CE loss handles silence at the supervision level,
-    # which is cheaper (no dataset shrinkage) and keeps the LLM's input
-    # distribution aligned with inference. Setting True is still
-    # supported for ablation runs that want to reproduce v6 behaviour.
+    # v5/v6 silence-token dataset-level workarounds. Both default OFF as
+    # of v9 — the correct fix is to filter the input dataset to remove
+    # silence-heavy rows up-front (see scripts/inpaint/filter_dataset_silence.py),
+    # not patch each row at __getitem__ time. The flags are kept for
+    # ablation but should not be needed for clean (filtered) data.
+    strip_silence_tokens: bool = False
     remove_silence_tokens_inline: bool = False
 
 
