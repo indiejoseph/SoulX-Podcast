@@ -1,0 +1,82 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=5:00:00
+#PJM -j
+
+# Pronunciation-inpaint composer — V10, filtered data + mean-pool composer.
+#
+# v9 = filtered AISHELL-3 (5,625 zh rows with <5% silence) + plain CE +
+#      concat+linear composer (38.9M params)
+# v10 = same data + same loss, mean-pool composer (9.6M params, -75%)
+#
+# Why mean-pool now: the concat+linear was added in v4 to "fix" zh
+# sparse-data mode-collapse. That was actually a data problem, fixed
+# in v9 via the filter. With the filter in place, mean-pool's
+# theoretical weakness (commutative, loses slot order) is irrelevant
+# because phoneme IDs in CMU / JP / PY ranges are already disjoint —
+# slot role is encoded in the ID, not the slot index.
+#
+# Smoke test (100 steps, zh-only filtered):
+#   v9  composer 38.9M  step 100 lm=4.82 gap=+0.45
+#   v10 composer  9.6M  step 100 lm=4.89 gap=+0.49
+# Essentially identical convergence rate; mean-pool gets there with
+# 25% the parameter budget. ~7K composer-params-per-zh-row → ~1.7K is
+# a much healthier ratio on the 5,625-row filtered slice.
+#
+# Backward compat: pre-v10 checkpoints have ``composer.0.weight``
+# shape (d, K*d); v10 needs (d, d). ``filter_compatible_state_dict``
+# drops the mismatched key on resume, so v8/v9 checkpoints warm-start
+# the phone_emb and the second Linear; the first Linear re-inits.
+#
+# All other hyperparams unchanged from v9: lr=5e-4, 30K steps,
+# warmup=500, lang_balance=sqrt, B=16x2, sdpa, no grad-ckpt,
+# label_smoothing=0.0, all silence flags off.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+# Generate dataset_filtered.jsonl on HPC if not already rsync'd:
+#   python scripts/inpaint/filter_dataset_silence.py \
+#     --input  /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset.jsonl \
+#     --output /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v10_filtered_meanpool \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --label_smoothing 0.0 \
+    --slots_per_token 8 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_run_name inpaint-h100-v10-filtered-meanpool

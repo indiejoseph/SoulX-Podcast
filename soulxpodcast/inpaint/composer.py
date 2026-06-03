@@ -48,11 +48,23 @@ from soulxpodcast.inpaint._vocab import TOTAL_VOCAB_SIZE
 class PhonemeComposer(nn.Module):
     """Composes per-text-token phoneme slots into a single d_model embedding.
 
-    Architecture (matches upstream CosyVoice-Inpaint ``concat_linear``):
+    Architecture (v10 — mean-pool + linear MLP):
 
       slot_emb[k] = phone_emb(ids[..., k])                # (B, L, K, d)
-      cat        = concat(slot_emb, dim=-1)               # (B, L, K*d) — POSITION PRESERVED
-      composed   = Linear(K*d → d)(cat) → GELU → Linear(d → d)
+      pooled     = mean(slot_emb over non-pad slots)      # (B, L, d)
+      composed   = Linear(d → d)(pooled) → GELU → Linear(d → d)
+
+    v1-v3 used mean-pool, v4-v9 used concat+linear (each slot fed a
+    dedicated weight block) on the theory that slot-order matters
+    (initial vs final). After the v9 dataset fix (filter zh AISHELL-3
+    silence-heavy rows) the original motivation for concat+linear
+    dissolves — phoneme IDs live in disjoint per-alphabet vocab ranges,
+    so slot role is already encoded in the ID. Mean-pool drops composer
+    params 38.9M → 9.6M (-75%), which is healthier on the small filtered
+    zh slice (5,625 rows).
+
+    The mean ignores pad slots (id=0): pad rows are zero by
+    ``padding_idx=0`` and the denominator counts non-pad slots only.
 
     Forward returns ``(composed, mask)`` where ``composed`` is shape
     ``(B, L, d_model)`` (zero at positions with no phoneme slot) and
@@ -67,14 +79,14 @@ class PhonemeComposer(nn.Module):
         self.vocab_size = TOTAL_VOCAB_SIZE
 
         self.phone_emb = nn.Embedding(TOTAL_VOCAB_SIZE, d_model, padding_idx=0)
-        # Concat + linear: each slot index always feeds the same weight block,
-        # so the MLP can learn slot-role-specific feature transformations.
-        # Linear(K*d → d) ≈ K separate Linear(d → d) heads that sum, but
-        # implemented as a single matmul. Each slot's weight block:
-        #   block_k = composer.0.weight[:, k*d : (k+1)*d]
-        # gets gradient signal whenever slot k is non-pad in any training example.
+        # Mean-pool composer: a single Linear(d → d) projects the
+        # pooled embedding. The per-slot role information is preserved
+        # by the phoneme vocab layout — IDs in CMU/JP/PY ranges are
+        # disjoint, so e.g. JP initial 'b' and JP final 'a1' embed to
+        # different rows and their mean is unique. Order info ("which
+        # slot was initial") is lost but redundant given the ID ranges.
         self.composer = nn.Sequential(
-            nn.Linear(self.K * d_model, d_model),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -115,7 +127,7 @@ class PhonemeComposer(nn.Module):
         self.phone_emb.weight.data[0].zero_()
 
     def forward(self, phone_token: Tensor) -> tuple[Tensor, Tensor]:
-        """Compose per-text-token phoneme embeddings via concat + linear.
+        """Compose per-text-token phoneme embeddings via mean-pool + linear.
 
         Args:
             phone_token: LongTensor of shape ``(B, K * L)``.
@@ -139,16 +151,15 @@ class PhonemeComposer(nn.Module):
         ids = phone_token.view(B, L, self.K)               # (B, L, K)
         slot_emb = self.phone_emb(ids)                     # (B, L, K, d)
 
-        # Pad rows (id=0) produce zero embeddings via padding_idx=0, so
-        # empty slots contribute nothing to the concat — no extra mask
-        # needed on the embeddings themselves. Consonant vs vowel
-        # information is already implicit in the embedding because
-        # vowel / consonant ids live in disjoint global id ranges (see
-        # `_vocab.py`); the MLP learns the C/V distinction from the
-        # embedding's location in vector space.
-        cat = slot_emb.reshape(B, L, self.K * self.d_model)  # (B, L, K*d)
+        # Mean-pool over the slot axis, ignoring pad slots (id=0).
+        # ``padding_idx=0`` makes pad rows exactly zero, so the sum
+        # naturally excludes them; we just need to divide by the
+        # non-pad count per position.
+        is_non_pad = (ids != 0).to(slot_emb.dtype)          # (B, L, K)
+        n_slots = is_non_pad.sum(dim=-1, keepdim=True).clamp_min(1)  # (B, L, 1)
+        pooled = slot_emb.sum(dim=2) / n_slots              # (B, L, d)
 
-        composed = self.composer(cat)                       # (B, L, d)
+        composed = self.composer(pooled)                    # (B, L, d)
 
         # Position mask: True where this text token has at least one phoneme slot.
         position_mask = (ids != 0).any(dim=-1)              # (B, L)
@@ -156,6 +167,30 @@ class PhonemeComposer(nn.Module):
         # ``composed[~mask] == 0`` for safe inject downstream.
         composed = composed * position_mask.unsqueeze(-1).to(composed.dtype)
         return composed, position_mask
+
+
+def filter_compatible_state_dict(
+    composer: PhonemeComposer, state_dict: dict
+) -> tuple[dict, list[str]]:
+    """Drop keys whose shape doesn't match the current composer module.
+
+    v10 changed the composer's first Linear from ``(K*d, d) → d`` to
+    ``(d, d) → d`` (mean-pool replaces concat). Any pre-v10 checkpoint
+    has ``composer.0.weight`` with shape ``(d, K*d)`` which won't load
+    into v10's ``(d, d)`` shape. We drop such keys here and let
+    ``load_state_dict(strict=False)`` use the random init for them.
+
+    Returns (filtered_state_dict, dropped_keys).
+    """
+    own = composer.state_dict()
+    filtered: dict = {}
+    dropped: list[str] = []
+    for k, v in state_dict.items():
+        if k in own and own[k].shape != v.shape:
+            dropped.append(f"{k} {tuple(v.shape)} → {tuple(own[k].shape)}")
+            continue
+        filtered[k] = v
+    return filtered, dropped
 
 
 def apply_phoneme_inpaint(text_emb: Tensor, composed: Tensor, mask: Tensor) -> Tensor:

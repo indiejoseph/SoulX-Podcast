@@ -62,6 +62,7 @@ from transformers import (
 )
 
 from soulxpodcast.inpaint import PhonemeComposer, apply_phoneme_inpaint
+from soulxpodcast.inpaint.composer import filter_compatible_state_dict
 from soulxpodcast.training.inpaint_dataset import (
     InpaintDataset,
     InpaintDatasetConfig,
@@ -620,11 +621,17 @@ def train(cfg: TrainConfig):
                 f"resume_composer slots_per_token={prior_cfg.get('slots_per_token')} != "
                 f"current {composer.K}"
             )
-        # Older checkpoints (pre-v6 LayerNorm) lack `output_norm.*` keys.
-        # Load non-strict; the new LN keeps its init_from_text_embed
-        # calibration (gamma=σ_emb, beta=μ_emb) so the resumed model
-        # starts with a sane LN even though it was never trained.
-        missing, unexpected = composer.load_state_dict(prior["composer"], strict=False)
+        # Resume across architecture revisions. Pre-v10 checkpoints have
+        # a (d, K*d) first-Linear; v10's first Linear is (d, d). Drop
+        # shape-mismatched keys before load; missing keys keep their
+        # fresh init (which is the intended v10 behaviour when resuming
+        # from an older arch — phone_emb still warm-starts, the MLP is
+        # re-initialised to the new shape).
+        sd, dropped_shape = filter_compatible_state_dict(composer, prior["composer"])
+        missing, unexpected = composer.load_state_dict(sd, strict=False)
+        if dropped_shape:
+            log.info(f"  resume: {len(dropped_shape)} shape-mismatched keys re-init'd: "
+                     f"{dropped_shape[:8]}{'...' if len(dropped_shape) > 8 else ''}")
         if missing:
             log.info(f"  resume: {len(missing)} missing keys (new module init kept): "
                      f"{missing[:8]}{'...' if len(missing) > 8 else ''}")
