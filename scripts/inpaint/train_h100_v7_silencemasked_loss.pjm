@@ -64,7 +64,7 @@ python -m soulxpodcast.training.train_inpaint \
     --lang_balance sqrt \
     --phoneme_keep_prob 0.25 \
     --aux_weight 0.3 \
-    --label_smoothing 0.1 \
+    --label_smoothing 0.0 \
     --slots_per_token 8 \
     \
     --max_total_tokens 2048 \

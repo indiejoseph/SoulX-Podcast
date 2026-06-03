@@ -96,7 +96,12 @@ class TrainConfig:
     # Composer
     slots_per_token: int = 8
     aux_weight: float = 0.3
-    label_smoothing: float = 0.1
+    # Default 0.0 from v7: on a 160K-vocab LLM, label_smoothing=0.1 adds
+    # ~1.5 nats of irreducible CE floor that makes train loss numbers
+    # un-interpretable. Composer already has phoneme-dropout + weight
+    # decay + grad clip + output LN — extra smoothing is redundant
+    # regularization. Set >0 only when needed.
+    label_smoothing: float = 0.0
     init_from_text_embed: bool = True
     # Resume a prior composer (loads composer weights only — NOT optimizer
     # / scheduler / step count). Use for "continuation fine-tuning" on a
@@ -164,7 +169,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--slots_per_token", type=int, default=8)
     p.add_argument("--aux_weight", type=float, default=0.3)
-    p.add_argument("--label_smoothing", type=float, default=0.1)
+    p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--no_init_from_text_embed", action="store_true")
     p.add_argument("--resume_composer", type=str, default="",
                    help="Path to a prior composer.pt to warm-start from "
