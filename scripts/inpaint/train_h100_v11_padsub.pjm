@@ -1,0 +1,84 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=8:00:00
+#PJM -j
+
+# v11 — pad-substitution alignment + per-alphabet composer heads.
+#
+# Spec: docs/inpaint_v11_spec.md
+# Gate: scripts/inpaint/test_alignment_{parity,behavioral}.py
+#
+# Key differences from v10 (mean-pool, broadcast alignment):
+#   * Alignment: pad-token substitution at training AND inference. For each
+#     marked CJK char (zh/yue) or word (en), splice ONE pad token after the
+#     covering BPE; composer fires at that pad. Eliminates v10's broadcast
+#     stutter on byte-fallback CJK chars (佢, 哋 → 2 BPEs) and mean-pool
+#     collapse on 1-BPE multi-syllable words (银行, 中国).
+#   * Composer: two heads sharing phone_emb.
+#       head_cn  (Linear 2d→d→d) for jyutping AND pinyin (K_active=2)
+#       head_cmu (Linear 6d→d→d) for English (K_active=6)
+#     ~41M trainable params (~4× v10's 9.6M).
+#   * Storage K = 6 (was 8). slots_per_token must match composer K_STORAGE.
+#   * Strict checkpoint loading — no resume from v10 (arch incompatible).
+#
+# Pre-flight on 3090 (smoke):
+#   python -m soulxpodcast.training.train_inpaint \
+#     --dataset_path  tmp/dataset_filtered.jsonl \
+#     --model_path    runs/merged \
+#     --output_dir    runs/inpaint_v11_smoke \
+#     --max_steps 1000 --batch_size 2 --slots_per_token 6
+#
+# Acceptance criteria after 30K steps: behavioral test ≥ 30/38 passes with
+# strictly no new FAIL vs v10's set
+# {yue_dei6_byte_fallback, zh_yinhang_merged, zh_zhongguo_merged,
+# zh_wo_singleton_baseline}.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+# Filter the corpus once; this command's output is reused across runs.
+#   python scripts/inpaint/filter_dataset_silence.py \
+#     --input  /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset.jsonl \
+#     --output /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v11_padsub \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --label_smoothing 0.0 \
+    --slots_per_token 6 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_project soulx-inpaint \
+    --wandb_run_name v11-padsub
