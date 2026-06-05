@@ -79,6 +79,11 @@ class Fixture:
                     False for fixtures whose LLM baseline is known unstable
                     (e.g. English under current SoulX checkpoints). Parity
                     test still runs; behavioral test is skipped.
+      enable_parity
+                    False for fixtures where training-side and inference-side
+                    intentionally produce different layouts (e.g. English,
+                    where ``train_phonemes`` annotates every word but the SSML
+                    only annotates one). Default True.
     """
 
     name: str
@@ -94,6 +99,7 @@ class Fixture:
     tok_ratio_band_correct: tuple[float, float]
     tok_ratio_band_wrong: tuple[float, float]
     enable_behavioral: bool = True
+    enable_parity: bool = True
 
 
 # -- Cantonese fixtures -------------------------------------------------- #
@@ -206,6 +212,11 @@ EN_BANANA_MULTIBPE = Fixture(
     tok_ratio_band_correct=(0.5, 2.0),
     tok_ratio_band_wrong=(0.5, 2.0),
     enable_behavioral=False,  # LLM baseline currently loops on en prompts
+    # Training-side annotates all 3 words from row['phonemes']; inference SSML
+    # annotates only BANANA. The two intentionally produce different layouts.
+    # Parity for en would require a row format where non-target words are
+    # absent — a v12 dataset shape, not v11.
+    enable_parity=False,
 )
 
 

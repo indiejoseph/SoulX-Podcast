@@ -1,16 +1,28 @@
-"""Phoneme embedding + composer module for pronunciation inpainting.
+"""Phoneme embedding + per-alphabet composer module for pronunciation inpainting.
 
 The composer takes a per-text-token slot buffer of phoneme ids and produces a
 ``d_model``-shaped embedding that replaces the LLM's text embedding at the
 corresponding position. The LLM backbone stays frozen during training; only
-this module's parameters receive gradients
-(see ``.claude/skills/cosyvoice-inpaint/SKILL.md`` §2).
+this module's parameters receive gradients.
 
-Slot layout, K=8 per text token::
+Slot layout (storage K = 6 for all alphabets, with per-alphabet active slots)::
 
     phone_token: LongTensor (B, K * L)
-                  per-text-token block: [slot_0, slot_1, ..., slot_{K-1}]
+                  per-text-token block: [slot_0, ..., slot_{K-1}]
                   id 0 means "no phoneme at this slot"
+
+  jyutping (alphabet 0): K_active = 2  → slots [initial, final-with-tone]
+  pinyin   (alphabet 1): K_active = 2  → slots [initial, final-with-tone]
+  cmu      (alphabet 2): K_active = 6  → slots [phone_0, ..., phone_5]
+
+Composition: concat the alphabet's active slots along the feature dim, then
+``Linear(K_active * d → d) → GELU → Linear(d → d)``. Two heads share the
+same ``phone_emb``: ``head_cn`` for K=2 Chinese (jyutping ∪ pinyin share
+the head — their phone-vocab id ranges are disjoint so the same Linear
+learns alphabet-specific patterns via embedding lookup), ``head_cmu`` for
+K=6 English.
+
+See ``docs/inpaint_v11_spec.md`` for the design rationale.
 """
 
 from __future__ import annotations
@@ -21,33 +33,72 @@ from torch import Tensor, nn
 from soulxpodcast.inpaint._vocab import TOTAL_VOCAB_SIZE
 
 
+# Alphabet id space — used by dataset and inference to tell the composer
+# which head to route a row through. Keep in sync with
+# `K_ACTIVE_PER_ALPHABET` below.
+ALPHABET_JYUTPING: int = 0
+ALPHABET_PINYIN: int = 1
+ALPHABET_CMU: int = 2
+
+# Mapping from the user-facing alphabet string (matches `LANG_TO_ALPHABET`
+# in `training.inpaint_dataset`) to the integer id the composer expects.
+ALPHABET_STR_TO_ID: dict[str, int] = {
+    "jyutping": ALPHABET_JYUTPING,
+    "pinyin": ALPHABET_PINYIN,
+    "cmu": ALPHABET_CMU,
+}
+
+# How many slots each alphabet actually fills. The remaining (K_STORAGE -
+# K_active) slots are always pad id 0. Storage K matches max active.
+K_ACTIVE_PER_ALPHABET: dict[int, int] = {
+    ALPHABET_JYUTPING: 2,
+    ALPHABET_PINYIN: 2,
+    ALPHABET_CMU: 6,
+}
+
+# Storage K — must be ≥ max(K_ACTIVE_PER_ALPHABET.values()).
+K_STORAGE: int = 6
+
+
 class PhonemeComposer(nn.Module):
-    """Composes per-text-token phoneme slots into a single d_model embedding.
-
-    Architecture: mean-pool over non-pad slots → 2-layer MLP::
-
-      slot_emb[k] = phone_emb(ids[..., k])                # (B, L, K, d)
-      pooled     = mean(slot_emb over non-pad slots)      # (B, L, d)
-      composed   = Linear(d → d)(pooled) → GELU → Linear(d → d)
-
-    Pad slots (id=0) are zero by ``padding_idx=0``; the denominator counts
-    non-pad slots only so empty positions don't divide by zero.
+    """Per-alphabet composer over a shared phoneme embedding table.
 
     Forward returns ``(composed, mask)`` where ``composed`` has shape
     ``(B, L, d_model)`` (zero at positions with no phoneme slot) and
-    ``mask`` is a bool ``(B, L)`` True wherever ``composed`` should
-    replace the text embedding.
+    ``mask`` is a bool ``(B, L)`` True wherever ``composed`` should replace
+    the text embedding.
+
+    The two heads:
+      * ``head_cn``  — ``Linear(2*d → d) → GELU → Linear(d → d)``.
+        Handles jyutping (alphabet 0) AND pinyin (alphabet 1). Reads
+        slots [0, 1] (initial, final-with-tone); slots [2..5] are pad.
+      * ``head_cmu`` — ``Linear(6*d → d) → GELU → Linear(d → d)``.
+        Reads all 6 slots. Tone information is encoded by the vocab's
+        ``_on``/``_co`` consonant position tags, not a separate dim.
     """
 
-    def __init__(self, d_model: int, slots_per_token: int = 8):
+    K_STORAGE = K_STORAGE
+    K_ACTIVE_PER_ALPHABET = K_ACTIVE_PER_ALPHABET
+
+    def __init__(self, d_model: int, slots_per_token: int = K_STORAGE):
         super().__init__()
+        if slots_per_token != K_STORAGE:
+            raise ValueError(
+                f"slots_per_token must equal K_STORAGE={K_STORAGE} for v11; "
+                f"got {slots_per_token}"
+            )
         self.d_model = d_model
-        self.K = slots_per_token
+        self.K = K_STORAGE
         self.vocab_size = TOTAL_VOCAB_SIZE
 
         self.phone_emb = nn.Embedding(TOTAL_VOCAB_SIZE, d_model, padding_idx=0)
-        self.composer = nn.Sequential(
+        self.head_cn = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
             nn.Linear(d_model, d_model),
+        )
+        self.head_cmu = nn.Sequential(
+            nn.Linear(6 * d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
@@ -56,14 +107,13 @@ class PhonemeComposer(nn.Module):
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.phone_emb.weight, mean=0.0, std=0.02)
         with torch.no_grad():
-            self.phone_emb.weight[0].zero_()  # keep pad row at exactly zero
+            self.phone_emb.weight[0].zero_()  # keep pad row exactly zero
 
     @torch.no_grad()
     def init_from_text_embed(self, text_embed: nn.Embedding) -> None:
         """Shift non-pad phoneme rows toward the average text-embedding row.
 
-        Mirrors upstream CosyVoice-Inpaint's ``init_component_from_text_embed``:
-        keeps composed embeddings on the LLM's input-embedding manifold so
+        Keeps composed embeddings on the LLM's input-embedding manifold so
         the frozen backbone sees a sane vector from step 1.
         """
         if text_embed.embedding_dim != self.d_model:
@@ -74,16 +124,19 @@ class PhonemeComposer(nn.Module):
         self.phone_emb.weight.data[1:] += avg.to(self.phone_emb.weight.dtype).unsqueeze(0)
         self.phone_emb.weight.data[0].zero_()
 
-    def forward(self, phone_token: Tensor) -> tuple[Tensor, Tensor]:
-        """Compose per-text-token phoneme embeddings via mean-pool + linear.
+    def forward(
+        self, phone_token: Tensor, alphabet_id: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Compose per-text-token phoneme embeddings.
 
         Args:
-            phone_token: LongTensor of shape ``(B, K * L)``.
+            phone_token: LongTensor of shape ``(B, K_STORAGE * L)``.
+            alphabet_id: LongTensor of shape ``(B,)``, one of
+                ``{ALPHABET_JYUTPING, ALPHABET_PINYIN, ALPHABET_CMU}``.
 
         Returns:
-            composed: (B, L, d_model)
-            mask:     (B, L) bool, True at positions with at least one
-                      non-pad slot.
+            composed: (B, L, d_model). Zero at positions with no phoneme slot.
+            mask:     (B, L) bool, True where the composer fired.
         """
         if phone_token.dim() != 2:
             raise ValueError(
@@ -92,27 +145,37 @@ class PhonemeComposer(nn.Module):
         B, KL = phone_token.shape
         if KL % self.K != 0:
             raise ValueError(
-                f"phone_token width {KL} is not a multiple of slots_per_token={self.K}"
+                f"phone_token width {KL} is not a multiple of K_STORAGE={self.K}"
             )
         L = KL // self.K
 
-        ids = phone_token.view(B, L, self.K)               # (B, L, K)
-        slot_emb = self.phone_emb(ids)                     # (B, L, K, d)
+        if alphabet_id.dim() != 1 or alphabet_id.shape[0] != B:
+            raise ValueError(
+                f"alphabet_id must be shape (B={B},); got {tuple(alphabet_id.shape)}"
+            )
 
-        # Mean-pool over the slot axis, ignoring pad slots (id=0).
-        # ``padding_idx=0`` makes pad rows exactly zero, so the sum
-        # naturally excludes them; we just need to divide by the
-        # non-pad count per position.
-        is_non_pad = (ids != 0).to(slot_emb.dtype)          # (B, L, K)
-        n_slots = is_non_pad.sum(dim=-1, keepdim=True).clamp_min(1)  # (B, L, 1)
-        pooled = slot_emb.sum(dim=2) / n_slots              # (B, L, d)
+        ids = phone_token.view(B, L, self.K)           # (B, L, K, )
+        slot_emb = self.phone_emb(ids)                 # (B, L, K, d)
 
-        composed = self.composer(pooled)                    # (B, L, d)
+        # Position mask: True where ANY slot has a non-pad id.
+        position_mask = (ids != 0).any(dim=-1)         # (B, L)
 
-        # Position mask: True where this text token has at least one phoneme slot.
-        position_mask = (ids != 0).any(dim=-1)              # (B, L)
-        # Zero positions that had no phoneme so callers can trust
-        # ``composed[~mask] == 0`` for safe inject downstream.
+        # Route per row. We compute both heads on each row (cheap relative to
+        # the LLM forward) and then select via the alphabet routing mask. This
+        # keeps the code branchless on the GPU and avoids irregular indexing.
+        # For Chinese: slots [0, 1].
+        # For CMU:     slots [0, 1, 2, 3, 4, 5].
+        cn_in = slot_emb[:, :, :2, :].reshape(B, L, 2 * self.d_model)
+        cmu_in = slot_emb.reshape(B, L, self.K * self.d_model)
+
+        out_cn = self.head_cn(cn_in)
+        out_cmu = self.head_cmu(cmu_in)
+
+        # alphabet_id broadcasts to (B, 1, 1) for masking
+        is_cmu = (alphabet_id == ALPHABET_CMU).view(B, 1, 1).to(out_cmu.dtype)
+        composed = out_cmu * is_cmu + out_cn * (1.0 - is_cmu)
+
+        # Zero positions that had no phoneme.
         composed = composed * position_mask.unsqueeze(-1).to(composed.dtype)
         return composed, position_mask
 

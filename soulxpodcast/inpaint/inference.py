@@ -35,7 +35,10 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from soulxpodcast.inpaint.composer import PhonemeComposer, apply_phoneme_inpaint
+from soulxpodcast.inpaint.composer import (
+    PhonemeComposer, apply_phoneme_inpaint,
+    ALPHABET_STR_TO_ID, K_STORAGE,
+)
 from soulxpodcast.inpaint.ssml import PhonemeSpan, parse_ssml
 from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
 from soulxpodcast.training.inpaint_dataset import (
@@ -43,10 +46,9 @@ from soulxpodcast.training.inpaint_dataset import (
     LANG_TO_ALPHABET,
     NON_PHONEME_TOKENS,
     SPECIAL_TOKENS,
-    _align_chinese,
-    _align_english,
-    _is_cjk,
+    _block,
     _resolve_special_tokens,
+    _splice_pads,
     normalise_text,
 )
 
@@ -203,10 +205,14 @@ class InpaintInferenceEngine:
         attention_mask = torch.ones_like(input_ids)
         full_phone_token = full_phone_token.unsqueeze(0).to(self.device)
         full_phone_mask = full_phone_mask.unsqueeze(0).to(self.device)
+        alphabet = LANG_TO_ALPHABET[lang]
+        alphabet_id = torch.tensor(
+            [ALPHABET_STR_TO_ID[alphabet]], dtype=torch.long, device=self.device,
+        )
 
         # 4. Compute inputs_embeds with composer inject at masked positions.
         text_emb = self.model.get_input_embeddings()(input_ids).to(self.dtype)
-        composed, mask_check = self.composer(full_phone_token)
+        composed, mask_check = self.composer(full_phone_token, alphabet_id)
         # Sanity: mask derived from slots must match what we built.
         if not torch.equal(mask_check, full_phone_mask):
             log.warning(
@@ -273,114 +279,49 @@ class InpaintInferenceEngine:
         lang: str,
         disable_inpaint: bool,
     ) -> tuple[str, list[int], list[tuple[int, int]], torch.Tensor, torch.Tensor, int]:
-        """Re-uses the SAME alignment helpers as
-        :class:`soulxpodcast.training.inpaint_dataset.InpaintDataset` so train/
-        infer can never drift apart.
+        """Pad-substitution alignment matching the training dataset's
+        ``_align_padsub_*`` byte-for-byte (asserted by
+        ``scripts/inpaint/test_alignment_parity.py``).
+
+        Strategy:
+          1. Tokenize natural (unmarked) text + dialect prefix once.
+          2. For each SSML span, decide how many pad tokens to splice in and
+             what slot block each pad carries (one syllable per pad).
+          3. Splice the pads after the LAST BPE that covers the span's
+             trailing char position. Pad ``phone_mask`` is True; everything
+             else is False.
+
+        Returns surface_with_prefix, new text_ids (with pads), unused offsets
+        (``[]`` placeholder — caller doesn't read them), phone_token,
+        phone_mask, n_aligned.
         """
-        # Normalise (strip spaces for zh/yue).
+        from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
+
         surface_text = normalise_text(surface_text, lang)
         surface_with_prefix = prefix + surface_text
+        prefix_len = len(prefix)
 
         enc = self.tokenizer(
             surface_with_prefix, add_special_tokens=False, return_offsets_mapping=True
         )
-        text_ids = enc["input_ids"]
-        offsets = [tuple(o) for o in enc["offset_mapping"]]
+        base_text_ids: list[int] = enc["input_ids"]
+        base_offsets: list[tuple[int, int]] = [tuple(o) for o in enc["offset_mapping"]]
 
         K = self.K
-        T_text = len(text_ids)
-        phone_token = torch.zeros(K * T_text, dtype=torch.long)
-        phone_mask = torch.zeros(T_text, dtype=torch.bool)
-        n_aligned = 0
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        if pad_id is None:
+            raise RuntimeError("tokenizer has no pad/eos id for padsub")
 
         if disable_inpaint or not spans:
-            return surface_with_prefix, text_ids, offsets, phone_token, phone_mask, 0
+            phone_token = torch.zeros(K * len(base_text_ids), dtype=torch.long)
+            phone_mask = torch.zeros(len(base_text_ids), dtype=torch.bool)
+            return surface_with_prefix, base_text_ids, [], phone_token, phone_mask, 0
 
-        # Build the per-text-token alignment using the SAME helpers as the
-        # dataset, but restrict to span-covered char ranges so non-annotated
-        # words stay text-only (matches the inference-time sparse-annotation
-        # distribution we trained for).
-        alphabet = LANG_TO_ALPHABET[lang]
-        prefix_len = len(prefix)
-        # Reduce offsets to text-portion-relative (skip dialect prefix tokens).
-        text_part_offsets: list[tuple[int, int]] = []
-        text_part_token_index: list[int] = []
-        for ti, (cs, ce) in enumerate(offsets):
-            if ce <= prefix_len:
-                continue
-            adj = (max(0, cs - prefix_len), max(0, ce - prefix_len))
-            text_part_offsets.append(adj)
-            text_part_token_index.append(ti)
-
-        # For inference we want only the SSML-annotated spans, not the entire
-        # text. So we project each span's per-language phonemes onto a fresh
-        # alignment buffer.
-        per_token_text, kept = self._align_spans_to_tokens(
-            surface_text, text_part_offsets, spans, alphabet, K,
-        )
-        n_aligned = kept
-
-        for local_ti, global_ti in enumerate(text_part_token_index):
-            block = per_token_text[local_ti]
-            phone_token[global_ti * K : global_ti * K + K] = torch.tensor(
-                block, dtype=torch.long
-            )
-            if any(b != 0 for b in block):
-                phone_mask[global_ti] = True
-
-        return surface_with_prefix, text_ids, offsets, phone_token, phone_mask, n_aligned
-
-    def _align_spans_to_tokens(
-        self,
-        text: str,
-        text_offsets: list[tuple[int, int]],
-        spans: list[PhonemeSpan],
-        alphabet: str,
-        K: int,
-    ) -> tuple[list[list[int]], int]:
-        """Per-span placement, matching the dataset adapter's alignment rule.
-
-        - Chinese (jyutping / pinyin) spans: broadcast the span's (initial,
-          final) ids across every BPE token covering its char range. Matches
-          ``inpaint_dataset._align_chinese``.
-        - English (cmu) spans: SYLLABLE-DISTRIBUTE — for multi-BPE multi-
-          syllable words, syllable groups are spread across BPEs in order.
-          Matches ``inpaint_dataset._align_english`` which the composer
-          was trained on.
-        """
-        from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
-
-        T_text = len(text_offsets)
-        per_token = [[0] * K for _ in range(T_text)]
-        cursor = [0] * T_text
-
-        # char → list[bpe token index] (covers byte-fallback rare CJK chars).
-        max_char = max((ce for _, ce in text_offsets), default=0)
-        char_to_tokens: list[list[int]] = [[] for _ in range(max_char)]
-        for ti, (cs, ce) in enumerate(text_offsets):
-            for ci in range(cs, ce):
-                char_to_tokens[ci].append(ti)
-
-        kept = 0
+        inserts: list[tuple[int, list[list[int]]]] = []
+        n_aligned = 0
         for span in spans:
-            cs, ce = span.char_start, span.char_end
             ph_tokens = list(span.ph_tokens)
-
-            # Collect BPE tokens overlapping the span's char range.
-            token_set: list[int] = []
-            seen: set[int] = set()
-            for ci in range(cs, ce):
-                if ci >= len(char_to_tokens):
-                    continue
-                for t in char_to_tokens[ci]:
-                    if t not in seen:
-                        seen.add(t)
-                        token_set.append(t)
-            if not token_set:
-                continue
-
             if span.alphabet == "cmu":
-                # Per-syllable distribution across the span's BPE tokens.
                 try:
                     syll_groups = encode_arpabet_per_syllable(ph_tokens)
                 except ValueError as exc:
@@ -388,66 +329,61 @@ class InpaintInferenceEngine:
                     continue
                 if not syll_groups:
                     continue
-                n_bpes = len(token_set)
-                n_sylls = len(syll_groups)
-                if n_bpes <= 1 or n_sylls <= 1:
-                    flat = [i for grp in syll_groups for i in grp]
-                    if self._write_unit(per_token, cursor, token_set, flat, K):
-                        kept += 1
-                else:
-                    base = n_sylls // n_bpes
-                    extra = n_sylls % n_bpes
-                    wrote_any = False
-                    idx = 0
-                    for bi, bpe_token in enumerate(token_set):
-                        take = base + (1 if bi < extra else 0)
-                        if take == 0:
-                            continue
-                        group = syll_groups[idx : idx + take]
-                        idx += take
-                        flat = [i for grp in group for i in grp]
-                        if self._write_unit(per_token, cursor, [bpe_token], flat, K):
-                            wrote_any = True
-                    if wrote_any:
-                        kept += 1
+                # One pad per syllable, anchored at the span's trailing char
+                # (which routes to the word's last BPE via _splice_pads).
+                anchor = span.char_end - 1 + prefix_len
+                blocks = [list(g) for g in syll_groups]
             else:
-                # Chinese: broadcast (initial, final) across all BPE tokens
-                # covering the span — matches _align_chinese training behavior.
+                # Chinese: one (initial, final-with-tone) pair per syllable.
+                # ph_tokens alternates (initial, final, initial, final, ...).
+                if len(ph_tokens) % 2 != 0:
+                    log.warning(
+                        f"chinese span ph_tokens length {len(ph_tokens)} is odd; "
+                        f"expected (initial, final) pairs: {span}"
+                    )
+                    continue
+                # SSML contract change (v11): one syllable per <phoneme> span.
+                # Multi-syllable single-char wraps like
+                # `<phoneme ph="y in2 h ang2">银行</phoneme>` are rejected;
+                # the user must split into per-char spans.
+                if len(ph_tokens) // 2 != 1 and span.char_end - span.char_start == 1:
+                    raise ValueError(
+                        f"chinese <phoneme> span wraps a single char but carries "
+                        f"{len(ph_tokens) // 2} syllables. Split into one span "
+                        f"per character. Got: ph={ph_tokens!r} "
+                        f"char_range=[{span.char_start},{span.char_end})"
+                    )
                 try:
-                    ids = self.phone_tok.encode_span(span.alphabet, ph_tokens)
+                    flat_ids = self.phone_tok.encode_span(span.alphabet, ph_tokens)
                 except ValueError as exc:
                     log.warning(f"skipping unparseable span {span}: {exc}")
                     continue
-                if self._write_unit(per_token, cursor, token_set, ids, K):
-                    kept += 1
+                # Split flat_ids into (initial, final) pairs — one syllable each.
+                blocks = [list(flat_ids[2 * i : 2 * (i + 1)])
+                          for i in range(len(flat_ids) // 2)]
+                # Anchor each syllable at its corresponding char. If the span
+                # covers N chars and N == n_sylls, anchor each pair at one
+                # char in order; otherwise fall back to the trailing char.
+                n_sylls = len(blocks)
+                span_chars = span.char_end - span.char_start
+                if span_chars == n_sylls:
+                    # Per-char anchoring — one pad per char.
+                    for i, block in enumerate(blocks):
+                        anchor = span.char_start + i + prefix_len
+                        inserts.append((anchor, [block]))
+                    n_aligned += 1
+                    continue
+                anchor = span.char_end - 1 + prefix_len
+            inserts.append((anchor, blocks))
+            n_aligned += 1
 
-        return per_token, kept
+        new_text_ids, new_slots, new_mask = _splice_pads(
+            base_text_ids, base_offsets, inserts, pad_id, K
+        )
+        # Pack slots into the flat phone_token shape the composer expects.
+        phone_token = torch.zeros(K * len(new_text_ids), dtype=torch.long)
+        for i, block in enumerate(new_slots):
+            phone_token[i * K : (i + 1) * K] = torch.tensor(block, dtype=torch.long)
+        phone_mask = torch.tensor(new_mask, dtype=torch.bool)
 
-    @staticmethod
-    def _write_unit(
-        per_token: list[list[int]],
-        cursor: list[int],
-        token_indices: list[int],
-        ids: list[int],
-        K: int,
-    ) -> bool:
-        """Same broadcast writer used in inpaint_dataset._write_unit_into_tokens."""
-        if not token_indices:
-            return False
-        if any(cursor[t] != cursor[token_indices[0]] for t in token_indices):
-            target = token_indices[0]
-            free = K - cursor[target]
-            n = min(free, len(ids))
-            per_token[target][cursor[target] : cursor[target] + n] = ids[:n]
-            cursor[target] += n
-            return n > 0
-        cur = cursor[token_indices[0]]
-        free = K - cur
-        if free <= 0:
-            return False
-        n = min(free, len(ids))
-        head = ids[:n]
-        for t in token_indices:
-            per_token[t][cur : cur + n] = head
-            cursor[t] += n
-        return True
+        return surface_with_prefix, new_text_ids, [], phone_token, phone_mask, n_aligned

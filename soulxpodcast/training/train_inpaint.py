@@ -232,9 +232,10 @@ def forward_step(
     speech_mask = batch["speech_mask"].to(device, non_blocking=True)
     phone_token = batch["phone_token"].to(device, non_blocking=True)
     phone_mask = batch["phone_mask"].to(device, non_blocking=True)
+    alphabet_id = batch["alphabet_id"].to(device, non_blocking=True)
 
     text_emb = model.get_input_embeddings()(input_ids).to(dtype)
-    composed, _ = composer(phone_token)
+    composed, _ = composer(phone_token, alphabet_id)
     inputs_embeds = apply_phoneme_inpaint(text_emb, composed, phone_mask)
 
     out = model(
@@ -291,9 +292,10 @@ def evaluate(
         speech_mask = batch["speech_mask"].to(device, non_blocking=True)
         phone_token = batch["phone_token"].to(device, non_blocking=True)
         phone_mask = batch["phone_mask"].to(device, non_blocking=True)
+        alphabet_id = batch["alphabet_id"].to(device, non_blocking=True)
 
         text_emb = model.get_input_embeddings()(input_ids).to(dtype)
-        composed, _ = composer(phone_token)
+        composed, _ = composer(phone_token, alphabet_id)
         emb_inject = apply_phoneme_inpaint(text_emb, composed, phone_mask)
 
         def _lm(inputs_embeds):

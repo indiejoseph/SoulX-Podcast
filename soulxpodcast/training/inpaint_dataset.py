@@ -121,7 +121,8 @@ class InpaintDatasetConfig:
     max_total_tokens: int = 2048
     max_speech_tokens: int = 750
     min_speech_tokens: int = 8
-    slots_per_token: int = 8  # must match the composer
+    # Storage K — must equal PhonemeComposer.K_STORAGE (6 in v11).
+    slots_per_token: int = 6
     strict: bool = False  # if True, raise on alignment overflow; else drop
     # Unit-level random masking — mirrors CosyVoice-Inpaint upstream.
     # Each alignment unit (one CJK char or one English word) is *kept*
@@ -169,90 +170,101 @@ def _resolve_special_tokens(tokenizer) -> dict[str, int]:
     return out
 
 
-def _build_char_to_tokens(
-    text_offsets: list[tuple[int, int]],
-) -> list[list[int]]:
-    """Return char_index → list of text-token indices whose offsets cover it.
-
-    Used by the broadcast rule: a single char may be covered by N>=1 BPE
-    tokens (byte fallback), so every covering token receives the same
-    composed embedding.
-    """
-    max_char = max((ce for _, ce in text_offsets), default=0)
-    out: list[list[int]] = [[] for _ in range(max_char)]
-    for ti, (cs, ce) in enumerate(text_offsets):
-        for ci in range(cs, ce):
-            out[ci].append(ti)
-    return out
+def _block(ids: list[int], K: int) -> list[int]:
+    """Zero-pad an id list out to K slots."""
+    if len(ids) > K:
+        return list(ids[:K])
+    return list(ids) + [0] * (K - len(ids))
 
 
-def _write_unit_into_tokens(
-    per_token: list[list[int]],
-    cursor: list[int],
-    token_indices: list[int],
-    ids: list[int],
+def _splice_pads(
+    text_ids: list[int],
+    offsets: list[tuple[int, int]],
+    inserts: list[tuple[int, list[list[int]]]],
+    pad_id: int,
     K: int,
-) -> bool:
-    """Write the same `ids` into the slot blocks of all `token_indices`.
+) -> tuple[list[int], list[list[int]], list[bool]]:
+    """Insert pad tokens after the BPE positions covering each char.
 
-    Returns True on success, False if any of the tokens runs out of room
-    (mismatched cursor). On failure the partial writes are left in place;
-    the caller decides whether to roll the sample back.
+    Args:
+        text_ids: BPE ids of the natural (unmarked) text.
+        offsets: per-BPE (char_start, char_end) offsets, parallel to text_ids.
+        inserts: list of (char_pos, [K-block, K-block, ...]) — each entry
+            requests one pad token per K-block, inserted after the BPE that
+            covers ``char_pos``.
+        pad_id: tokenizer's pad token id (also acts as a marker the LLM
+            sees at composer-injected positions).
+        K: storage K (constant across alphabets).
+
+    Returns:
+        new_text_ids: text_ids with pads inserted.
+        new_slots: per-position K-slot block, parallel to new_text_ids.
+            Zero blocks at non-pad positions.
+        new_mask: per-position bool, True at pad positions only.
+
+    If a char appears as N consecutive byte-fallback BPEs (e.g. CJK chars
+    that tokenize to 2-3 byte tokens), the pad is appended after the LAST
+    of those BPEs. That keeps the composer's fire-position invariant to
+    the char's byte-length, which is what unblocks the "broadcast stutter"
+    on byte-fallback CJK.
     """
-    if not token_indices:
-        return False
-    # All target tokens must have the same number of free slots — otherwise
-    # the broadcast can't write identical blocks.
-    if any(cursor[t] != cursor[token_indices[0]] for t in token_indices):
-        # If callers previously wrote into one of these tokens but not the
-        # others (e.g. two chars share BPE A but only one shares BPE B),
-        # broadcast can't honour identical blocks. Fall back to a single
-        # write into the first token only.
-        target = token_indices[0]
-        free = K - cursor[target]
-        n_write = min(free, len(ids))
-        per_token[target][cursor[target] : cursor[target] + n_write] = ids[:n_write]
-        cursor[target] += n_write
-        return n_write > 0
+    # char_pos → index of the LAST BPE that covers it (largest-bi wins on tie)
+    char_to_last_bpe: dict[int, int] = {}
+    for bi, (cs, ce) in enumerate(offsets):
+        for cp in range(cs, ce):
+            char_to_last_bpe[cp] = bi
 
-    cur = cursor[token_indices[0]]
-    free = K - cur
-    if free <= 0:
-        return False
-    n_write = min(free, len(ids))
-    head = ids[:n_write]
-    for t in token_indices:
-        per_token[t][cur : cur + n_write] = head
-        cursor[t] += n_write
-    return True
+    # bpe_idx → list of K-blocks to insert immediately after that BPE
+    by_bpe: dict[int, list[list[int]]] = {}
+    for cp, blocks in inserts:
+        if cp not in char_to_last_bpe:
+            continue
+        bi = char_to_last_bpe[cp]
+        by_bpe.setdefault(bi, []).extend(blocks)
+
+    new_text_ids: list[int] = []
+    new_slots: list[list[int]] = []
+    new_mask: list[bool] = []
+    for bi, tid in enumerate(text_ids):
+        new_text_ids.append(tid)
+        new_slots.append([0] * K)
+        new_mask.append(False)
+        if bi in by_bpe:
+            for block in by_bpe[bi]:
+                new_text_ids.append(pad_id)
+                new_slots.append(_block(block, K))
+                new_mask.append(True)
+    return new_text_ids, new_slots, new_mask
 
 
-def _align_chinese(
+def _align_padsub_chinese(
     text: str,
     text_offsets: list[tuple[int, int]],
+    text_ids: list[int],
     phonemes: list[str],
     alphabet: str,
     tokenizer_obj: PhonemeTokenizer,
     K: int,
+    pad_id: int,
+    prefix_len: int = 0,
     keep_prob: float = 1.0,
     rng: Optional[random.Random] = None,
-) -> tuple[list[list[int]], int, int]:
-    """One syllable per CJK char; broadcast each pair to all BPE tokens covering that char.
+) -> tuple[list[int], list[list[int]], list[bool], int, int]:
+    """Pad-substitution alignment for jyutping / pinyin.
 
-    Returns ``(per_token_slots, n_units_kept, n_units_seen)``. With
-    ``keep_prob < 1`` each unit is independently kept with probability
-    ``keep_prob``; otherwise it's dropped (zeroed) — mimics the sparse-
-    annotation inference distribution.
+    For each CJK char in ``text``, with probability ``keep_prob``, append a
+    pad token after that char's last BPE position; write the syllable's
+    ``[initial, final-with-tone]`` ids into slots 0..1 of the pad's K-block.
+
+    Returns (new_text_ids, new_slots, new_mask, n_kept, n_seen). Lengths of
+    the first three are equal: prefix BPEs + text BPEs + N inserted pads.
     """
-    T_text = len(text_offsets)
-    per_token = [[0] * K for _ in range(T_text)]
-    cursor = [0] * T_text
-    char_to_tokens = _build_char_to_tokens(text_offsets)
-    queue = [p for p in phonemes if p and p not in NON_PHONEME_TOKENS]
     rng_ = rng or random
+    queue = [p for p in phonemes if p and p not in NON_PHONEME_TOKENS]
     qi = 0
-    kept = 0
-    seen = 0
+    n_kept = 0
+    n_seen = 0
+    inserts: list[tuple[int, list[list[int]]]] = []
     for ci, ch in enumerate(text):
         if qi >= len(queue):
             break
@@ -262,11 +274,8 @@ def _align_chinese(
         if not syl[-1].isdigit():
             qi += 1
             continue
-        seen += 1
+        n_seen += 1
         qi += 1
-        # Unit-level random drop — sparse-annotation training (auxiliary
-        # info: model must learn to use phonemes when present AND fall
-        # back to text when absent).
         if rng_.random() >= keep_prob:
             continue
         ini, fin = tokenizer_obj.split_whole_syllable(alphabet, syl)
@@ -274,46 +283,40 @@ def _align_chinese(
             ids = tokenizer_obj.encode_span(alphabet, [ini, fin])
         except ValueError:
             continue
-        toks = char_to_tokens[ci] if ci < len(char_to_tokens) else []
-        if not toks:
-            continue
-        if _write_unit_into_tokens(per_token, cursor, toks, ids, K):
-            kept += 1
-    return per_token, kept, seen
+        # char_pos is measured in the prefix+text string for offsets lookup
+        inserts.append((ci + prefix_len, [list(ids)]))
+        n_kept += 1
+    new_text_ids, new_slots, new_mask = _splice_pads(
+        text_ids, text_offsets, inserts, pad_id, K
+    )
+    return new_text_ids, new_slots, new_mask, n_kept, n_seen
 
 
-def _align_english(
+def _align_padsub_english(
     text: str,
     text_offsets: list[tuple[int, int]],
+    text_ids: list[int],
     phonemes: list[str],
     tokenizer_obj: PhonemeTokenizer,
     K: int,
+    pad_id: int,
+    prefix_len: int = 0,
     keep_prob: float = 1.0,
     rng: Optional[random.Random] = None,
-) -> tuple[list[list[int]], int, int]:
-    """One word = one unit. Each word's ARPAbet stream is syllabified and
-    position-tagged via ``PhonemeTokenizer``.
+) -> tuple[list[int], list[list[int]], list[bool], int, int]:
+    """Pad-substitution alignment for English (ARPAbet).
 
-    Multi-BPE words **distribute syllable groups across the word's BPE
-    tokens** instead of broadcasting the entire phoneme block into every
-    BPE — long words like "INTERNATIONAL" use multiple text time-space
-    positions, so the composer doesn't have to squeeze a 4-syllable
-    word into one BPE's K-slot block. Single-BPE words still pack all
-    syllables into one block.
+    For each word in ``text``, with probability ``keep_prob``, syllabify
+    the word's ARPAbet via ``encode_arpabet_per_syllable`` and append ONE
+    pad token per syllable after the word's last BPE. Each pad's K-block
+    holds the phone ids for its syllable (zero-padded out to K).
 
-    With ``keep_prob < 1`` each word is independently kept with
-    probability ``keep_prob`` (sparse-annotation training).
-    Returns ``(per_token_slots, n_words_kept, n_words_seen)``.
+    Returns (new_text_ids, new_slots, new_mask, n_kept, n_seen).
     """
     from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
 
-    T_text = len(text_offsets)
-    per_token = [[0] * K for _ in range(T_text)]
-    cursor = [0] * T_text
-    char_to_tokens = _build_char_to_tokens(text_offsets)
     rng_ = rng or random
 
-    # Split phonemes by '|' into per-word lists.
     pwords: list[list[str]] = [[]]
     for p in phonemes:
         if p == "|":
@@ -322,7 +325,6 @@ def _align_english(
             pwords[-1].append(p)
     pwords = [w for w in pwords if w]
 
-    # Find text words (runs of alpha + apostrophe).
     text_words: list[tuple[int, int]] = []
     in_word = False
     start = 0
@@ -338,61 +340,27 @@ def _align_english(
     if in_word:
         text_words.append((start, len(text)))
 
-    kept = 0
-    seen = 0
+    inserts: list[tuple[int, list[list[int]]]] = []
+    n_kept = 0
+    n_seen = 0
     for word_idx, (cs, ce) in enumerate(text_words):
         if word_idx >= len(pwords):
             break
-        seen += 1
+        n_seen += 1
         if rng_.random() >= keep_prob:
             continue
-
-        # Per-syllable ids — list of lists, one inner list per syllable.
         syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
         if not syll_groups:
             continue
-
-        # Collect unique BPE tokens covering this word's char range, in order.
-        token_set: list[int] = []
-        already: set[int] = set()
-        for ci in range(cs, ce):
-            if ci >= len(char_to_tokens):
-                continue
-            for t in char_to_tokens[ci]:
-                if t not in already:
-                    already.add(t)
-                    token_set.append(t)
-        if not token_set:
-            continue
-
-        n_bpes = len(token_set)
-        n_sylls = len(syll_groups)
-        if n_bpes <= 1 or n_sylls <= 1:
-            # Single BPE OR single syllable — pack all ids into the first BPE.
-            flat = [i for grp in syll_groups for i in grp]
-            if _write_unit_into_tokens(per_token, cursor, token_set, flat, K):
-                kept += 1
-        else:
-            # Multi-BPE multi-syllable: assign syllable groups to BPEs in order.
-            # Each BPE gets ceil(n_sylls / n_bpes) syllables (last BPE may
-            # get fewer). Each BPE's slot block holds only ITS portion of
-            # the word's phonemes — no broadcast.
-            base = n_sylls // n_bpes
-            extra = n_sylls % n_bpes
-            wrote_any = False
-            cursor_idx = 0
-            for bi, bpe_token in enumerate(token_set):
-                take = base + (1 if bi < extra else 0)
-                if take == 0:
-                    continue
-                group = syll_groups[cursor_idx : cursor_idx + take]
-                cursor_idx += take
-                flat = [i for grp in group for i in grp]
-                if _write_unit_into_tokens(per_token, cursor, [bpe_token], flat, K):
-                    wrote_any = True
-            if wrote_any:
-                kept += 1
-    return per_token, kept, seen
+        # Insert one pad per syllable after the last char of the word
+        # (which routes to the word's last BPE via _splice_pads).
+        last_char = ce - 1 + prefix_len
+        inserts.append((last_char, [list(g) for g in syll_groups]))
+        n_kept += 1
+    new_text_ids, new_slots, new_mask = _splice_pads(
+        text_ids, text_offsets, inserts, pad_id, K
+    )
+    return new_text_ids, new_slots, new_mask, n_kept, n_seen
 
 
 @dataclass
@@ -437,6 +405,8 @@ class InpaintDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> Optional[dict]:
+        from soulxpodcast.inpaint.composer import ALPHABET_STR_TO_ID
+
         row = self.rows[idx]
         lang = row["lang"]
         text = normalise_text(row["text"], lang)
@@ -446,32 +416,22 @@ class InpaintDataset(Dataset):
         if not (self.cfg.min_speech_tokens <= len(speech_raw) <= self.cfg.max_speech_tokens):
             return None
 
-        # Text → tokens with offsets.
+        # Tokenize natural text+prefix once. The alignment functions splice
+        # pad tokens into this base sequence at syllable-override points.
         prefix = DIALECT_PREFIX.get(lang, "")
         text_with_prefix = prefix + text
         enc = self.tokenizer(
             text_with_prefix, add_special_tokens=False, return_offsets_mapping=True
         )
-        text_ids: list[int] = enc["input_ids"]
-        offsets: list[tuple[int, int]] = [tuple(o) for o in enc["offset_mapping"]]
+        base_text_ids: list[int] = enc["input_ids"]
+        base_offsets: list[tuple[int, int]] = [tuple(o) for o in enc["offset_mapping"]]
 
-        # Phoneme alignment to the **text portion only** (relative offsets).
         K = self.cfg.slots_per_token
         alphabet = LANG_TO_ALPHABET[lang]
-        # Shift offsets so they index into ``text_with_prefix``; for alignment
-        # we treat the dialect-prefix tokens as having no phoneme. We use the
-        # raw text portion of the string (after the dialect prefix) for
-        # CJK/word checks — so subtract len(prefix) from offsets and skip
-        # tokens whose offsets fall inside the prefix.
         prefix_len = len(prefix)
-        text_part_offsets: list[tuple[int, int]] = []
-        text_part_token_index: list[int] = []  # index into text_ids
-        for ti, (cs, ce) in enumerate(offsets):
-            if ce <= prefix_len:
-                continue  # entirely inside the prefix
-            adj = (max(0, cs - prefix_len), max(0, ce - prefix_len))
-            text_part_offsets.append(adj)
-            text_part_token_index.append(ti)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        if pad_id is None:
+            raise RuntimeError("tokenizer has no pad/eos id for padsub")
 
         # Per-call RNG so DataLoader workers see different draws each step.
         # deterministic_dropout=True uses the row index as the seed for
@@ -483,26 +443,28 @@ class InpaintDataset(Dataset):
         keep_prob = self.cfg.phoneme_keep_prob
 
         if alphabet == "cmu":
-            per_token_text, kept, seen = _align_english(
-                text, text_part_offsets, phonemes, self.phone_tok, K,
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_padsub_english(
+                text, base_offsets, base_text_ids, phonemes, self.phone_tok, K,
+                pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,
             )
         else:
-            per_token_text, kept, seen = _align_chinese(
-                text, text_part_offsets, phonemes, alphabet, self.phone_tok, K,
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_padsub_chinese(
+                text, base_offsets, base_text_ids, phonemes, alphabet, self.phone_tok, K,
+                pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,
             )
 
-        # We keep the sample even when `kept == 0` so the LLM also trains on
-        # text-only inputs (composer is fully off for those). `seen == 0`
-        # means the row has no phoneme info at all — drop it.
+        # Drop rows that have no phoneme info at all. Rows where dropout
+        # produced kept==0 are kept (LLM also trains on text-only inputs
+        # so it has to fall back gracefully when the composer doesn't fire).
         if seen == 0:
             return None
 
         # Speech tokens with offset.
         speech_ids = [t + self.cfg.speech_token_offset for t in speech_raw]
 
-        # Assemble the full sequence.
+        # Assemble the full sequence: task prefix + (text BPEs + pads) + bridge + speech + EOS.
         task_prefix = [
             self.special["task_podcast"],
             self.special["speaker_0"],
@@ -521,18 +483,16 @@ class InpaintDataset(Dataset):
         speech_global_end = speech_global_start + len(speech_ids)
 
         phone_token = torch.zeros(K * T, dtype=torch.long)
-        # write per_token_text into the global buffer
-        for local_ti, global_ti in enumerate(text_part_token_index):
-            tgt = text_token_global_start + global_ti
-            slot_block = per_token_text[local_ti]
-            phone_token[tgt * K : tgt * K + K] = torch.tensor(slot_block, dtype=torch.long)
+        phone_mask = torch.zeros(T, dtype=torch.bool)
+        for local_ti, block in enumerate(text_slot_blocks):
+            gti = text_token_global_start + local_ti
+            phone_token[gti * K : gti * K + K] = torch.tensor(block, dtype=torch.long)
+        for local_ti, m in enumerate(text_phone_mask):
+            gti = text_token_global_start + local_ti
+            phone_mask[gti] = m
 
         speech_mask = torch.zeros(T, dtype=torch.long)
         speech_mask[speech_global_start : speech_global_end + 1] = 1  # include EOS
-
-        # phone_mask derived directly from any non-zero slot in each block
-        phone_mask_2d = phone_token.view(T, K) != 0
-        phone_mask = phone_mask_2d.any(dim=-1)
 
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -540,6 +500,7 @@ class InpaintDataset(Dataset):
             "speech_mask": speech_mask,
             "phone_token": phone_token,
             "phone_mask": phone_mask,
+            "alphabet_id": torch.tensor(ALPHABET_STR_TO_ID[alphabet], dtype=torch.long),
             "n_phonemes_kept": kept,
             "n_phonemes_seen": seen,
         }
@@ -559,6 +520,7 @@ def collate(batch: list[Optional[dict]], pad_token_id: int = 0) -> dict:
     speech_mask = torch.zeros((B, Tmax), dtype=torch.long)
     phone_token = torch.zeros((B, K * Tmax), dtype=torch.long)
     phone_mask = torch.zeros((B, Tmax), dtype=torch.bool)
+    alphabet_id = torch.zeros(B, dtype=torch.long)
 
     for i, b in enumerate(batch):
         T = b["input_ids"].numel()
@@ -567,6 +529,7 @@ def collate(batch: list[Optional[dict]], pad_token_id: int = 0) -> dict:
         speech_mask[i, :T] = b["speech_mask"]
         phone_token[i, : K * T] = b["phone_token"]
         phone_mask[i, :T] = b["phone_mask"]
+        alphabet_id[i] = b["alphabet_id"]
 
     return {
         "input_ids": input_ids,
@@ -574,6 +537,7 @@ def collate(batch: list[Optional[dict]], pad_token_id: int = 0) -> dict:
         "speech_mask": speech_mask,
         "phone_token": phone_token,
         "phone_mask": phone_mask,
+        "alphabet_id": alphabet_id,
         "n_phonemes_kept": sum(b["n_phonemes_kept"] for b in batch),
         "n_phonemes_seen": sum(b["n_phonemes_seen"] for b in batch),
     }

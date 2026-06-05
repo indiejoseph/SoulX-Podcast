@@ -41,17 +41,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from transformers import AutoTokenizer
 
 from scripts.inpaint.fixtures_adversarial import ALL_FIXTURES, Fixture, verify_bpe_assertions
+from soulxpodcast.inpaint.composer import K_STORAGE
 from soulxpodcast.inpaint.inference import InpaintInferenceEngine
 from soulxpodcast.inpaint.ssml import parse_ssml
 from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
 from soulxpodcast.training.inpaint_dataset import (
-    DIALECT_PREFIX, LANG_TO_ALPHABET, _align_chinese, _align_english,
+    DIALECT_PREFIX, LANG_TO_ALPHABET,
+    _align_padsub_chinese, _align_padsub_english,
     normalise_text,
 )
 
 
 MODEL_PATH = "/home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/runs/merged"
-SLOTS_PER_TOKEN = 8  # K — must match training cfg
+SLOTS_PER_TOKEN = K_STORAGE  # v11 = 6
 
 
 # ---------------------------------------------------------------- helpers
@@ -61,35 +63,24 @@ def _build_inference_side(
     tokenizer, phone_tok: PhonemeTokenizer, ssml: str, lang: str, K: int
 ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
     """Mirror InpaintInferenceEngine._build_text_and_phone_tokens *without*
-    loading the full engine (which would load 1.7B weights). Re-implements
-    the alignment logic inline by calling the same _align_spans_to_tokens
-    method we want to test.
+    loading the full engine (which would pull in 1.7B model weights).
+    Borrow only the alignment method from the engine class — it's pure on
+    `.K`, `.tokenizer`, `.phone_tok`.
     """
-    # We need a tiny stand-in for the engine that has `.K`, `.tokenizer`,
-    # `.phone_tok`, and the alignment methods on InpaintInferenceEngine
-    # (which are pure functions of those three attributes).
     class _Stub:
         pass
     stub = _Stub()
     stub.K = K
     stub.tokenizer = tokenizer
     stub.phone_tok = phone_tok
-
-    # Borrow all the alignment-related bound methods from the real class —
-    # `_build_text_and_phone_tokens` delegates to `_align_spans_to_tokens`
-    # and `_write_unit`. They depend only on the stubbed attrs above.
-    for name in ("_build_text_and_phone_tokens", "_align_spans_to_tokens", "_write_unit"):
-        attr = getattr(InpaintInferenceEngine, name)
-        # `_write_unit` is a @staticmethod — bind directly.
-        if isinstance(InpaintInferenceEngine.__dict__.get(name), staticmethod):
-            setattr(stub, name, attr)
-        else:
-            setattr(stub, name, attr.__get__(stub))
-    _build = stub._build_text_and_phone_tokens
+    # Borrow the bound method from the engine class.
+    stub._build_text_and_phone_tokens = (
+        InpaintInferenceEngine._build_text_and_phone_tokens.__get__(stub)
+    )
 
     surface_text, spans = parse_ssml(ssml)
     prefix = DIALECT_PREFIX.get(lang, "")
-    _, text_ids, _, phone_token, phone_mask, _ = _build(
+    _, text_ids, _, phone_token, phone_mask, _ = stub._build_text_and_phone_tokens(
         surface_text=surface_text, spans=spans, prefix=prefix, lang=lang,
         disable_inpaint=False,
     )
@@ -100,50 +91,40 @@ def _build_training_side(
     tokenizer, phone_tok: PhonemeTokenizer,
     text: str, train_phonemes: list[str], lang: str, K: int,
 ) -> tuple[list[int], torch.Tensor, torch.Tensor]:
-    """Run the training-side alignment over the same logical input.
+    """Run the training-side padsub alignment over the same logical input.
 
     This mirrors the relevant slice of InpaintDataset.__getitem__ — just the
     text → input_ids + phone_token portion, without the speech-tokens append
-    and the silence stripping (none of which affect the text-portion slot
-    tensors we want to check).
+    (which doesn't affect the text-portion slot tensors we want to check).
     """
     text = normalise_text(text, lang)
     prefix = DIALECT_PREFIX.get(lang, "")
     text_with_prefix = prefix + text
-    enc = tokenizer(text_with_prefix, add_special_tokens=False, return_offsets_mapping=True)
-    text_ids = enc["input_ids"]
-    offsets = [tuple(o) for o in enc["offset_mapping"]]
-
-    # Adjust offsets to text-portion-relative (skip dialect-prefix tokens).
     prefix_len = len(prefix)
-    text_part_offsets: list[tuple[int, int]] = []
-    text_part_token_index: list[int] = []
-    for ti, (cs, ce) in enumerate(offsets):
-        if ce <= prefix_len:
-            continue
-        adj = (max(0, cs - prefix_len), max(0, ce - prefix_len))
-        text_part_offsets.append(adj)
-        text_part_token_index.append(ti)
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    assert pad_id is not None, "tokenizer must expose pad/eos id for padsub"
+
+    enc = tokenizer(text_with_prefix, add_special_tokens=False, return_offsets_mapping=True)
+    base_text_ids = enc["input_ids"]
+    base_offsets = [tuple(o) for o in enc["offset_mapping"]]
 
     alphabet = LANG_TO_ALPHABET[lang]
     if alphabet == "cmu":
-        per_token_text, _, _ = _align_english(
-            text, text_part_offsets, train_phonemes, phone_tok, K, keep_prob=1.0,
+        text_ids, slot_blocks, mask_list, _, _ = _align_padsub_english(
+            text, base_offsets, base_text_ids, train_phonemes, phone_tok, K,
+            pad_id=pad_id, prefix_len=prefix_len, keep_prob=1.0,
         )
     else:
-        per_token_text, _, _ = _align_chinese(
-            text, text_part_offsets, train_phonemes, alphabet, phone_tok, K, keep_prob=1.0,
+        text_ids, slot_blocks, mask_list, _, _ = _align_padsub_chinese(
+            text, base_offsets, base_text_ids, train_phonemes, alphabet, phone_tok, K,
+            pad_id=pad_id, prefix_len=prefix_len, keep_prob=1.0,
         )
 
-    # Write per_token_text into a full phone_token aligned to text_ids
-    # (zero-padded for prefix-only tokens).
     T = len(text_ids)
     phone_token = torch.zeros(K * T, dtype=torch.long)
-    for local_ti, global_ti in enumerate(text_part_token_index):
-        block = per_token_text[local_ti]
-        phone_token[global_ti * K : global_ti * K + K] = torch.tensor(block, dtype=torch.long)
-
-    phone_mask = (phone_token.view(T, K) != 0).any(dim=-1)
+    for ti, block in enumerate(slot_blocks):
+        phone_token[ti * K : (ti + 1) * K] = torch.tensor(block, dtype=torch.long)
+    phone_mask = torch.tensor(mask_list, dtype=torch.bool)
     return text_ids, phone_token, phone_mask
 
 
@@ -214,11 +195,16 @@ def main():
 
     total = 0
     failed = 0
+    skipped = 0
     for fx in ALL_FIXTURES:
         for pole in ("correct", "wrong"):
+            tag = f"{fx.name}.{pole}"
+            if not fx.enable_parity:
+                skipped += 1
+                print(f"[skip] {tag}  (enable_parity=False)")
+                continue
             total += 1
             fails = _compare_one_pole(fx, pole, tokenizer, phone_tok, SLOTS_PER_TOKEN)
-            tag = f"{fx.name}.{pole}"
             if fails:
                 failed += 1
                 print(f"[FAIL] {tag}")
@@ -228,7 +214,7 @@ def main():
                 print(f"[ok]   {tag}")
 
     print()
-    print(f"{total - failed}/{total} parity checks passed")
+    print(f"{total - failed}/{total} parity checks passed  ({skipped} skipped)")
     sys.exit(0 if failed == 0 else 1)
 
 
