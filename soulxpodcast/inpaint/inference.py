@@ -35,9 +35,7 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from soulxpodcast.inpaint.composer import (
-    PhonemeComposer, apply_phoneme_inpaint, filter_compatible_state_dict,
-)
+from soulxpodcast.inpaint.composer import PhonemeComposer, apply_phoneme_inpaint
 from soulxpodcast.inpaint.ssml import PhonemeSpan, parse_ssml
 from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
 from soulxpodcast.training.inpaint_dataset import (
@@ -123,20 +121,8 @@ class InpaintInferenceEngine:
         self.composer = PhonemeComposer(
             d_model=cfg["d_model"], slots_per_token=cfg["slots_per_token"]
         ).to(self.device, dtype=dtype)
-        # Non-strict load — older checkpoints (pre-v7) carry removed
-        # alphabet_head / id_to_alphabet_label keys, and pre-v10
-        # checkpoints have a (d, K*d) first-Linear shape that doesn't
-        # fit v10's (d, d). Filter shape-mismatched keys before load.
-        sd, dropped_shape = filter_compatible_state_dict(
-            self.composer, ckpt["composer"]
-        )
-        missing, unexpected = self.composer.load_state_dict(sd, strict=False)
-        for name, keys in (("dropped (shape mismatch)", dropped_shape),
-                           ("missing", missing),
-                           ("unexpected", unexpected)):
-            if keys:
-                log.info(f"  {name} composer keys: "
-                         f"{len(keys)} — {keys[:6]}{'...' if len(keys) > 6 else ''}")
+        # Strict load — composer arch must match the checkpoint exactly.
+        self.composer.load_state_dict(ckpt["composer"], strict=True)
         self.composer.eval()
         self.K = cfg["slots_per_token"]
 

@@ -62,11 +62,9 @@ from transformers import (
 )
 
 from soulxpodcast.inpaint import PhonemeComposer, apply_phoneme_inpaint
-from soulxpodcast.inpaint.composer import filter_compatible_state_dict
 from soulxpodcast.training.inpaint_dataset import (
     InpaintDataset,
     InpaintDatasetConfig,
-    build_silence_id_lut,
     collate,
 )
 
@@ -99,11 +97,10 @@ class TrainConfig:
     seed: int = 42
     # Composer
     slots_per_token: int = 8
-    # Default 0.0 from v7: on a 160K-vocab LLM, label_smoothing=0.1 adds
-    # ~1.5 nats of irreducible CE floor that makes train loss numbers
-    # un-interpretable. Composer already has phoneme-dropout + weight
-    # decay + grad clip + output LN — extra smoothing is redundant
-    # regularization. Set >0 only when needed.
+    # On the 160K-vocab LLM, label_smoothing=0.1 adds ~1.5 nats of irreducible
+    # CE floor that makes train loss un-interpretable. Composer already has
+    # phoneme-dropout + weight decay + grad clip; extra smoothing is redundant.
+    # Set >0 only when needed.
     label_smoothing: float = 0.0
     init_from_text_embed: bool = True
     # Resume a prior composer (loads composer weights only — NOT optimizer
@@ -126,15 +123,6 @@ class TrainConfig:
     max_speech_tokens: int = 750
     eval_fraction: float = 0.01       # held-out fraction (capped at 2000 rows)
     eval_max_rows: int = 2000
-    # Silence-token workarounds (v5/v6/v7). All default OFF as of v9 —
-    # the correct fix is to filter silence-heavy rows out of the dataset
-    # up-front (scripts/inpaint/filter_dataset_silence.py) rather than
-    # patch the loss or per-row transform. Upstream CosyVoice-Inpaint
-    # uses plain CE on clean data; v9 reverts to that. Flags kept for
-    # ablation but should not be flipped on for clean-data runs.
-    strip_silence_tokens: bool = False
-    remove_silence_tokens_inline: bool = False
-    silence_mask_loss: bool = False
     # Memory / runtime
     gradient_checkpointing: bool = True
     attn_implementation: str = "flash_attention_2"  # "flash_attention_2" | "sdpa" | "eager"
@@ -180,18 +168,6 @@ def parse_args() -> TrainConfig:
     p.add_argument("--max_speech_tokens", type=int, default=750)
     p.add_argument("--eval_fraction", type=float, default=0.01)
     p.add_argument("--eval_max_rows", type=int, default=2000)
-    p.add_argument("--strip_silence_tokens",
-                   dest="strip_silence_tokens", action="store_true",
-                   help="(legacy v5) boundary-strip silence tokens from each row.")
-    p.set_defaults(strip_silence_tokens=False)
-    p.add_argument("--remove_silence_tokens_inline",
-                   dest="remove_silence_tokens_inline", action="store_true",
-                   help="(legacy v6) drop silence tokens from speech_tokens entirely.")
-    p.set_defaults(remove_silence_tokens_inline=False)
-    p.add_argument("--silence_mask_loss",
-                   dest="silence_mask_loss", action="store_true",
-                   help="(legacy v7) exclude silence-target positions from CE.")
-    p.set_defaults(silence_mask_loss=False)
     p.add_argument("--no_gradient_checkpointing", action="store_true")
     p.add_argument("--attn_implementation", default="flash_attention_2",
                    choices=["flash_attention_2", "sdpa", "eager"])
@@ -248,16 +224,8 @@ def forward_step(
     batch: dict,
     dtype: torch.dtype,
     label_smoothing: float,
-    silence_lut: Optional[torch.Tensor] = None,
 ):
-    """One forward through frozen backbone + composer; returns scalar loss + parts.
-
-    If ``silence_lut`` is provided it must be a bool (V,) buffer that is True
-    at every LLM-vocab id corresponding to a silence-coding s3 token. Those
-    positions are then excluded from the supervised CE — the composer is no
-    longer rewarded for predicting silence, which removes the "make whole
-    output silent" failure mode (v7 objective fix).
-    """
+    """One forward through frozen backbone + composer; returns scalar loss + parts."""
     device = next(composer.parameters()).device
     input_ids = batch["input_ids"].to(device, non_blocking=True)
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
@@ -280,12 +248,6 @@ def forward_step(
     shift_logits = logits[:, :-1].contiguous()
     shift_targets = input_ids[:, 1:].contiguous()
     shift_mask = speech_mask[:, 1:].to(torch.float32)
-    if silence_lut is not None:
-        # Drop silence-target positions from supervision. The LLM still
-        # processes silence tokens as input context (matching inference);
-        # we just stop rewarding the composer for shaping its emission.
-        is_silence_tg = silence_lut[shift_targets]
-        shift_mask = shift_mask * (~is_silence_tg).to(shift_mask.dtype)
     V = shift_logits.size(-1)
     ce = F.cross_entropy(
         shift_logits.reshape(-1, V).float(),
@@ -310,7 +272,6 @@ def evaluate(
     eval_loader: DataLoader,
     eval_loader_full: DataLoader,
     dtype: torch.dtype,
-    silence_lut: Optional[torch.Tensor] = None,
 ) -> dict[str, float]:
     """Compute eval lm_loss at three phoneme regimes for trend tracking.
 
@@ -318,10 +279,6 @@ def evaluate(
       - ``eval/lm_loss_dropout``  : composer ON with same p_keep as train
       - ``eval/lm_loss_full``     : composer ON, all units kept (p_keep=1.0)
       - ``eval/lm_loss_text_only``: composer fully OFF (pure text baseline)
-
-    The ``silence_lut`` must match the one used in training (same v7
-    silence-exclusion policy) so eval lm_loss is directly comparable to
-    train lm_loss.
     """
     composer.eval()
     sums = {"dropout": 0.0, "full": 0.0, "text_only": 0.0}
@@ -349,9 +306,6 @@ def evaluate(
             shift_logits = out.logits[:, :-1].contiguous()
             shift_targets = input_ids[:, 1:].contiguous()
             shift_mask = speech_mask[:, 1:].to(torch.float32)
-            if silence_lut is not None:
-                is_silence_tg = silence_lut[shift_targets]
-                shift_mask = shift_mask * (~is_silence_tg).to(shift_mask.dtype)
             ce = F.cross_entropy(
                 shift_logits.reshape(-1, shift_logits.size(-1)).float(),
                 shift_targets.reshape(-1),
@@ -457,8 +411,6 @@ def train(cfg: TrainConfig):
         phoneme_keep_prob=cfg.phoneme_keep_prob,
         max_total_tokens=cfg.max_total_tokens,
         max_speech_tokens=cfg.max_speech_tokens,
-        strip_silence_tokens=cfg.strip_silence_tokens,
-        remove_silence_tokens_inline=cfg.remove_silence_tokens_inline,
     )
     log.info(f"loading dataset from {cfg.dataset_path}")
     full_ds = InpaintDataset(
@@ -489,8 +441,6 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
-            strip_silence_tokens=cfg.strip_silence_tokens,
-            remove_silence_tokens_inline=cfg.remove_silence_tokens_inline,
         ),
         lang_filter=lang_filter,
     )
@@ -502,8 +452,6 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
-            strip_silence_tokens=cfg.strip_silence_tokens,
-            remove_silence_tokens_inline=cfg.remove_silence_tokens_inline,
         ),
         lang_filter=lang_filter,
     )
@@ -621,44 +569,14 @@ def train(cfg: TrainConfig):
                 f"resume_composer slots_per_token={prior_cfg.get('slots_per_token')} != "
                 f"current {composer.K}"
             )
-        # Resume across architecture revisions. Pre-v10 checkpoints have
-        # a (d, K*d) first-Linear; v10's first Linear is (d, d). Drop
-        # shape-mismatched keys before load; missing keys keep their
-        # fresh init (which is the intended v10 behaviour when resuming
-        # from an older arch — phone_emb still warm-starts, the MLP is
-        # re-initialised to the new shape).
-        sd, dropped_shape = filter_compatible_state_dict(composer, prior["composer"])
-        missing, unexpected = composer.load_state_dict(sd, strict=False)
-        if dropped_shape:
-            log.info(f"  resume: {len(dropped_shape)} shape-mismatched keys re-init'd: "
-                     f"{dropped_shape[:8]}{'...' if len(dropped_shape) > 8 else ''}")
-        if missing:
-            log.info(f"  resume: {len(missing)} missing keys (new module init kept): "
-                     f"{missing[:8]}{'...' if len(missing) > 8 else ''}")
-        if unexpected:
-            log.info(f"  resume: {len(unexpected)} unexpected keys ignored: "
-                     f"{unexpected[:8]}{'...' if len(unexpected) > 8 else ''}")
+        # Strict load — composer arch must match the checkpoint's. Any
+        # arch change requires a fresh run, not a resume.
+        composer.load_state_dict(prior["composer"], strict=True)
         log.info(
             f"  loaded {sum(p.numel() for p in composer.parameters())/1e6:.2f}M composer params "
             f"(prior step={prior.get('step', '?')}). Optimizer & scheduler start fresh."
         )
     composer.train()
-
-    # v7 silence-masked CE: drop silence-target positions from supervised
-    # loss. The composer is never rewarded for predicting silence, which
-    # was the dominant collapse mechanism on zh in v4-v6. None disables
-    # the mask (reproduces v6 behaviour for ablation).
-    if cfg.silence_mask_loss:
-        silence_lut = build_silence_id_lut(
-            model.config.vocab_size, ds_cfg.speech_token_offset
-        ).to("cuda")
-        n_mask = int(silence_lut.sum())
-        log.info(f"silence-masked CE: excluding {n_mask} LLM-vocab ids "
-                 f"(union across zh/yue/en) from supervision")
-    else:
-        silence_lut = None
-        log.info("silence-masked CE DISABLED — supervising all speech positions "
-                 "(legacy v4-v6 objective)")
 
     n_train = sum(p.numel() for p in composer.parameters() if p.requires_grad)
     n_frozen = sum(p.numel() for p in model.parameters())
@@ -720,7 +638,6 @@ def train(cfg: TrainConfig):
                 continue
             loss, lm_loss, n_loss_tokens = forward_step(
                 model, composer, batch, dtype, cfg.label_smoothing,
-                silence_lut=silence_lut,
             )
             loss = loss / cfg.grad_accum_steps
             loss.backward()
@@ -794,7 +711,6 @@ def train(cfg: TrainConfig):
                     metrics = evaluate(
                         model, composer, eval_loader, eval_loader_full,
                         dtype,
-                        silence_lut=silence_lut,
                     )
                     dt_eval = time.perf_counter() - t_eval
                     log.info(

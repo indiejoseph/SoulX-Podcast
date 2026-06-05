@@ -86,28 +86,15 @@ LANG_TO_ALPHABET = {"en": "cmu", "zh": "pinyin", "yue": "jyutping"}
 # (punctuation pass-through).
 NON_PHONEME_TOKENS = frozenset({".", ",", "!", "?", "|"})
 
-# Per-language speech-token IDs identified as "silence padding" via
-# audit of dataset position distributions. These are s3tokenizer
-# codebook entries that decode to flat / low-energy audio and are
-# heavily over-represented at the start/end of utterances in each
-# language's source recordings (most severely in zh AISHELL-3-style
-# studio takes).
-#
-# Stripping these from the leading and trailing runs of each row's
-# speech_tokens prevents the composer from learning the degenerate
-# "predict silence" strategy during training — which was the v4 zh
-# mode-collapse root cause.
-#
-# Derived from `tmp/dataset.jsonl` audit: top tokens appearing at row
-# position 0 or row position -1 with >5% frequency, plus the dominant
-# repeating-run tokens (4299/4218/6486).
+# Per-language speech-token IDs identified as "silence padding" via audit of
+# dataset position distributions. These are s3tokenizer codebook entries that
+# decode to flat / low-energy audio and are heavily over-represented at the
+# start/end of utterances. Used to mask silence-target positions out of the
+# speech-token CE loss so the composer can't shortcut to "predict silence".
 SILENCE_TOKEN_IDS: dict[str, frozenset[int]] = {
-    # Derived by scanning tmp/dataset.jsonl: tokens that appear in the
-    # first 10 or last 10 positions of rows in that language with
-    # boundary-share ≥0.1% AND ≥2× their global unigram frequency.
-    # Broad set deliberately included to capture variant silence/breath
-    # codes (zh in particular has ~66 silence-coding ids clustered
-    # around 3700-3900 for intake-breath and 4200-4300 for fade-out).
+    # Boundary-share ≥0.1% AND ≥2× global unigram frequency at position 0 or -1
+    # in tmp/dataset.jsonl. zh has ~66 silence-coding ids clustered around
+    # 3700-3900 (intake-breath) and 4200-4300 (fade-out).
     "zh": frozenset({
         3969, 6402, 4227, 3972, 6405, 3975, 4105, 4106, 6159, 3729,
         6162, 3732, 3863, 1944, 1947, 1950, 5919, 4131, 1701, 4134,
@@ -126,48 +113,6 @@ SILENCE_TOKEN_IDS: dict[str, frozenset[int]] = {
         5919, 2922, 5109, 3888, 1461, 5832,
     }),
 }
-
-
-def union_silence_s3_ids() -> frozenset[int]:
-    """Union of per-language silence-coding s3tokenizer ids across all langs.
-
-    Safe to use as a single LUT in loss masking: silence codes are
-    properties of the s3tokenizer codebook (silence/breath/pause units),
-    not of language. yue's silence set is a subset of zh's; en's
-    overlaps with both. Filtering against the union excludes silence
-    everywhere without language-aware per-row branching during training.
-    """
-    out: set[int] = set()
-    for s in SILENCE_TOKEN_IDS.values():
-        out.update(s)
-    return frozenset(out)
-
-
-def build_silence_id_lut(vocab_size: int, speech_token_offset: int) -> "torch.Tensor":
-    """Bool LUT over the full LLM vocab. True where the id corresponds to a
-    silence-coding s3 token (after the +offset shift into LLM-id space).
-
-    Use as: ``is_silence_target = silence_lut[shift_targets]``.
-    """
-    import torch  # local import keeps the dataset module torch-optional
-    lut = torch.zeros(vocab_size, dtype=torch.bool)
-    for s3 in union_silence_s3_ids():
-        llm_id = s3 + speech_token_offset
-        if 0 <= llm_id < vocab_size:
-            lut[llm_id] = True
-    return lut
-
-
-def _trim_silence_run(speech_tokens: list[int], silence_set: frozenset[int]) -> list[int]:
-    """Strip leading and trailing runs of silence-codebook tokens."""
-    n = len(speech_tokens)
-    i = 0
-    while i < n and speech_tokens[i] in silence_set:
-        i += 1
-    j = n
-    while j > i and speech_tokens[j - 1] in silence_set:
-        j -= 1
-    return speech_tokens[i:j]
 
 
 @dataclass
@@ -191,13 +136,6 @@ class InpaintDatasetConfig:
     # __getitem__ uses a fresh `random.random()` so dropout differs every
     # epoch and across DataLoader workers.
     deterministic_dropout: bool = False
-    # v5/v6 silence-token dataset-level workarounds. Both default OFF as
-    # of v9 — the correct fix is to filter the input dataset to remove
-    # silence-heavy rows up-front (see scripts/inpaint/filter_dataset_silence.py),
-    # not patch each row at __getitem__ time. The flags are kept for
-    # ablation but should not be needed for clean (filtered) data.
-    strip_silence_tokens: bool = False
-    remove_silence_tokens_inline: bool = False
 
 
 def _is_cjk(ch: str) -> bool:
@@ -504,23 +442,6 @@ class InpaintDataset(Dataset):
         text = normalise_text(row["text"], lang)
         phonemes: list[str] = row["phonemes"]
         speech_raw: list[int] = row["speech_tokens"]
-
-        # Remove silence-coding tokens so the composer can't learn the
-        # degenerate "predict silence" shortcut (v4 zh mode-collapse cause).
-        # Two passes, both data-derived from `SILENCE_TOKEN_IDS`:
-        #   1. boundary strip — leading and trailing runs
-        #   2. inline filter   — every remaining silence-token position
-        # AISHELL-3-style zh data has silence tokens scattered through
-        # the interior of utterances (5-10% of all tokens), so a boundary
-        # strip alone leaves enough silence in the supervision signal for
-        # the composer to mode-collapse onto it (verified by the overfit
-        # A/B test in scripts/inpaint/overfit_zh.py).
-        silence_set = SILENCE_TOKEN_IDS.get(lang, frozenset())
-        if silence_set:
-            if self.cfg.strip_silence_tokens:
-                speech_raw = _trim_silence_run(speech_raw, silence_set)
-            if self.cfg.remove_silence_tokens_inline:
-                speech_raw = [t for t in speech_raw if t not in silence_set]
 
         if not (self.cfg.min_speech_tokens <= len(speech_raw) <= self.cfg.max_speech_tokens):
             return None
