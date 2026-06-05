@@ -55,33 +55,48 @@ findings that transfer regardless of alphabet, and one that doesn't.
 
 ## 2. Per-alphabet decisions
 
-| alphabet | K | slot layout | composer input | tone? |
+The SoulX phone vocab ([`_vocab.py`](../soulxpodcast/inpaint/_vocab.py))
+already bakes tone into Chinese finals (e.g. `in2`, `ang3` are single
+ids — separate phone_emb rows per (final, tone) combination), and
+already position-tags CMU consonants as `_on` / `_co`. We use the vocab
+as-is for v11 — re-deriving it to match upstream's (onset, nucleus,
+coda, tone) decomposition is a v12 lever, not v11.
+
+| alphabet | K | slot layout | composer head | tone? |
 |---|---|---|---|---|
-| jyutping | 4 | `[onset, nucleus, coda, tone]` | `Linear(3d→d) + tone_emb` | yes (residual) |
-| pinyin | 3 | `[initial, final, tone]` | `Linear(2d→d) + tone_emb` | yes (residual) |
-| cmu | 6 | `[phone₀, …, phone₅]` (syllable-internal order, pad with 0) | `Linear(6d→d)` | no |
+| jyutping | 2 | `[initial, final-with-tone]` | `Linear(2d→d) → GELU → Linear(d→d)` | no — baked into final ids |
+| pinyin | 2 | `[initial, final-with-tone]` | `Linear(2d→d) → GELU → Linear(d→d)` | no — baked into final ids |
+| cmu | 6 | `[phone₀, …, phone₅]` (syllable-internal order, pad with 0) | `Linear(6d→d) → GELU → Linear(d→d)` | n/a — consonants already position-tagged in vocab |
 
-**Why pinyin K=3 not K=4:** the Mandarin final glyph in our phone vocab
-already encodes nucleus + coda + tone together (e.g. `in2`, `ang3` are
-single ids per `_vocab.py`). Splitting them would require either
-re-derivation from raw pinyin or accepting irreducible ambiguity. K=3 with
-[initial, final-w-tone-stripped, tone] matches what our tokenizer already
-parses; we strip the tone digit off the final at composer-input time so
-final and tone live in separate slots.
+**Why K=2 for Chinese:** the vocab stores finals like `in2` and `ang3`
+as single ids (see `_load_finals()` in `_vocab.py`). The composer's
+input for `银 (yin2)` is `[y_initial_emb, in2_final_emb]` →
+`Linear(2d→d)`. The frozen LLM was trained on full-precision text
+embeddings of 银; the composer's job is to land in the same neighborhood
+of embedding space.
 
-Implementation: tone is the trailing digit of the final string (`in2` →
-final `in`, tone `2`). The tone slot maps the digit to a small 6-vocab
-tone embedding shared with jyutping (also 6 tones, neutral = 0).
+**Why no tone residual:** upstream needed it because their final vocab
+was nucleus+coda only (12+9=21 components), so tone had to be added in.
+Our final-with-tone vocab is 257 rows for jyutping and 210 for pinyin —
+each (final-shape, tone) is its own row. The phone_emb table already
+learns tone-specific embeddings.
 
-**Why cmu K=6 not K=8:** empirically 99%+ of English syllables fit in 6
+**Why CMU K=6 not K=8:** empirically 99%+ of English syllables fit in 6
 phones. K=8 (current v10) wastes capacity. Internal slot order =
-syllable-internal phoneme order from the SoulX phone vocab, which already
-position-tags consonants as `_on` / `_co` so the alphabet ID encodes some
-role information even before the composer sees it.
+syllable-internal phoneme order from the SoulX phone vocab; the vocab
+already tags consonants as `_on` / `_co` so slot role is encoded in the
+ID before the composer sees it.
 
-**Cross-alphabet contract:** all three composer heads emit a single
-`d_model` vector per pad position. The output dimensionality is uniform
-so the inject path (`apply_phoneme_inpaint`) is alphabet-agnostic.
+**Shared Chinese head:** jyutping and pinyin both have K=2 with the same
+shape and a shared phone_emb table (their initials and finals live in
+disjoint id ranges in the global vocab, so the same Linear(2d→d) can
+learn alphabet-specific patterns through which embedding rows the
+indices point at). v11 ships TWO heads: one for K=2 Chinese, one for
+K=6 CMU.
+
+**Cross-alphabet contract:** both heads emit a single `d_model` vector
+per pad position. The output dimensionality is uniform so the inject
+path (`apply_phoneme_inpaint`) is alphabet-agnostic.
 
 
 ## 3. Source data format
@@ -195,65 +210,69 @@ This mirrors training §4 byte-for-byte. The parity test asserts this.
 
 ```python
 class PhonemeComposer(nn.Module):
-    K_PER_ALPHABET = {"jyutping": 4, "pinyin": 3, "cmu": 6}
+    # K=2 for Chinese (jyutping / pinyin), K=6 for CMU.
+    # Storage K = max = 6; Chinese rows leave slots 2..5 as pad id 0.
+    K_PER_ALPHABET = {"jyutping": 2, "pinyin": 2, "cmu": 6}
+    SLOTS_STORAGE = 6
 
     def __init__(self, d_model):
         self.phone_emb = nn.Embedding(TOTAL_VOCAB_SIZE, d_model, padding_idx=0)
-        self.head_jp  = nn.Sequential(nn.Linear(3*d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
-        self.head_py  = nn.Sequential(nn.Linear(2*d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+        self.head_cn  = nn.Sequential(nn.Linear(2*d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.head_cmu = nn.Sequential(nn.Linear(6*d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model))
-        self.tone_emb = nn.Embedding(7, d_model, padding_idx=0)  # 1-6 + neutral
-        self.tone_classifier = nn.Linear(d_model, 7)
 ```
 
-Forward, given `phone_token: (B, K_max*L)`, `alphabet: (B,)` row-level ids:
-1. Look up `phone_emb` on each non-pad slot.
-2. Route per-row to the matching head: concat the role slots along feature
-   dim, project through 2-layer MLP.
-3. For yue / zh: add `tone_emb(tone_slot)` to the projection output.
-4. Output `composed: (B, L, d_model)` plus `position_mask: (B, L)`.
+Forward, given `phone_token: (B, SLOTS_STORAGE*L)`, `alphabet: (B,)`
+row-level alphabet id (`0`=jyutping, `1`=pinyin, `2`=cmu):
 
-**Why per-alphabet heads:** the three head shapes encode role layouts that
-differ across alphabets. A single `Linear(K_max*d, d)` with zero-padding
-would waste capacity on phantom slots and still need to learn three
-different role conventions through the LLM context — slower and noisier.
+1. Look up `phone_emb` on each slot → `(B, L, SLOTS_STORAGE, d)`.
+2. Route per-row to its head:
+   - Chinese rows (alphabet 0 or 1): concat slots `[0,1]` → `head_cn`.
+     Slots `[2..5]` are not read.
+   - CMU rows (alphabet 2): concat slots `[0..5]` → `head_cmu`.
+3. Output `composed: (B, L, d_model)` zeroed at positions with no phoneme,
+   plus `position_mask: (B, L)`.
+
+**Why per-alphabet heads:** the two head shapes encode different role
+layouts. A single `Linear(6d, d)` with zero-padding for Chinese would
+waste 4×d_model channels per Chinese position and still need to learn
+two role conventions through the LLM context — slower and noisier.
 
 **Parameter cost vs v10:** v10 = 9.6M. v11 estimate at d_model=2048:
-phone_emb (576 × 2048) ≈ 1.2M, three heads (sums to (3+2+6)×d² + d² each)
-≈ 4M × 3 ≈ 12M, tone_emb + classifier negligible. Total ≈ 13.5M — modestly
-larger than v10 but order-of-magnitude same.
+phone_emb (576 × 2048) ≈ 1.2M, head_cn ((2d → d → d): 8M + 4M = 12M),
+head_cmu ((6d → d → d): 24M + 4M = 28M). Total ≈ 41M — ~4× larger than
+v10. Justified if it fixes the alignment bugs that v10 couldn't; if not,
+the 6d→d projection on head_cmu is the obvious place to cut (down-project
+to 2d first, then to d).
 
-**Init:** `init_from_text_embed` heuristic still applies — bias phone_emb
-rows toward the average text-embedding row so the frozen backbone sees a
-sane vector at step 0.
+**Init:** `init_from_text_embed` heuristic still applies — bias
+phone_emb rows toward the average text-embedding row so the frozen
+backbone sees a sane vector at step 0.
 
 
 ## 7. Loss
 
 ```
-loss = lm_loss + 0.3 * tone_loss
+loss = lm_loss
 ```
 
-- `lm_loss`: standard CE on speech-token positions only (mask via
-  `speech_mask` exactly as v10). No silence-target exclusion — handled by
-  dataset filtering up-front.
-- `tone_loss`: `CrossEntropy(tone_classifier(composed.detach_from_context),
-  tone_label, ignore_index=-100)` over yue/zh pad positions only. en
-  positions contribute 0. Detach trick: `composed + 0.0 * text_emb.detach()`
-  ensures gradient flows only through `composed`, forcing tone signal
-  into the phoneme path.
+Plain speech-token CE on positions where `speech_mask=True`. No tone
+auxiliary loss in v11 — tone is encoded in the final-with-tone phone_emb
+rows so there's no separate tone embedding to push gradient through.
+No silence masking — handled by dataset filtering up-front. No label
+smoothing.
 
-`label_smoothing=0.0`. No silence masking. Plain CE on the speech-token
-positions.
+If v11's tone discrimination is empirically weak (e.g. zh fixtures
+ship audio with the wrong tone), v12 can:
+1. Re-derive the vocab to split finals into nucleus / coda / tone.
+2. Add the tone-residual + aux-classifier from upstream (spec §6 had
+   this; deferred).
 
 
 ## 8. What's trained vs frozen
 
 **Trained:**
 - `phone_emb` (shared across alphabets)
-- Three per-alphabet composer heads (`head_jp`, `head_py`, `head_cmu`)
-- `tone_emb`
-- `tone_classifier`
+- Two per-alphabet composer heads (`head_cn`, `head_cmu`)
 
 **Frozen:** Qwen3 LLM backbone (every parameter under `model.*`).
 
@@ -300,30 +319,28 @@ still pass all current asserts. Address via a separate ASR-back check
 Before the first training step is run, all of these must be true.
 Numbered to be checkable on a PR diff.
 
-1. [ ] `PhonemeComposer` rewritten to per-alphabet heads + tone residual.
-   Old mean-pool path gone. `slots_per_token` becomes
-   `max(K_PER_ALPHABET.values()) = 6`. `forward()` takes a per-row
-   `alphabet_id` tensor.
+1. [ ] `PhonemeComposer` rewritten to two heads (`head_cn` for K=2
+   Chinese, `head_cmu` for K=6 English). Old mean-pool path gone.
+   `slots_per_token` is now 6 (storage) but per-alphabet K is 2 or 6.
+   `forward()` takes a per-row `alphabet_id` tensor.
 2. [ ] `InpaintDataset.__getitem__` switched to padsub: build
-   `text_with_marks`, run `re.sub` for pad substitution, write slot blocks
-   only at pad positions. `_align_chinese` and `_align_english` are
-   replaced (not modified) by `_align_padsub_chinese` and
+   `text_with_marks`, run `re.sub` for pad substitution, write slot
+   blocks only at pad positions. `_align_chinese` and `_align_english`
+   are replaced (not modified) by `_align_padsub_chinese` and
    `_align_padsub_english`.
-3. [ ] `InpaintInferenceEngine._build_text_and_phone_tokens` rewritten to
-   match §5 exactly. The `inference_audio_padsub.py` prototype is the
-   starting point; it gets folded back into the engine.
-4. [ ] `tone_classifier` + `tone_loss` added to the training forward.
-   Weight 0.3. en rows contribute 0 (ignore_index masks all positions).
-5. [ ] Fixtures updated: each fixture's `train_phonemes_*` field replaced
-   with `train_text_with_marks` (the source-text representation
-   that the new dataset alignment consumes).
-6. [ ] `test_alignment_parity` updated to compare new training-side
+3. [ ] `InpaintInferenceEngine._build_text_and_phone_tokens` rewritten
+   to match §5 exactly. The `inference_audio_padsub.py` prototype is
+   the starting point; it gets folded back into the engine.
+4. [ ] Fixtures updated: each fixture's `train_phonemes_*` field is
+   replaced with `train_text_with_marks` (the source-text
+   representation that the new dataset alignment consumes).
+5. [ ] `test_alignment_parity` updated to compare new training-side
    slot tensors vs new inference-side slot tensors. The byte-equality
    contract is unchanged.
-7. [ ] Adversarial fixtures' `expected_inpaint_pads` field correctly
-   reflects per-alphabet syllable counts (already does for v10; recheck
-   under the new alignment).
-8. [ ] PJM file `scripts/inpaint/train_h100_v11_padsub.pjm` written;
+6. [ ] Adversarial fixtures' `expected_inpaint_pads` field correctly
+   reflects per-alphabet syllable counts (already does for v10;
+   recheck under the new alignment).
+7. [ ] PJM file `scripts/inpaint/train_h100_v11_padsub.pjm` written;
    passes a 1000-step smoke run on the 3090 (loss decreases, no NaN,
    gate asserts converge in the right direction).
 
