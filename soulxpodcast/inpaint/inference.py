@@ -49,6 +49,7 @@ from soulxpodcast.training.inpaint_dataset import (
     _block,
     _resolve_special_tokens,
     _splice_pads,
+    _substitute_units,
     normalise_text,
 )
 
@@ -279,21 +280,25 @@ class InpaintInferenceEngine:
         lang: str,
         disable_inpaint: bool,
     ) -> tuple[str, list[int], list[tuple[int, int]], torch.Tensor, torch.Tensor, int]:
-        """Pad-substitution alignment matching the training dataset's
-        ``_align_padsub_*`` byte-for-byte (asserted by
+        """Grapheme-substitution alignment matching the training dataset's
+        ``_align_grapheme_subst_*`` byte-for-byte (asserted by
         ``scripts/inpaint/test_alignment_parity.py``).
 
-        Strategy:
+        Strategy (v12):
           1. Tokenize natural (unmarked) text + dialect prefix once.
-          2. For each SSML span, decide how many pad tokens to splice in and
-             what slot block each pad carries (one syllable per pad).
-          3. Splice the pads after the LAST BPE that covers the span's
-             trailing char position. Pad ``phone_mask`` is True; everything
-             else is False.
+          2. For each SSML span, build a substitution unit
+             ``(char_start, char_end, blocks)`` with one slot block per
+             syllable (one per CJK char for zh/yue; one per syllable for en).
+          3. Hand the units to the shared :func:`_substitute_units`, which
+             REMOVES each unit's covering grapheme BPE(s) and splices the
+             phoneme pad(s) in their place. ``phone_mask`` is True at the
+             pads, False elsewhere. The composed embedding is therefore the
+             only signal at the annotated position — the LM cannot fall back
+             on the (now-deleted) grapheme.
 
-        Returns surface_with_prefix, new text_ids (with pads), unused offsets
-        (``[]`` placeholder — caller doesn't read them), phone_token,
-        phone_mask, n_aligned.
+        Returns surface_with_prefix, new text_ids (graphemes substituted),
+        unused offsets (``[]`` placeholder — caller doesn't read them),
+        phone_token, phone_mask, n_aligned.
         """
         from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
 
@@ -317,7 +322,12 @@ class InpaintInferenceEngine:
             phone_mask = torch.zeros(len(base_text_ids), dtype=torch.bool)
             return surface_with_prefix, base_text_ids, [], phone_token, phone_mask, 0
 
-        inserts: list[tuple[int, list[list[int]]]] = []
+        # v12 — build substitution units (char_start, char_end, blocks) and
+        # splice via the SHARED _substitute_units so the inference input_ids
+        # match the training pipeline byte-for-byte (guarded by
+        # test_alignment_parity.py). Each unit's covering grapheme BPE(s) are
+        # removed and replaced by its phoneme pad(s).
+        units: list[tuple[int, int, list[list[int]]]] = []
         n_aligned = 0
         for span in spans:
             ph_tokens = list(span.ph_tokens)
@@ -329,9 +339,6 @@ class InpaintInferenceEngine:
                     continue
                 if not syll_groups:
                     continue
-                # One pad per syllable, anchored at the span's trailing char
-                # (which routes to the word's last BPE via _splice_pads).
-                anchor = span.char_end - 1 + prefix_len
                 blocks = [list(g) for g in syll_groups]
             else:
                 # Chinese: one (initial, final-with-tone) pair per syllable.
@@ -358,27 +365,28 @@ class InpaintInferenceEngine:
                 except ValueError as exc:
                     log.warning(f"skipping unparseable span {span}: {exc}")
                     continue
-                # Split flat_ids into (initial, final) pairs — one syllable each.
+                # Split flat_ids into (initial, final) pairs — one syllable each,
+                # in reading order (matches the training group's per-char order).
                 blocks = [list(flat_ids[2 * i : 2 * (i + 1)])
                           for i in range(len(flat_ids) // 2)]
-                # Anchor each syllable at its corresponding char. If the span
-                # covers N chars and N == n_sylls, anchor each pair at one
-                # char in order; otherwise fall back to the trailing char.
-                n_sylls = len(blocks)
-                span_chars = span.char_end - span.char_start
-                if span_chars == n_sylls:
-                    # Per-char anchoring — one pad per char.
-                    for i, block in enumerate(blocks):
-                        anchor = span.char_start + i + prefix_len
-                        inserts.append((anchor, [block]))
-                    n_aligned += 1
-                    continue
-                anchor = span.char_end - 1 + prefix_len
-            inserts.append((anchor, blocks))
+            units.append(
+                (span.char_start + prefix_len, span.char_end + prefix_len, blocks)
+            )
             n_aligned += 1
 
-        new_text_ids, new_slots, new_mask = _splice_pads(
-            base_text_ids, base_offsets, inserts, pad_id, K
+        def _warn_fallback(unit):
+            cs, ce, _ = unit
+            log.warning(
+                "inpaint span [%d,%d) %r partially covers a merged BPE; "
+                "grapheme kept + pads inserted (v11-style) instead of "
+                "substituted. Annotate the WHOLE merged token (e.g. both chars "
+                "of 银行) for the trained substitution behaviour.",
+                cs, ce, surface_with_prefix[cs:ce],
+            )
+
+        new_text_ids, new_slots, new_mask = _substitute_units(
+            base_text_ids, base_offsets, units, pad_id, K,
+            on_fallback=_warn_fallback,
         )
         # Pack slots into the flat phone_token shape the composer expects.
         phone_token = torch.zeros(K * len(new_text_ids), dtype=torch.long)

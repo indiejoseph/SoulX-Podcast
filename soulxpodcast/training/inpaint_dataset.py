@@ -137,6 +137,17 @@ class InpaintDatasetConfig:
     # __getitem__ uses a fresh `random.random()` so dropout differs every
     # epoch and across DataLoader workers.
     deterministic_dropout: bool = False
+    # v12 — grapheme substitution. When True (the v12 default), a kept
+    # alignment unit's covering BPE token(s) are REMOVED from input_ids and
+    # replaced by the phoneme-carrying pad(s). This makes the composer the
+    # ONLY signal at the annotated position, so the LM cannot read the
+    # natural reading off the surviving grapheme. When False, the v11
+    # behaviour is used (pad INSERTED after the grapheme; grapheme kept —
+    # which left the phoneme redundant and the composer collapsed onto a
+    # per-alphabet marker; see docs/inpaint_v12_spec.md). Dropout is also
+    # made BPE-group-coherent under substitution so merged BPEs (银行, 中国)
+    # are kept/dropped as a whole and actually get masked at rate keep_prob.
+    grapheme_subst: bool = True
 
 
 def _is_cjk(ch: str) -> bool:
@@ -363,6 +374,317 @@ def _align_padsub_english(
     return new_text_ids, new_slots, new_mask, n_kept, n_seen
 
 
+# --------------------------------------------------------------------- #
+# v12 — grapheme substitution
+# --------------------------------------------------------------------- #
+#
+# v11 (above) INSERTED a pad after the covering BPE and kept the grapheme,
+# so at an annotated position the trunk saw both the natural reading (the
+# grapheme) and the composer's phoneme. The phoneme was therefore redundant
+# and the composer collapsed onto a per-alphabet "marker" direction (the LM
+# read the answer off the surviving grapheme). v12 SUBSTITUTES: it removes
+# the unit's grapheme BPE(s) and replaces them with the phoneme pad(s), so
+# the composed embedding is the only signal for that position. The shared
+# splicer below is used by BOTH training and inference so the
+# train/inference contract (guarded by test_alignment_parity.py) holds.
+
+
+def _bpe_coherence_groups(
+    offsets: list[tuple[int, int]],
+) -> list[list[int]]:
+    """Group char positions that share a BPE token into excisable units.
+
+    Two char positions belong to the same group iff some single BPE token
+    covers both (a merged BPE like ``银行`` → chars {2,3}) OR a char is
+    covered by several byte-fallback BPEs that cover no other char (``哋``
+    → 2 BPEs, both over char 8 → group {8}). A group is the smallest set of
+    chars that cannot be split without slicing a BPE, i.e. the smallest unit
+    whose grapheme can be cleanly removed from ``input_ids``.
+
+    Returns a list of char-position lists, in ascending char order. Zero-width
+    offsets (special tokens with empty char spans) are ignored.
+    """
+    char_bpes: dict[int, set[int]] = {}
+    max_c = 0
+    for bi, (s, e) in enumerate(offsets):
+        for c in range(s, e):
+            char_bpes.setdefault(c, set()).add(bi)
+        max_c = max(max_c, e)
+
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    cur_bpes: set[int] = set()
+    for c in range(max_c):
+        cb = char_bpes.get(c)
+        if cb is None:
+            # Gap with no covering BPE — flush the running group.
+            if cur:
+                groups.append(cur)
+                cur, cur_bpes = [], set()
+            continue
+        if cur and (cb & cur_bpes):
+            cur.append(c)
+            cur_bpes |= cb
+        else:
+            if cur:
+                groups.append(cur)
+            cur, cur_bpes = [c], set(cb)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _substitute_units(
+    text_ids: list[int],
+    offsets: list[tuple[int, int]],
+    units: list[tuple[int, int, list[list[int]]]],
+    pad_id: int,
+    K: int,
+    on_fallback=None,
+) -> tuple[list[int], list[list[int]], list[bool]]:
+    """Replace each unit's covering BPE tokens with its phoneme pad(s).
+
+    Shared by training (:func:`_align_grapheme_subst_chinese` /
+    ``_english``) and inference
+    (``InpaintInferenceEngine._build_text_and_phone_tokens``) so both build
+    byte-identical ``input_ids`` — this is the contract guarded by
+    ``scripts/inpaint/test_alignment_parity.py``.
+
+    Args:
+        text_ids: BPE ids of the natural (unmarked) prefix+text.
+        offsets:  per-BPE ``(char_start, char_end)``, parallel to ``text_ids``.
+        units:    list of ``(char_start, char_end, blocks)``. ``blocks`` is a
+                  list of phoneme-id lists (one pad per block) to splice in
+                  place of the unit's graphemes. Char ranges are in the same
+                  (prefix+text) coordinate space as ``offsets`` and must be
+                  non-overlapping.
+        pad_id:   tokenizer pad id (what the LM sees at composed positions if
+                  the composer is off — e.g. the text-only eval baseline).
+        K:        storage K.
+
+    Substitution vs. insertion fallback: a unit's covering BPEs are removed
+    (true substitution) only when every char those BPEs cover lies inside the
+    substituted char set — i.e. removing them cannot delete a neighbouring,
+    non-substituted grapheme. If a covering BPE bleeds onto an unsubstituted
+    char (the English ``" B"`` leading-space case), that unit falls back to
+    INSERTION (grapheme kept, pads appended after its last covering BPE) so we
+    never corrupt a neighbour. For zh/yue every BPE covers whole CJK chars, so
+    substitution is always clean there.
+
+    Returns ``(new_text_ids, new_slots, new_mask)`` — equal length; pad
+    positions carry the unit's block in ``new_slots`` and ``True`` in
+    ``new_mask``.
+    """
+    covered_chars: set[int] = set()
+    for cs, ce, _ in units:
+        covered_chars.update(range(cs, ce))
+
+    def _covering_bpes(cs: int, ce: int) -> list[int]:
+        return [bi for bi, (bcs, bce) in enumerate(offsets)
+                if not (bce <= cs or bcs >= ce) and bce > bcs]
+
+    emit_before: dict[int, list[list[int]]] = {}  # at first covering BPE
+    emit_after: dict[int, list[list[int]]] = {}    # insertion fallback
+    remove: set[int] = set()
+    for cs, ce, blocks in units:
+        cov = _covering_bpes(cs, ce)
+        if not cov:
+            continue
+        # Clean substitution only if no covering BPE bleeds onto a char that
+        # is not part of any substituted unit.
+        clean = all(
+            all(c in covered_chars for c in range(offsets[bi][0], offsets[bi][1]))
+            for bi in cov
+        )
+        if clean:
+            emit_before.setdefault(cov[0], []).extend(blocks)
+            remove.update(cov)
+        else:
+            # A covering BPE bleeds onto an un-substituted char (e.g. the
+            # English " B" leading-space token, or a span covering only PART
+            # of a merged CJK BPE). Keep the grapheme and INSERT the pads
+            # instead — never corrupt a neighbour. This is a train/inference
+            # divergence for zh/yue (training only ever substitutes whole
+            # BPE-coherence groups), so let callers warn.
+            emit_after.setdefault(cov[-1], []).extend(blocks)
+            if on_fallback is not None:
+                on_fallback((cs, ce, blocks))
+
+    new_text_ids: list[int] = []
+    new_slots: list[list[int]] = []
+    new_mask: list[bool] = []
+
+    def _push_pad(block: list[int]) -> None:
+        new_text_ids.append(pad_id)
+        new_slots.append(_block(block, K))
+        new_mask.append(True)
+
+    for bi, tid in enumerate(text_ids):
+        for block in emit_before.get(bi, []):
+            _push_pad(block)
+        if bi not in remove:
+            new_text_ids.append(tid)
+            new_slots.append([0] * K)
+            new_mask.append(False)
+        for block in emit_after.get(bi, []):
+            _push_pad(block)
+    return new_text_ids, new_slots, new_mask
+
+
+def _align_grapheme_subst_chinese(
+    text: str,
+    text_offsets: list[tuple[int, int]],
+    text_ids: list[int],
+    phonemes: list[str],
+    alphabet: str,
+    tokenizer_obj: PhonemeTokenizer,
+    K: int,
+    pad_id: int,
+    prefix_len: int = 0,
+    keep_prob: float = 1.0,
+    rng: Optional[random.Random] = None,
+) -> tuple[list[int], list[list[int]], list[bool], int, int]:
+    """Grapheme-substitution alignment for jyutping / pinyin (v12).
+
+    Per CJK char, pull its ``[initial, final-with-tone]`` syllable from the
+    phoneme queue (skipping non-syllable placeholders, exactly as the v11
+    path does — keeps the queue↔char alignment the fixtures rely on). Then,
+    with **BPE-group-coherent** dropout (one keep/drop decision per
+    :func:`_bpe_coherence_groups` group, so merged BPEs like ``银行`` are
+    kept/dropped whole), SUBSTITUTE each kept group's grapheme BPE(s) with one
+    phoneme pad per CJK char in the group.
+
+    Returns ``(new_text_ids, new_slots, new_mask, n_kept, n_seen)`` where
+    ``n_seen`` counts CJK chars with a valid syllable and ``n_kept`` counts
+    chars actually substituted.
+    """
+    rng_ = rng or random
+    queue = [p for p in phonemes if p and p not in NON_PHONEME_TOKENS]
+
+    # Map each CJK char (in prefix+text coords) to its syllable, advancing the
+    # queue per CJK char so placeholders ('X') stay aligned.
+    char_syl: dict[int, str] = {}
+    qi = 0
+    n_seen = 0
+    for ci, ch in enumerate(text):
+        if qi >= len(queue):
+            break
+        if not _is_cjk(ch):
+            continue
+        syl = queue[qi]
+        qi += 1
+        if not syl[-1].isdigit():
+            continue
+        char_syl[ci + prefix_len] = syl
+        n_seen += 1
+
+    def _is_cjk_at(p: int) -> bool:
+        return p >= prefix_len and _is_cjk(text[p - prefix_len])
+
+    units: list[tuple[int, int, list[list[int]]]] = []
+    n_kept = 0
+    for group in _bpe_coherence_groups(text_offsets):
+        cjk_chars = [p for p in group if _is_cjk_at(p)]
+        if not cjk_chars:
+            continue
+        # Substitute only when EVERY CJK char in the group has a valid
+        # syllable — never partially mask a merged BPE.
+        if any(p not in char_syl for p in cjk_chars):
+            continue
+        if rng_.random() >= keep_prob:
+            continue
+        blocks: list[list[int]] = []
+        ok = True
+        for p in cjk_chars:
+            ini, fin = tokenizer_obj.split_whole_syllable(alphabet, char_syl[p])
+            try:
+                ids = tokenizer_obj.encode_span(alphabet, [ini, fin])
+            except ValueError:
+                ok = False
+                break
+            blocks.append(list(ids))
+        if not ok or not blocks:
+            continue
+        units.append((cjk_chars[0], cjk_chars[-1] + 1, blocks))
+        n_kept += len(cjk_chars)
+
+    new_text_ids, new_slots, new_mask = _substitute_units(
+        text_ids, text_offsets, units, pad_id, K
+    )
+    return new_text_ids, new_slots, new_mask, n_kept, n_seen
+
+
+def _align_grapheme_subst_english(
+    text: str,
+    text_offsets: list[tuple[int, int]],
+    text_ids: list[int],
+    phonemes: list[str],
+    tokenizer_obj: PhonemeTokenizer,
+    K: int,
+    pad_id: int,
+    prefix_len: int = 0,
+    keep_prob: float = 1.0,
+    rng: Optional[random.Random] = None,
+) -> tuple[list[int], list[list[int]], list[bool], int, int]:
+    """Grapheme-substitution alignment for English (ARPAbet, v12).
+
+    Per word (kept with prob ``keep_prob``), syllabify its ARPAbet and
+    SUBSTITUTE the word's grapheme BPE(s) with one pad per syllable. A word
+    whose covering BPE bleeds onto an adjacent space (e.g. the ``" B"`` token)
+    falls back to insertion inside :func:`_substitute_units` — English is not
+    parity- or behavioral-gated (the SoulX en LLM baseline loops), so this is
+    best-effort and kept structurally consistent with the zh/yue path.
+    """
+    from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
+
+    rng_ = rng or random
+
+    pwords: list[list[str]] = [[]]
+    for p in phonemes:
+        if p == "|":
+            pwords.append([])
+        else:
+            pwords[-1].append(p)
+    pwords = [w for w in pwords if w]
+
+    text_words: list[tuple[int, int]] = []
+    in_word = False
+    start = 0
+    for ci, ch in enumerate(text):
+        if ch.isalpha() or ch == "'":
+            if not in_word:
+                start = ci
+                in_word = True
+        else:
+            if in_word:
+                text_words.append((start, ci))
+                in_word = False
+    if in_word:
+        text_words.append((start, len(text)))
+
+    units: list[tuple[int, int, list[list[int]]]] = []
+    n_kept = 0
+    n_seen = 0
+    for word_idx, (cs, ce) in enumerate(text_words):
+        if word_idx >= len(pwords):
+            break
+        n_seen += 1
+        if rng_.random() >= keep_prob:
+            continue
+        syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
+        if not syll_groups:
+            continue
+        units.append(
+            (cs + prefix_len, ce + prefix_len, [list(g) for g in syll_groups])
+        )
+        n_kept += 1
+
+    new_text_ids, new_slots, new_mask = _substitute_units(
+        text_ids, text_offsets, units, pad_id, K
+    )
+    return new_text_ids, new_slots, new_mask, n_kept, n_seen
+
+
 @dataclass
 class InpaintSample:
     input_ids: torch.Tensor      # (T,)
@@ -442,14 +764,22 @@ class InpaintDataset(Dataset):
             rng = random
         keep_prob = self.cfg.phoneme_keep_prob
 
+        align_english = (
+            _align_grapheme_subst_english if self.cfg.grapheme_subst
+            else _align_padsub_english
+        )
+        align_chinese = (
+            _align_grapheme_subst_chinese if self.cfg.grapheme_subst
+            else _align_padsub_chinese
+        )
         if alphabet == "cmu":
-            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_padsub_english(
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = align_english(
                 text, base_offsets, base_text_ids, phonemes, self.phone_tok, K,
                 pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,
             )
         else:
-            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_padsub_chinese(
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = align_chinese(
                 text, base_offsets, base_text_ids, phonemes, alphabet, self.phone_tok, K,
                 pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,

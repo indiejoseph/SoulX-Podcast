@@ -109,6 +109,18 @@ class TrainConfig:
     resume_composer: str = ""
     # Dataset
     phoneme_keep_prob: float = 0.25
+    # v12 — grapheme substitution (remove the grapheme BPE at annotated
+    # positions; the composed phoneme embedding is the only signal). True is
+    # the v12 default; False reproduces v11 insertion behaviour. See
+    # docs/inpaint_v12_spec.md.
+    grapheme_subst: bool = True
+    # v12.1 lever (default OFF) — direct phoneme-recovery aux loss. When >0,
+    # a small Linear(d->vocab) head must recover each masked position's
+    # phoneme ids from the composed embedding (multi-label BCE), forcing
+    # phoneme-discriminative composed vectors. The clean v12 run is
+    # substitution-only (weight 0.0); flip this on for the v12.1 fallback if
+    # the behavioral gate still shows corr↔wrong edit=0.0. Typical 0.1-0.3.
+    aux_phoneme_loss_weight: float = 0.0
     lang_filter: str = ""             # "" = all langs (yue,zh,en); else comma-separated
     # Language-rebalanced sampling. One of:
     #   "none"     — uniform sampling (matches the corpus distribution)
@@ -163,6 +175,15 @@ def parse_args() -> TrainConfig:
     p.add_argument("--lang_balance", choices=["none", "balanced", "sqrt"], default="none",
                    help="Per-row sampling weight scheme based on language frequency.")
     p.add_argument("--phoneme_keep_prob", type=float, default=0.25)
+    p.add_argument("--aux_phoneme_loss_weight", type=float, default=0.0,
+                   help="v12.1 lever (default off). Weight of the direct "
+                        "phoneme-recovery BCE on composed embeddings. Flip to "
+                        "~0.1-0.3 if substitution-only v12 fails the gate.")
+    p.add_argument("--no_grapheme_subst", action="store_true",
+                   help="Disable v12 grapheme substitution and use the v11 "
+                        "pad-insertion path (grapheme kept). For ablation only "
+                        "— inference always substitutes, so a model trained "
+                        "this way will be train/inference-mismatched.")
     p.add_argument("--lang_filter", type=str, default="")
     p.add_argument("--max_total_tokens", type=int, default=2048)
     p.add_argument("--max_speech_tokens", type=int, default=750)
@@ -185,6 +206,7 @@ def parse_args() -> TrainConfig:
     d["init_from_text_embed"] = not d.pop("no_init_from_text_embed")
     d["gradient_checkpointing"] = not d.pop("no_gradient_checkpointing")
     d["use_8bit_adam"] = not d.pop("no_8bit_adam")
+    d["grapheme_subst"] = not d.pop("no_grapheme_subst")
     return TrainConfig(**d)
 
 
@@ -218,14 +240,51 @@ def _maybe_init_wandb(cfg: TrainConfig):
 # Forward + loss
 # --------------------------------------------------------------------- #
 
+def _aux_phoneme_loss(
+    composed: torch.Tensor,      # (B, T, d)
+    phone_token: torch.Tensor,   # (B, K*T)
+    phone_mask: torch.Tensor,    # (B, T) bool
+    aux_head: torch.nn.Module,   # Linear(d -> vocab)
+    K: int,
+) -> torch.Tensor:
+    """Direct phoneme-recovery regulariser (v12.1 lever, default-off).
+
+    Forces the composed embedding at each masked position to be decodable to
+    the exact set of phoneme ids stored in its K-block — a multi-label BCE
+    over the phoneme vocab. This attacks the per-alphabet-marker collapse
+    ([[inpaint-v11-fail-pattern]]) at its root: two positions with different
+    phonemes must produce different composed embeddings or the head cannot
+    recover them. Complements grapheme substitution (which gives the trunk a
+    reason to read the phoneme); this gives the composer a reason to write a
+    distinguishable one. Returns a scalar; 0.0 if no masked positions.
+    """
+    B, T, d = composed.shape
+    flat_mask = phone_mask.reshape(-1)              # (B*T,)
+    if not bool(flat_mask.any()):
+        return composed.new_zeros(())
+    comp = composed.reshape(B * T, d)[flat_mask]    # (N, d)
+    ids = phone_token.reshape(B, T, K).reshape(B * T, K)[flat_mask]  # (N, K)
+    logits = aux_head(comp.float())                 # (N, V)
+    target = torch.zeros_like(logits)
+    nz = ids != 0                                   # pad id 0 excluded
+    rows = torch.arange(ids.size(0), device=ids.device).unsqueeze(1).expand_as(ids)
+    target[rows[nz], ids[nz]] = 1.0
+    return F.binary_cross_entropy_with_logits(logits, target)
+
+
 def forward_step(
     model,
     composer: PhonemeComposer,
     batch: dict,
     dtype: torch.dtype,
     label_smoothing: float,
+    aux_head: torch.nn.Module = None,
+    aux_weight: float = 0.0,
 ):
-    """One forward through frozen backbone + composer; returns scalar loss + parts."""
+    """One forward through frozen backbone + composer; returns scalar loss + parts.
+
+    Returns ``(loss, lm_loss_detached, aux_loss_detached, n_loss_tokens)``.
+    """
     device = next(composer.parameters()).device
     input_ids = batch["input_ids"].to(device, non_blocking=True)
     attention_mask = batch["attention_mask"].to(device, non_blocking=True)
@@ -259,7 +318,11 @@ def forward_step(
     denom = shift_mask.sum().clamp_min(1)
     lm_loss = (ce * shift_mask).sum() / denom
 
-    return lm_loss, lm_loss.detach(), int(denom.item())
+    if aux_head is not None and aux_weight > 0.0:
+        aux_loss = _aux_phoneme_loss(composed, phone_token, phone_mask, aux_head, composer.K)
+        loss = lm_loss + aux_weight * aux_loss
+        return loss, lm_loss.detach(), aux_loss.detach(), int(denom.item())
+    return lm_loss, lm_loss.detach(), composed.new_zeros(()), int(denom.item())
 
 
 # --------------------------------------------------------------------- #
@@ -413,6 +476,7 @@ def train(cfg: TrainConfig):
         phoneme_keep_prob=cfg.phoneme_keep_prob,
         max_total_tokens=cfg.max_total_tokens,
         max_speech_tokens=cfg.max_speech_tokens,
+        grapheme_subst=cfg.grapheme_subst,
     )
     log.info(f"loading dataset from {cfg.dataset_path}")
     full_ds = InpaintDataset(
@@ -443,6 +507,7 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
+            grapheme_subst=cfg.grapheme_subst,
         ),
         lang_filter=lang_filter,
     )
@@ -454,6 +519,7 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
+            grapheme_subst=cfg.grapheme_subst,
         ),
         lang_filter=lang_filter,
     )
@@ -580,10 +646,25 @@ def train(cfg: TrainConfig):
         )
     composer.train()
 
-    n_train = sum(p.numel() for p in composer.parameters() if p.requires_grad)
+    # v12.1 lever — optional phoneme-recovery aux head (trainer-only; NOT part
+    # of the composer state, so inference strict-load + parity are unaffected).
+    aux_head = None
+    if cfg.aux_phoneme_loss_weight > 0.0:
+        aux_head = torch.nn.Linear(composer.d_model, composer.vocab_size).to("cuda", dtype=torch.float32)
+        aux_head.train()
+        log.info(
+            f"aux phoneme-recovery loss ON: weight={cfg.aux_phoneme_loss_weight} "
+            f"head=Linear({composer.d_model}->{composer.vocab_size})"
+        )
+
+    trainable_params = list(composer.parameters())
+    if aux_head is not None:
+        trainable_params += list(aux_head.parameters())
+
+    n_train = sum(p.numel() for p in trainable_params if p.requires_grad)
     n_frozen = sum(p.numel() for p in model.parameters())
     log.info(
-        f"trainable composer params: {n_train/1e6:.3f}M  "
+        f"trainable params: {n_train/1e6:.3f}M (composer + aux)  "
         f"frozen backbone params: {n_frozen/1e6:.1f}M"
     )
 
@@ -599,7 +680,7 @@ def train(cfg: TrainConfig):
     if AdamW8bit is not None:
         log.info("using bitsandbytes AdamW8bit")
         optim = AdamW8bit(
-            composer.parameters(),
+            trainable_params,
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(0.9, 0.95),
@@ -607,7 +688,7 @@ def train(cfg: TrainConfig):
     else:
         log.info("using torch AdamW (fp32 state)")
         optim = torch.optim.AdamW(
-            composer.parameters(),
+            trainable_params,
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(0.9, 0.95),
@@ -622,6 +703,7 @@ def train(cfg: TrainConfig):
     global_step = 0
     accum_loss = 0.0
     accum_lm = 0.0
+    accum_aux = 0.0
     accum_count = 0           # micro-batches since last optimizer step
     window_steps = 0          # gradient steps since last log
     tokens_since_log = 0
@@ -638,13 +720,15 @@ def train(cfg: TrainConfig):
         for batch in train_loader:
             if not batch:
                 continue
-            loss, lm_loss, n_loss_tokens = forward_step(
+            loss, lm_loss, aux_loss, n_loss_tokens = forward_step(
                 model, composer, batch, dtype, cfg.label_smoothing,
+                aux_head=aux_head, aux_weight=cfg.aux_phoneme_loss_weight,
             )
             loss = loss / cfg.grad_accum_steps
             loss.backward()
             accum_loss += float(loss)
             accum_lm += float(lm_loss) / cfg.grad_accum_steps
+            accum_aux += float(aux_loss) / cfg.grad_accum_steps
             accum_count += 1
             tokens_since_log += n_loss_tokens
             units_kept_since_log += batch.get("n_phonemes_kept", 0)
@@ -653,7 +737,7 @@ def train(cfg: TrainConfig):
             if accum_count >= cfg.grad_accum_steps:
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        composer.parameters(),
+                        trainable_params,
                         max_norm=cfg.grad_clip if cfg.grad_clip > 0 else float("inf"),
                     )
                 )
@@ -675,9 +759,11 @@ def train(cfg: TrainConfig):
                     n = max(1, window_steps)
                     mean_loss = accum_loss / n
                     mean_lm = accum_lm / n
+                    mean_aux = accum_aux / n
+                    aux_str = f"  aux={mean_aux:.4f}" if cfg.aux_phoneme_loss_weight > 0 else ""
                     log.info(
                         f"step {global_step:6d}/{cfg.max_steps}  "
-                        f"loss={mean_loss:.4f}  lm={mean_lm:.4f}  "
+                        f"loss={mean_loss:.4f}  lm={mean_lm:.4f}{aux_str}  "
                         f"|grad|={grad_norm:.3f}  "
                         f"lr={lr_now:.2e}  keep={keep_frac:.2%}  "
                         f"loss_tok/s={tps:.0f}"
@@ -686,6 +772,7 @@ def train(cfg: TrainConfig):
                         "step": global_step,
                         "loss": mean_loss,
                         "lm_loss": mean_lm,
+                        "aux_loss": mean_aux,
                         "grad_norm": grad_norm,
                         "lr": lr_now,
                         "keep_frac": keep_frac,
@@ -696,12 +783,13 @@ def train(cfg: TrainConfig):
                         wandb_run.log({
                             "train/loss": row["loss"],
                             "train/lm_loss": row["lm_loss"],
+                            "train/aux_loss": row["aux_loss"],
                             "train/grad_norm": row["grad_norm"],
                             "train/lr": row["lr"],
                             "train/keep_frac": row["keep_frac"],
                             "train/loss_tok_per_s": row["loss_tok_per_s"],
                         }, step=global_step)
-                    accum_loss = 0.0; accum_lm = 0.0
+                    accum_loss = 0.0; accum_lm = 0.0; accum_aux = 0.0
                     window_steps = 0
                     tokens_since_log = 0
                     units_kept_since_log = 0; units_seen_since_log = 0

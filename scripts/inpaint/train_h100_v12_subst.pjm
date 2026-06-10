@@ -1,0 +1,79 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=8:00:00
+#PJM -j
+
+# v12 — grapheme substitution (the ONE change vs v11).
+#
+# Spec: docs/inpaint_v12_spec.md
+# Gate: scripts/inpaint/test_alignment_{parity,behavioral}.py
+#       scripts/inpaint/diagnose_composer_noop.py
+#
+# Root cause v12 fixes: v11 (and all prior) INSERTED the phoneme pad after the
+# grapheme BPE and KEPT the grapheme, so the frozen trunk read the natural
+# reading off the surviving grapheme and the composer collapsed onto a
+# per-alphabet "marker" direction (cos(correct,wrong) ~0.99; corr↔wrong token
+# edit = 0.0 on dei6/yinhang). v12 SUBSTITUTES: the grapheme BPE(s) are removed
+# and replaced by the phoneme pad(s), making the composed embedding the only
+# signal at the annotated position. This restores the true upstream
+# CosyVoice-Inpaint recipe (`re.sub(r"\[.*?\]", pad, text)`) that v11 broke.
+#
+# Everything else is held constant vs v11 (per-alphabet heads, silence-masked
+# CE, keep_prob=0.25, K=6, 30K steps) so the gate attributes the result to the
+# substitution change alone. --grapheme_subst is ON by default; no new flag
+# needed beyond what the trainer already defaults to.
+#
+# Pre-flight on 3090 (smoke, validated 2026-06-10): parity 10/10, trains clean,
+# graphemes verified removed (银行→2 pads, 哋→1 pad). Smoke at 400 steps is
+# undertrained — does NOT confirm de-collapse; the H100 30K run + behavioral
+# gate is the verdict.
+#
+# Acceptance after 30K steps (see spec §4): behavioral ≥ 30/38 AND the M1/D1
+# discriminative asserts PASS on yue_dei6 and zh_yinhang (v11 had edit=0.0
+# there), AND diagnostic cross-fixture cosine drops below v11's per-alphabet
+# block pattern. GO only if dei6/yinhang flip to non-zero corr↔wrong edit.
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100_v12_subst \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --label_smoothing 0.0 \
+    --slots_per_token 6 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_project soulx-inpaint \
+    --wandb_run_name v12-subst

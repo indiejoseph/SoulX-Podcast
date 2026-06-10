@@ -47,7 +47,7 @@ from soulxpodcast.inpaint.ssml import parse_ssml
 from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
 from soulxpodcast.training.inpaint_dataset import (
     DIALECT_PREFIX, LANG_TO_ALPHABET,
-    _align_padsub_chinese, _align_padsub_english,
+    _align_grapheme_subst_chinese, _align_grapheme_subst_english,
     normalise_text,
 )
 
@@ -110,12 +110,12 @@ def _build_training_side(
 
     alphabet = LANG_TO_ALPHABET[lang]
     if alphabet == "cmu":
-        text_ids, slot_blocks, mask_list, _, _ = _align_padsub_english(
+        text_ids, slot_blocks, mask_list, _, _ = _align_grapheme_subst_english(
             text, base_offsets, base_text_ids, train_phonemes, phone_tok, K,
             pad_id=pad_id, prefix_len=prefix_len, keep_prob=1.0,
         )
     else:
-        text_ids, slot_blocks, mask_list, _, _ = _align_padsub_chinese(
+        text_ids, slot_blocks, mask_list, _, _ = _align_grapheme_subst_chinese(
             text, base_offsets, base_text_ids, train_phonemes, alphabet, phone_tok, K,
             pad_id=pad_id, prefix_len=prefix_len, keep_prob=1.0,
         )
