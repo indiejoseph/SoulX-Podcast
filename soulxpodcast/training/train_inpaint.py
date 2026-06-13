@@ -95,8 +95,9 @@ class TrainConfig:
     grad_clip: float = 1.0
     dtype: str = "bf16"
     seed: int = 42
-    # Composer
-    slots_per_token: int = 8
+    # Composer. Must equal PhonemeComposer.K_STORAGE (6 for v11/v12); the
+    # composer raises if given anything else, so 8 was a launch trap.
+    slots_per_token: int = 6
     # On the 160K-vocab LLM, label_smoothing=0.1 adds ~1.5 nats of irreducible
     # CE floor that makes train loss un-interpretable. Composer already has
     # phoneme-dropout + weight decay + grad clip; extra smoothing is redundant.
@@ -165,7 +166,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--slots_per_token", type=int, default=8)
+    p.add_argument("--slots_per_token", type=int, default=6)
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--no_init_from_text_embed", action="store_true")
     p.add_argument("--resume_composer", type=str, default="",

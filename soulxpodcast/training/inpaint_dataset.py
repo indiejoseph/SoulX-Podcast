@@ -441,6 +441,7 @@ def _substitute_units(
     pad_id: int,
     K: int,
     on_fallback=None,
+    free_chars: Optional[set[int]] = None,
 ) -> tuple[list[int], list[list[int]], list[bool]]:
     """Replace each unit's covering BPE tokens with its phoneme pad(s).
 
@@ -463,18 +464,25 @@ def _substitute_units(
         K:        storage K.
 
     Substitution vs. insertion fallback: a unit's covering BPEs are removed
-    (true substitution) only when every char those BPEs cover lies inside the
-    substituted char set — i.e. removing them cannot delete a neighbouring,
-    non-substituted grapheme. If a covering BPE bleeds onto an unsubstituted
-    char (the English ``" B"`` leading-space case), that unit falls back to
-    INSERTION (grapheme kept, pads appended after its last covering BPE) so we
-    never corrupt a neighbour. For zh/yue every BPE covers whole CJK chars, so
-    substitution is always clean there.
+    (true substitution) only when every char those BPEs cover is either part of
+    the substituted set OR a ``free_char`` (whitespace) — i.e. removing them can
+    only delete the annotated graphemes plus adjacent whitespace, never a
+    neighbouring *content* grapheme. ``free_chars`` is the set of whitespace
+    char positions; without it, English words whose first BPE bundles a leading
+    space (``" B"`` in ``I LIKE BANANA``) would bleed onto the space and fall
+    back to INSERTION (grapheme kept) — which left the English composer
+    non-load-bearing exactly like v11 (96% of en word units fell back). With
+    whitespace marked free, ``" B"`` is cleanly substituted (the space is
+    absorbed into the pad). A bleed onto a non-whitespace neighbour (a span
+    covering only PART of a merged CJK BPE) still falls back to insertion. For
+    zh/yue, spaces are stripped so ``free_chars`` is empty and behaviour is
+    unchanged.
 
     Returns ``(new_text_ids, new_slots, new_mask)`` — equal length; pad
     positions carry the unit's block in ``new_slots`` and ``True`` in
     ``new_mask``.
     """
+    free = free_chars or set()
     covered_chars: set[int] = set()
     for cs, ce, _ in units:
         covered_chars.update(range(cs, ce))
@@ -490,10 +498,12 @@ def _substitute_units(
         cov = _covering_bpes(cs, ce)
         if not cov:
             continue
-        # Clean substitution only if no covering BPE bleeds onto a char that
-        # is not part of any substituted unit.
+        # Clean substitution only if no covering BPE bleeds onto a CONTENT char
+        # (non-whitespace) that is not part of any substituted unit. Whitespace
+        # bundled into a word's first BPE is free to delete.
         clean = all(
-            all(c in covered_chars for c in range(offsets[bi][0], offsets[bi][1]))
+            all(c in covered_chars or c in free
+                for c in range(offsets[bi][0], offsets[bi][1]))
             for bi in cov
         )
         if clean:
@@ -629,11 +639,14 @@ def _align_grapheme_subst_english(
     """Grapheme-substitution alignment for English (ARPAbet, v12).
 
     Per word (kept with prob ``keep_prob``), syllabify its ARPAbet and
-    SUBSTITUTE the word's grapheme BPE(s) with one pad per syllable. A word
-    whose covering BPE bleeds onto an adjacent space (e.g. the ``" B"`` token)
-    falls back to insertion inside :func:`_substitute_units` — English is not
-    parity- or behavioral-gated (the SoulX en LLM baseline loops), so this is
-    best-effort and kept structurally consistent with the zh/yue path.
+    SUBSTITUTE the word's grapheme BPE(s) with one pad per syllable. The
+    word's leading space (bundled into its first BPE by the Qwen tokenizer,
+    e.g. the ``" B"`` token) is passed as a ``free_char`` so the BPE is cleanly
+    removed rather than triggering the insertion fallback that left the v12
+    English composer non-load-bearing (96% of en units fell back before this
+    fix). ``n_kept`` counts only units that ACTUALLY substituted (insertion
+    fallbacks are excluded) so the training ``keep_frac`` cannot mask a
+    substitution failure.
     """
     from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
 
@@ -668,20 +681,37 @@ def _align_grapheme_subst_english(
     for word_idx, (cs, ce) in enumerate(text_words):
         if word_idx >= len(pwords):
             break
+        # Unparseable / placeholder word (e.g. 'X' in fixtures) → not annotated.
+        # Mirrors the zh 'X'-skip convention so a sparse SSML annotation can be
+        # reproduced training-side for parity. Skipped words don't count as seen.
+        try:
+            syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
+        except ValueError:
+            continue
+        if not syll_groups:
+            continue
         n_seen += 1
         if rng_.random() >= keep_prob:
-            continue
-        syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
-        if not syll_groups:
             continue
         units.append(
             (cs + prefix_len, ce + prefix_len, [list(g) for g in syll_groups])
         )
         n_kept += 1
 
+    # Whitespace positions are free to delete with a word's leading-space BPE.
+    # Prefix chars (e.g. dialect tags) are never whitespace; use a non-space
+    # placeholder for them so they are never marked free.
+    full = ("x" * prefix_len) + text
+    free_chars = {i for i, ch in enumerate(full) if ch.isspace()}
+
+    n_fallback = [0]
     new_text_ids, new_slots, new_mask = _substitute_units(
-        text_ids, text_offsets, units, pad_id, K
+        text_ids, text_offsets, units, pad_id, K,
+        on_fallback=lambda u: n_fallback.__setitem__(0, n_fallback[0] + 1),
+        free_chars=free_chars,
     )
+    # Honest keep count: a word that fell back to insertion did NOT substitute.
+    n_kept -= n_fallback[0]
     return new_text_ids, new_slots, new_mask, n_kept, n_seen
 
 

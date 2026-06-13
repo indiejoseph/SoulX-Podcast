@@ -201,22 +201,24 @@ EN_BANANA_MULTIBPE = Fixture(
     text="I LIKE BANANA",
     ssml_correct='I LIKE <phoneme alphabet="cmu" ph="B AH N AE N AH">BANANA</phoneme>',
     ssml_wrong='I LIKE <phoneme alphabet="cmu" ph="P IH N AE P AH L">BANANA</phoneme>',
-    # 3 words. Train side splits by '|'. Use real ARPAbet for non-target words
-    # so encode_arpabet_per_syllable doesn't crash; behavioural test is off so
-    # we only need this for parity.
-    train_phonemes_correct=["AY", "|", "L", "AY", "K", "|", "B", "AH", "N", "AE", "N", "AH"],
-    train_phonemes_wrong=["AY", "|", "L", "AY", "K", "|", "P", "IH", "N", "AE", "P", "AH", "L"],
+    # 3 words. Train side splits by '|'. Non-target words use the 'X'
+    # placeholder (skipped by the aligner, mirroring the zh convention) so the
+    # training side annotates ONLY BANANA — matching the SSML which wraps only
+    # BANANA. This makes parity a like-for-like comparison.
+    train_phonemes_correct=["X", "|", "X", "|", "B", "AH", "N", "AE", "N", "AH"],
+    train_phonemes_wrong=["X", "|", "X", "|", "P", "IH", "N", "AE", "P", "AH", "L"],
     target_chars=(7, 13),
     expected_bpe_count_for_target=3,   # 'B', 'AN', 'ANA' or similar
     expected_inpaint_pads=3,            # 3 syllables: BA-NA-NA
     tok_ratio_band_correct=(0.5, 2.0),
     tok_ratio_band_wrong=(0.5, 2.0),
     enable_behavioral=False,  # LLM baseline currently loops on en prompts
-    # Training-side annotates all 3 words from row['phonemes']; inference SSML
-    # annotates only BANANA. The two intentionally produce different layouts.
-    # Parity for en would require a row format where non-target words are
-    # absent — a v12 dataset shape, not v11.
-    enable_parity=False,
+    # v12 + whitespace-tolerant substitution: training (with 'X' placeholders
+    # for non-target words) and inference (SSML annotates only BANANA) now
+    # produce the SAME layout — only BANANA is substituted on both sides — so
+    # parity is meaningful again. The leading-space BPE (" B") is cleanly
+    # substituted via free_chars, so BANANA's graphemes are removed on both.
+    enable_parity=True,
 )
 
 

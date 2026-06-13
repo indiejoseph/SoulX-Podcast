@@ -384,9 +384,14 @@ class InpaintInferenceEngine:
                 cs, ce, surface_with_prefix[cs:ce],
             )
 
+        # Whitespace positions are free to delete with a word's leading-space
+        # BPE (English); zh/yue have spaces stripped so this set is empty.
+        # MUST match the training aligner's free_chars for parity.
+        free_chars = {i for i, ch in enumerate(surface_with_prefix) if ch.isspace()}
+
         new_text_ids, new_slots, new_mask = _substitute_units(
             base_text_ids, base_offsets, units, pad_id, K,
-            on_fallback=_warn_fallback,
+            on_fallback=_warn_fallback, free_chars=free_chars,
         )
         # Pack slots into the flat phone_token shape the composer expects.
         phone_token = torch.zeros(K * len(new_text_ids), dtype=torch.long)
