@@ -1,7 +1,28 @@
 # Pronunciation-inpaint: English is not working — diagnosis & fix plan
 
 Date: 2026-06-13
-Status: zh/yue inpaint is GO (v12); English is unverified and structurally not wired.
+Status: Phase A DONE (commit 6fe5b7a). Phase B DONE — base LLM terminates on
+English under deployment decoding → retrain greenlit (`v12_en_subst_fix` PJM
+ready). zh/yue inpaint already GO (v12).
+
+## Progress log
+
+- **Phase A — DONE (commit 6fe5b7a).** `_substitute_units` whitespace-tolerant
+  (`free_chars`); en fallback 96.44% → **0.00%** on 7191 real words; BANANA →
+  `['I',' LIKE','PAD','PAD','PAD']`; parity **12/12** (en enabled). Plus honest
+  `n_kept` (finding 3) and `slots_per_token` 8→6 (finding 5).
+- **Phase B — DONE.** Base SoulX LLM termination on English, existing v12
+  checkpoint, `disable_inpaint=True`:
+  | decoding | result |
+  |---|---|
+  | greedy + rep_penalty 1.1 | 5/6 terminate (one 15-word loops) |
+  | **sampling + rep_penalty 1.1 (deployment)** | **18/18 (6 prompts × 3 seeds), incl. toy BANANA** |
+  | greedy + rep_penalty 1.0 (the gate's A/B mode) | loops on en — this is why the gate "saw" en looping |
+  Conclusion: the base model terminates on English under normal decoding; the
+  gate's en-looping is a harness artifact (greedy, no rep-penalty), NOT a
+  base-model blocker. **Retrain is worthwhile.**
+- **Phase 1 (retrain) — READY.** `scripts/inpaint/train_h100_v12_en_subst_fix.pjm`
+  (not v12.1 — aux loss off). Submit on the H100 cluster.
 Related: `docs/inpaint_v12_spec.md`, memories `inpaint-v12-grapheme-subst`,
 `inpaint-v11-fail-pattern`, `inference-text-must-match-training-format`.
 
