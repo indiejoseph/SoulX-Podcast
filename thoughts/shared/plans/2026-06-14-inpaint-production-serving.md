@@ -1,8 +1,35 @@
 # Inpaint production serving — wiring the composer into the live path
 
 Date: 2026-06-14
-Status: capability bundling DONE (composer.pt sibling + auto-detect). The
-embeds-injection integration below is NOT built.
+Status: capability bundling DONE. **Option A DONE** for the non-streaming
+`/generate` endpoint — inpaint serves via the shared HF trunk (no second model
+copy). Streaming + vLLM + multi-turn-with-history remain gated (see below).
+
+## DONE (Option A, non-streaming /generate)
+
+The shared-trunk approach worked — no second trunk, just the +86 MB composer:
+
+- `SoulXPodcast._load_composer` loads the bundled composer onto the existing HF
+  trunk at model load (HF engine + inpaint-capable → `self.inpaint_ready=True`).
+- `SoulXPodcast.generate_speech_tokens_inpaint(ssml, lang, …)` builds
+  `inputs_embeds` (text emb + composer inject) on `self.llm.model` and generates
+  speech tokens. **Verified bit-identical to the standalone InpaintInferenceEngine.**
+- `SoulXPodcast.synthesize_from_tokens(tokens, prompt_feats…)` vocodes via the
+  same prompt-align + flow + HiFT blocks as `forward_longform`. **Verified: 35
+  tokens → finite 1.40 s wav.**
+- `SoulXPodcastService.generate` detects `<phoneme>`/`<speak>` in any segment and
+  routes to `_generate_inpaint_wavs` (per-segment, independent; lang inferred
+  from the SSML alphabet). `/generate` passes `dialogue_text` straight through —
+  no route change; `validate_dialogue_format` doesn't reject SSML.
+- **Gates:** `<phoneme>` with a non-inpaint-ready model (no composer / vLLM
+  engine) → clear `RuntimeError`. `/generate-stream` with `<phoneme>` → clear
+  `RuntimeError` ("use /generate").
+
+Trade accepted: inpaint segments are generated independently (no cross-turn
+history that `forward_longform` provides) — speaker still comes from the flow
+prompt conditioning. Fine for the "fix this word" use case.
+
+## Still NOT built
 
 ## Where we are
 
@@ -73,7 +100,16 @@ from `api/service.py` / `SoulXPodcast.forward_longform`. So:
   verify before shipping inpaint on the quantized model.
 - Streaming TTFA impact of the HF path vs vLLM for inpaint requests.
 
-## Not doing now
+## Remaining (follow-ups)
 
-The bundling (this commit) is the clean, low-risk capability layer. Option A is
-the next project; it's gated on the VRAM/shared-trunk question above.
+- **Streaming inpaint** (`/generate-stream`): inject composed embeds per chunk in
+  `forward_longform_streaming`. Currently gated with a clear error.
+- **vLLM coexistence**: inpaint needs the HF trunk; under `LLM_ENGINE=vllm` the
+  model advertises capability but `inpaint_ready=False`. Either a small HF trunk
+  alongside vLLM (VRAM permitting) or an HF-only inpaint deployment mode.
+- **Multi-turn history**: inpaint segments currently generate independently. If
+  cross-turn coherence matters for inpaint dialogues, thread the composer inject
+  into the KV-cached `forward_longform` loop (harder; RAS + cache interaction).
+- **AWQ trunk**: the composer was trained on the bf16 input-embedding table
+  (not quantized by AWQ). Confirm composed embeds land correctly if inpaint runs
+  on an AWQ HF trunk before shipping that combo.

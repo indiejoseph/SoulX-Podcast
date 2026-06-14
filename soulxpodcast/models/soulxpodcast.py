@@ -110,12 +110,24 @@ class SoulXPodcast(torch.nn.Module):
         from soulxpodcast.inpaint.capability import inpaint_capability
         self.inpaint = inpaint_capability(self.config.model)
         self.inpaint_supported = self.inpaint is not None
+        # inpaint_ready: capability AND the active engine can inject embeds.
+        # Inpaint needs the HF inputs_embeds path; the vLLM engine is token-id
+        # only, so a vLLM deployment can advertise capability but not serve it.
+        self.composer = None
+        self.inpaint_ready = False
         _ts2 = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
         if self.inpaint_supported:
-            tqdm.write(f"[{_ts2}] - [INFO] - Detected bundled composer; model is "
-                       f"inpaint-capable (alphabets={self.inpaint.get('alphabets')}). "
-                       f"Inpaint runs via InpaintInferenceEngine (HF inputs_embeds); "
-                       f"the production token-id engine cannot inject embeds.")
+            is_hf = self.config.llm_engine == "hf" and hasattr(self.llm, "model")
+            if is_hf:
+                self._load_composer(self.inpaint["composer"])
+                self.inpaint_ready = True
+                tqdm.write(f"[{_ts2}] - [INFO] - Inpaint READY: bundled composer "
+                           f"loaded (alphabets={self.inpaint.get('alphabets')}); "
+                           f"shares the HF trunk via inputs_embeds.")
+            else:
+                tqdm.write(f"[{_ts2}] - [INFO] - Model is inpaint-capable but the "
+                           f"active engine ({self.config.llm_engine}) is token-id "
+                           f"only; inpaint serving needs LLM_ENGINE=hf.")
 
     def compile_for_inference(self):
         """Apply torch.compile to the flow estimator.
@@ -290,6 +302,182 @@ class SoulXPodcast(torch.nn.Module):
         results_dict['generated_wavs'] = generated_wavs
         results_dict['generated_speech_tokens'] = per_turn_speech_tokens
         return results_dict
+
+    # ------------------------------------------------------------------ #
+    # Pronunciation inpaint — shared-trunk speech-token generation.
+    # Reuses the already-loaded HF trunk (self.llm.model) via inputs_embeds, so
+    # no second model copy is needed. Single-utterance only; the multi-turn
+    # KV-cached loop above is left untouched. Returns 0-based s3tokenizer ids,
+    # which the caller feeds into the SAME flow+HiFT path as a normal turn.
+    # See docs/pronunciation_inpaint.md + 2026-06-14-inpaint-production-serving.
+    # ------------------------------------------------------------------ #
+
+    def _load_composer(self, composer_ckpt_path) -> None:
+        """Load the bundled PhonemeComposer + an SSML→slots builder. HF only."""
+        from soulxpodcast.inpaint.composer import PhonemeComposer
+        from soulxpodcast.inpaint.inference import InpaintInferenceEngine
+        from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
+        from soulxpodcast.training.inpaint_dataset import _resolve_special_tokens
+
+        ckpt = torch.load(composer_ckpt_path, map_location="cuda", weights_only=False)
+        cfg = ckpt["config"]
+        trunk = self.llm.model
+        if cfg["d_model"] != trunk.config.hidden_size:
+            raise ValueError(
+                f"composer d_model ({cfg['d_model']}) != trunk hidden_size "
+                f"({trunk.config.hidden_size}) — composer/trunk mismatch."
+            )
+        self.composer = PhonemeComposer(
+            d_model=cfg["d_model"], slots_per_token=cfg["slots_per_token"]
+        ).to("cuda", dtype=trunk.dtype)
+        self.composer.load_state_dict(ckpt["composer"], strict=True)
+        self.composer.eval()
+        self._inpaint_K = cfg["slots_per_token"]
+        self._inpaint_special = _resolve_special_tokens(self.llm.tokenizer)
+        # Reuse the parity-tested SSML→(text_ids, phone_token, phone_mask)
+        # builder by binding it to a tiny stub (same pattern as the parity test).
+        class _Builder:
+            pass
+        _b = _Builder()
+        _b.K = self._inpaint_K
+        _b.tokenizer = self.llm.tokenizer
+        _b.phone_tok = PhonemeTokenizer()
+        self._inpaint_build = (
+            InpaintInferenceEngine._build_text_and_phone_tokens.__get__(_b)
+        )
+
+    @torch.no_grad()
+    def generate_speech_tokens_inpaint(
+        self,
+        ssml_or_text: str,
+        lang: str = "yue",
+        max_new_tokens: int = 1024,
+        do_sample: bool = True,
+        temperature: float = 0.8,
+        top_p: float = 0.95,
+        repetition_penalty: float = 1.1,
+        seed=None,
+    ) -> list[int]:
+        """Generate speech tokens for one inpaint utterance via the shared trunk.
+
+        Returns 0-based s3tokenizer ids (offset stripped, EOS removed).
+        """
+        if not self.inpaint_ready:
+            raise RuntimeError(
+                "inpaint not ready (no bundled composer, or engine is not HF). "
+                "Bundle a composer (scripts/inpaint/bundle_composer.py) and run "
+                "with LLM_ENGINE=hf."
+            )
+        from soulxpodcast.inpaint.composer import (
+            ALPHABET_STR_TO_ID, apply_phoneme_inpaint,
+        )
+        from soulxpodcast.inpaint.ssml import parse_ssml
+        from soulxpodcast.training.inpaint_dataset import DIALECT_PREFIX, LANG_TO_ALPHABET
+
+        if seed is not None:
+            torch.manual_seed(seed)
+        trunk = self.llm.model
+        device = next(trunk.parameters()).device
+        K = self._inpaint_K
+        sp = self._inpaint_special
+
+        surface_text, spans = (
+            parse_ssml(ssml_or_text)
+            if ("<phoneme" in ssml_or_text or "<speak" in ssml_or_text)
+            else (ssml_or_text, [])
+        )
+        prefix = DIALECT_PREFIX.get(lang, "")
+        _, text_ids, _, phone_token, phone_mask, _ = self._inpaint_build(
+            surface_text=surface_text, spans=spans, prefix=prefix, lang=lang,
+            disable_inpaint=False,
+        )
+
+        task_prefix = [sp["task_podcast"], sp["speaker_0"], sp["text_start"]]
+        bridge = [sp["text_end"], sp["semantic_token_start"]]
+        input_ids_list = task_prefix + text_ids + bridge
+        T = len(input_ids_list)
+        start = len(task_prefix)
+        full_phone_token = torch.zeros(K * T, dtype=torch.long)
+        full_phone_mask = torch.zeros(T, dtype=torch.bool)
+        for li in range(len(text_ids)):
+            gti = start + li
+            full_phone_token[gti * K:(gti + 1) * K] = phone_token[li * K:(li + 1) * K]
+            full_phone_mask[gti] = phone_mask[li]
+
+        input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(input_ids)
+        full_phone_token = full_phone_token.unsqueeze(0).to(device)
+        full_phone_mask = full_phone_mask.unsqueeze(0).to(device)
+        alphabet_id = torch.tensor(
+            [ALPHABET_STR_TO_ID[LANG_TO_ALPHABET[lang]]], dtype=torch.long, device=device
+        )
+
+        text_emb = trunk.get_input_embeddings()(input_ids).to(trunk.dtype)
+        composed, _ = self.composer(full_phone_token, alphabet_id)
+        inputs_embeds = apply_phoneme_inpaint(text_emb, composed, full_phone_mask)
+
+        eos_id = sp["semantic_token_end"]
+        out = trunk.generate(
+            inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens, do_sample=do_sample,
+            temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty,
+            eos_token_id=eos_id, pad_token_id=self.llm.tokenizer.pad_token_id or 0,
+        )
+        gen_ids = out[0].tolist()
+        if gen_ids and gen_ids[-1] == eos_id:
+            gen_ids = gen_ids[:-1]
+        offset = self.config.hf_config.speech_token_offset
+        return [int(t - offset) for t in gen_ids if offset <= t < offset + 6561]
+
+    @torch.inference_mode()
+    def synthesize_from_tokens(
+        self,
+        generated_speech_tokens: list[int],
+        prompt_mels_for_llm,
+        prompt_mels_lens_for_llm: torch.Tensor,
+        prompt_mels_for_flow_ori,
+        spk_emb_for_flow: torch.Tensor,
+        spk_id: int = 0,
+    ):
+        """Vocode already-generated speech tokens with a voice prompt.
+
+        Reuses the SAME prompt-alignment + flow + HiFT blocks as
+        ``forward_longform`` (speaker conditioning comes from the prompt mels +
+        CAMPPlus embedding, not LLM prompt tokens — matching the inpaint token
+        generation, which is unconditioned at the LLM). Single utterance /
+        single speaker; returns a 24 kHz waveform tensor.
+        """
+        # Prompt alignment (mirror forward_longform lines for one speaker).
+        prompt_speech_tokens_ori, prompt_speech_tokens_lens_ori = self.audio_tokenizer.quantize(
+            prompt_mels_for_llm.cuda(), prompt_mels_lens_for_llm.cuda()
+        )
+        plen = prompt_speech_tokens_lens_ori[spk_id].item()
+        prompt_speech_token = prompt_speech_tokens_ori[spk_id, :plen]
+        prompt_mel = prompt_mels_for_flow_ori[spk_id]
+        prompt_mel_len = prompt_mel.shape[0]
+        if plen * 2 > prompt_mel_len:
+            prompt_speech_token = prompt_speech_token[:int(prompt_mel_len / 2)]
+            prompt_mel = prompt_mel.detach().clone().cuda()
+            prompt_mel_len = torch.tensor([prompt_mel_len]).cuda()
+        else:
+            prompt_mel = prompt_mel.detach().clone()[:plen * 2].cuda()
+            prompt_mel_len = torch.tensor([plen * 2]).cuda()
+
+        flow_input = torch.tensor([prompt_speech_token.tolist() + generated_speech_tokens])
+        flow_inputs_len = torch.tensor([prompt_speech_token.shape[0] + len(generated_speech_tokens)])
+        prompt_mels = prompt_mel[None]
+        prompt_mels_lens = prompt_mel_len
+        spk_emb = spk_emb_for_flow[spk_id:spk_id + 1]
+
+        with torch.amp.autocast("cuda", dtype=torch.float16 if self.config.hf_config.fp16_flow else torch.float32):
+            generated_mels, generated_mels_lens = self.flow(
+                flow_input.cuda(), flow_inputs_len.cuda(),
+                prompt_mels, prompt_mels_lens, spk_emb.cuda(),
+                streaming=False, finalize=True,
+            )
+        mel = generated_mels[:, :, prompt_mels_lens[0].item():generated_mels_lens[0].item()]
+        wav, _ = self.hift(speech_feat=mel)
+        return wav
 
     # ------------------------------------------------------------------ #
     # Streaming variant of forward_longform.

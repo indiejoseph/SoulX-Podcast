@@ -175,6 +175,56 @@ class SoulXPodcastService:
         """Return whether the model has been loaded."""
         return hasattr(self, 'model') and self.model is not None
 
+    @staticmethod
+    def _infer_inpaint_lang(text: str) -> str:
+        """Derive the inpaint language from the first SSML alphabet in a segment.
+
+        jyutping→yue, pinyin→zh, cmu→en. Defaults to zh (no dialect prefix) when
+        a segment carries no <phoneme> span.
+        """
+        m = re.search(r'alphabet="(\w+)"', text)
+        return {"jyutping": "yue", "pinyin": "zh", "cmu": "en"}.get(
+            m.group(1) if m else "", "zh"
+        )
+
+    def _generate_inpaint_wavs(
+        self,
+        texts: List[str],
+        spks: List[int],
+        prompt_mels_for_llm,
+        prompt_mels_lens_for_llm,
+        prompt_mels_for_flow,
+        spk_emb_for_flow,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+        seed: int,
+    ) -> Dict[str, Any]:
+        """Synthesize each segment via the shared-trunk inpaint path.
+
+        Each segment is generated independently (single-utterance) through
+        ``generate_speech_tokens_inpaint`` (composer fires only at <phoneme>
+        spans; plain segments pass through), then vocoded with that segment's
+        speaker prompt via ``synthesize_from_tokens``. Cross-turn history (a
+        ``forward_longform`` feature) is traded for pronunciation control — the
+        accepted trade for inpaint requests.
+        """
+        generated_wavs, per_turn_tokens = [], []
+        for i, text in enumerate(texts):
+            lang = self._infer_inpaint_lang(text)
+            tokens = self.model.generate_speech_tokens_inpaint(
+                text, lang=lang, do_sample=True, temperature=temperature,
+                top_p=top_p, repetition_penalty=repetition_penalty, seed=seed + i,
+            )
+            wav = self.model.synthesize_from_tokens(
+                tokens, prompt_mels_for_llm, prompt_mels_lens_for_llm,
+                prompt_mels_for_flow, spk_emb_for_flow, spk_id=spks[i],
+            )
+            generated_wavs.append(wav)
+            per_turn_tokens.append(tokens)
+            logger.info(f"inpaint segment {i} (lang={lang}): {len(tokens)} tokens")
+        return {"generated_wavs": generated_wavs, "generated_speech_tokens": per_turn_tokens}
+
     def generate(
         self,
         prompt_audio_paths: List[str],
@@ -284,12 +334,33 @@ class SoulXPodcastService:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+                # Pronunciation-inpaint routing: if any segment carries
+                # <phoneme> SSML, route to the shared-trunk inpaint path
+                # (HF inputs_embeds). Requires an inpaint-ready model (bundled
+                # composer + HF engine); the token-id/vLLM path can't inject
+                # composed embeds. See docs/pronunciation_inpaint.md.
+                is_inpaint = any("<phoneme" in t or "<speak" in t for t in texts)
+                if is_inpaint and not getattr(self.model, "inpaint_ready", False):
+                    raise RuntimeError(
+                        "Request contains <phoneme> inpaint SSML but the model is "
+                        "not inpaint-ready. Bundle a composer "
+                        "(scripts/inpaint/bundle_composer.py) and serve with "
+                        "LLM_ENGINE=hf."
+                    )
+
                 import concurrent.futures
                 import signal
 
                 def run_inference():
                     """Run model inference in a worker thread."""
                     with torch.no_grad():
+                        if is_inpaint:
+                            return self._generate_inpaint_wavs(
+                                texts, spks,
+                                prompt_mels_for_llm, prompt_mels_lens_for_llm,
+                                prompt_mels_for_flow, spk_emb_for_flow,
+                                temperature, top_p, repetition_penalty, seed,
+                            )
                         return self.model.forward_longform(**processed_data)
 
                 num_segments = len(texts)
@@ -1223,6 +1294,16 @@ class SoulXPodcastService:
                 texts.append(text)
             else:
                 raise ValueError(f"Invalid dialogue text format: {target_text}")
+
+        # Inpaint (<phoneme> SSML) is not supported on the streaming path: the
+        # streaming flow injects composed embeds per chunk, which isn't wired
+        # yet. Use the non-streaming /generate endpoint for inpaint. Fail loudly
+        # rather than silently dropping the pronunciation override.
+        if any("<phoneme" in t or "<speak" in t for t in texts):
+            raise RuntimeError(
+                "Inpaint (<phoneme> SSML) is not supported on the streaming "
+                "endpoint yet; use the non-streaming /generate endpoint."
+            )
 
         dataitem = {
             "key": "api_stream",
