@@ -218,3 +218,5 @@ runs
 .DS_Store
 exports/flow_runtime/
 docker-compose.dev.yml
+
+thoughts/
