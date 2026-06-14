@@ -12,6 +12,7 @@ Public API:
 See .claude/skills/cosyvoice-inpaint/ for the design.
 """
 
+from soulxpodcast.inpaint.capability import composer_path, inpaint_capability
 from soulxpodcast.inpaint.composer import PhonemeComposer, apply_phoneme_inpaint
 from soulxpodcast.inpaint.ssml import PhonemeSpan, parse_ssml
 from soulxpodcast.inpaint.tokenizer import PhonemeTokenizer
@@ -21,5 +22,7 @@ __all__ = [
     "PhonemeSpan",
     "PhonemeTokenizer",
     "apply_phoneme_inpaint",
+    "composer_path",
+    "inpaint_capability",
     "parse_ssml",
 ]

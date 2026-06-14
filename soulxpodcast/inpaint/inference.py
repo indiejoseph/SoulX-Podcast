@@ -81,7 +81,7 @@ class InpaintInferenceEngine:
     def __init__(
         self,
         model_path: str | Path,
-        composer_ckpt_path: str | Path,
+        composer_ckpt_path: str | Path | None = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
@@ -92,6 +92,21 @@ class InpaintInferenceEngine:
         self.dtype = dtype
         self.speech_token_offset = speech_token_offset
         self.speech_token_vocab = speech_token_vocab
+
+        # Auto-discover a composer bundled in the model dir (sibling
+        # composer.pt) when no explicit path is given — a model dir is
+        # "inpaint-capable" if it carries one (see inpaint.capability).
+        if composer_ckpt_path is None:
+            from soulxpodcast.inpaint.capability import composer_path
+            bundled = composer_path(model_path)
+            if bundled is None:
+                raise FileNotFoundError(
+                    f"no composer_ckpt_path given and no bundled composer.pt in "
+                    f"{model_path} — that model dir is not inpaint-capable. Bundle "
+                    f"one with scripts/inpaint/bundle_composer.py."
+                )
+            composer_ckpt_path = bundled
+            log.info(f"using bundled composer: {composer_ckpt_path}")
 
         log.info(f"loading tokenizer from {model_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)

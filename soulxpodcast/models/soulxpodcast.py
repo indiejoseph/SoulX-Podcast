@@ -100,6 +100,23 @@ class SoulXPodcast(torch.nn.Module):
         # the per-conv weight recomputation overhead on every forward call.
         _remove_weight_norm_safe(self.hift)
 
+        # Auto-detect pronunciation-inpaint capability: a bundled composer.pt
+        # next to flow.pt/hift.pt marks this model inpaint-capable (mirrors the
+        # MeanFlow flow-variant detection above). We only FLAG it here — the
+        # production token-id engines (HF/vLLM) cannot inject composed input
+        # embeddings, so inpaint serving runs through InpaintInferenceEngine on
+        # the HF inputs_embeds path (see docs/pronunciation_inpaint.md). The
+        # flag lets the API advertise/route the capability.
+        from soulxpodcast.inpaint.capability import inpaint_capability
+        self.inpaint = inpaint_capability(self.config.model)
+        self.inpaint_supported = self.inpaint is not None
+        _ts2 = datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]
+        if self.inpaint_supported:
+            tqdm.write(f"[{_ts2}] - [INFO] - Detected bundled composer; model is "
+                       f"inpaint-capable (alphabets={self.inpaint.get('alphabets')}). "
+                       f"Inpaint runs via InpaintInferenceEngine (HF inputs_embeds); "
+                       f"the production token-id engine cannot inject embeds.")
+
     def compile_for_inference(self):
         """Apply torch.compile to the flow estimator.
 
