@@ -23,7 +23,7 @@ Usage::
 
     .venv/bin/python scripts/inpaint/inference_smoke.py \\
       --model_path /home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/pretrained_models/SoulX-Podcast-1.7B-dialect \\
-      --composer_ckpt outputs/step_0030000/composer.pt
+      --composer_ckpt outputs/inpaint_final/step_0030000/composer.pt
 
 If the user trained on top of a merged-LoRA model (``runs/merged``),
 prefer the same model for inference. Mismatch is OK for smoke but
@@ -113,7 +113,7 @@ def parse_args():
     )
     p.add_argument(
         "--composer_ckpt",
-        default="outputs/step_0030000/composer.pt",
+        default="outputs/inpaint_final/step_0030000/composer.pt",
     )
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.8)

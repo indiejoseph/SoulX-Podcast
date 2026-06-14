@@ -48,7 +48,6 @@ from soulxpodcast.training.inpaint_dataset import (
     SPECIAL_TOKENS,
     _block,
     _resolve_special_tokens,
-    _splice_pads,
     _substitute_units,
     normalise_text,
 )
@@ -284,7 +283,7 @@ class InpaintInferenceEngine:
         ``_align_grapheme_subst_*`` byte-for-byte (asserted by
         ``scripts/inpaint/test_alignment_parity.py``).
 
-        Strategy (v12):
+        Strategy:
           1. Tokenize natural (unmarked) text + dialect prefix once.
           2. For each SSML span, build a substitution unit
              ``(char_start, char_end, blocks)`` with one slot block per
@@ -322,7 +321,7 @@ class InpaintInferenceEngine:
             phone_mask = torch.zeros(len(base_text_ids), dtype=torch.bool)
             return surface_with_prefix, base_text_ids, [], phone_token, phone_mask, 0
 
-        # v12 — build substitution units (char_start, char_end, blocks) and
+        # Build substitution units (char_start, char_end, blocks) and
         # splice via the SHARED _substitute_units so the inference input_ids
         # match the training pipeline byte-for-byte (guarded by
         # test_alignment_parity.py). Each unit's covering grapheme BPE(s) are

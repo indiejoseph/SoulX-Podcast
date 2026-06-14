@@ -22,7 +22,7 @@ the head — their phone-vocab id ranges are disjoint so the same Linear
 learns alphabet-specific patterns via embedding lookup), ``head_cmu`` for
 K=6 English.
 
-See ``docs/inpaint_v11_spec.md`` for the design rationale.
+See ``docs/pronunciation_inpaint.md`` for the design rationale.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ class PhonemeComposer(nn.Module):
         super().__init__()
         if slots_per_token != K_STORAGE:
             raise ValueError(
-                f"slots_per_token must equal K_STORAGE={K_STORAGE} for v11; "
+                f"slots_per_token must equal K_STORAGE={K_STORAGE}; "
                 f"got {slots_per_token}"
             )
         self.d_model = d_model

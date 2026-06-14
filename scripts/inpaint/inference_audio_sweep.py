@@ -201,7 +201,7 @@ def main():
     except AttributeError: pass
     engine = InpaintInferenceEngine(
         model_path="/home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/runs/merged",
-        composer_ckpt_path="outputs/inpaint_h100_v4_concat/step_0030000/composer.pt",
+        composer_ckpt_path="outputs/inpaint_final/step_0030000/composer.pt",
     )
 
     results = []

@@ -53,7 +53,7 @@ from soulxpodcast.training.inpaint_dataset import (
 
 
 MODEL_PATH = "/home/joseph/projects/notebooks/notebooks/projects/SoulX-Podcast/runs/merged"
-SLOTS_PER_TOKEN = K_STORAGE  # v11 = 6
+SLOTS_PER_TOKEN = K_STORAGE  # = 6
 
 
 # ---------------------------------------------------------------- helpers

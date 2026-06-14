@@ -1,4 +1,4 @@
-"""Adversarial input library for pre-v11 inpaint testing.
+"""Adversarial input library for inpaint testing.
 
 Each fixture is a single test case that exercises a specific known failure mode
 in the inpaint pipeline. Fixtures are intentionally hand-curated:

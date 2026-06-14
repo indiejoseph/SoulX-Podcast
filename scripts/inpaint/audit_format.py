@@ -21,9 +21,9 @@ Run examples::
 
     python scripts/inpaint/audit_format.py --check format
     python scripts/inpaint/audit_format.py --check composer \\
-        --composer_ckpt outputs/step_0030000/composer.pt
+        --composer_ckpt outputs/inpaint_final/step_0030000/composer.pt
     python scripts/inpaint/audit_format.py --check both \\
-        --composer_ckpt outputs/step_0030000/composer.pt
+        --composer_ckpt outputs/inpaint_final/step_0030000/composer.pt
 """
 
 from __future__ import annotations
@@ -148,7 +148,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--check", choices=["format", "composer", "both"], default="both")
     p.add_argument("--jsonl_path", default="tmp/dataset.jsonl")
-    p.add_argument("--composer_ckpt", default="outputs/step_0030000/composer.pt")
+    p.add_argument("--composer_ckpt", default="outputs/inpaint_final/step_0030000/composer.pt")
     p.add_argument("--sample_n", type=int, default=200,
                    help="rows to sample per language for the format check")
     args = p.parse_args()

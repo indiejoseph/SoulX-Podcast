@@ -5,20 +5,19 @@ reader recognises the pattern. Differences from the LoRA trainer:
 
 - The backbone is frozen ENTIRELY (no LoRA, no lm_head trainable). The
   only trainable params live in
-  :class:`soulxpodcast.inpaint.composer.PhonemeComposer` (~10 M for
-  ``d_model=2048, K=8``).
+  :class:`soulxpodcast.inpaint.composer.PhonemeComposer` (~43 M for
+  ``d_model=2048, K=6``).
 - The forward goes via ``inputs_embeds=`` instead of ``input_ids=`` so
   the composer's output can replace the LLM's embedding at phoneme
   positions (``apply_phoneme_inpaint``).
-- Speech-token CE on the LLM logits. v7 masks silence-target positions
+- Speech-token CE on the LLM logits, with silence-target positions masked
   out of the supervised loss via a precomputed LUT so the composer is
-  never rewarded for predicting silence (root cause of v4-v6 zh mode
-  collapse). The aux 3-way alphabet head used in v1-v6 was removed —
-  its loss was always ~0 (alphabet is trivially decodable from the
-  disjoint per-alphabet vocab ranges).
-- Phoneme dropout is **unit-level** (one CJK character or one English
-  word) with default ``phoneme_keep_prob=0.25`` — mirrors the upstream
-  CosyVoice-Inpaint recipe and matches the sparse inference distribution.
+  never rewarded for predicting silence.
+- Alignment is **grapheme substitution**: a kept unit's grapheme BPE(s) are
+  removed and replaced by the phoneme pad(s), so the composer is the only
+  signal at the annotated position. Phoneme dropout is BPE-group-coherent and
+  **unit-level** (one CJK character or one English word) with default
+  ``phoneme_keep_prob=0.25`` — matches the sparse inference distribution.
 
 Usage (small sanity run)::
 
@@ -95,8 +94,8 @@ class TrainConfig:
     grad_clip: float = 1.0
     dtype: str = "bf16"
     seed: int = 42
-    # Composer. Must equal PhonemeComposer.K_STORAGE (6 for v11/v12); the
-    # composer raises if given anything else, so 8 was a launch trap.
+    # Composer storage K. Must equal PhonemeComposer.K_STORAGE (6); the
+    # composer raises if given anything else.
     slots_per_token: int = 6
     # On the 160K-vocab LLM, label_smoothing=0.1 adds ~1.5 nats of irreducible
     # CE floor that makes train loss un-interpretable. Composer already has
@@ -110,17 +109,11 @@ class TrainConfig:
     resume_composer: str = ""
     # Dataset
     phoneme_keep_prob: float = 0.25
-    # v12 — grapheme substitution (remove the grapheme BPE at annotated
-    # positions; the composed phoneme embedding is the only signal). True is
-    # the v12 default; False reproduces v11 insertion behaviour. See
-    # docs/inpaint_v12_spec.md.
-    grapheme_subst: bool = True
-    # v12.1 lever (default OFF) — direct phoneme-recovery aux loss. When >0,
-    # a small Linear(d->vocab) head must recover each masked position's
-    # phoneme ids from the composed embedding (multi-label BCE), forcing
-    # phoneme-discriminative composed vectors. The clean v12 run is
-    # substitution-only (weight 0.0); flip this on for the v12.1 fallback if
-    # the behavioral gate still shows corr↔wrong edit=0.0. Typical 0.1-0.3.
+    # Optional direct phoneme-recovery aux loss (default OFF). When >0, a small
+    # Linear(d->vocab) head must recover each masked position's phoneme ids from
+    # the composed embedding (multi-label BCE), forcing phoneme-discriminative
+    # composed vectors. Reserve for tightening a weak alphabet (e.g. pinyin);
+    # grapheme substitution alone is sufficient for the shipped model. 0.1-0.3.
     aux_phoneme_loss_weight: float = 0.0
     lang_filter: str = ""             # "" = all langs (yue,zh,en); else comma-separated
     # Language-rebalanced sampling. One of:
@@ -177,14 +170,9 @@ def parse_args() -> TrainConfig:
                    help="Per-row sampling weight scheme based on language frequency.")
     p.add_argument("--phoneme_keep_prob", type=float, default=0.25)
     p.add_argument("--aux_phoneme_loss_weight", type=float, default=0.0,
-                   help="v12.1 lever (default off). Weight of the direct "
-                        "phoneme-recovery BCE on composed embeddings. Flip to "
-                        "~0.1-0.3 if substitution-only v12 fails the gate.")
-    p.add_argument("--no_grapheme_subst", action="store_true",
-                   help="Disable v12 grapheme substitution and use the v11 "
-                        "pad-insertion path (grapheme kept). For ablation only "
-                        "— inference always substitutes, so a model trained "
-                        "this way will be train/inference-mismatched.")
+                   help="Optional (default off). Weight of the direct "
+                        "phoneme-recovery BCE on composed embeddings; set "
+                        "~0.1-0.3 to tighten a weak alphabet (e.g. pinyin).")
     p.add_argument("--lang_filter", type=str, default="")
     p.add_argument("--max_total_tokens", type=int, default=2048)
     p.add_argument("--max_speech_tokens", type=int, default=750)
@@ -207,7 +195,6 @@ def parse_args() -> TrainConfig:
     d["init_from_text_embed"] = not d.pop("no_init_from_text_embed")
     d["gradient_checkpointing"] = not d.pop("no_gradient_checkpointing")
     d["use_8bit_adam"] = not d.pop("no_8bit_adam")
-    d["grapheme_subst"] = not d.pop("no_grapheme_subst")
     return TrainConfig(**d)
 
 
@@ -248,15 +235,15 @@ def _aux_phoneme_loss(
     aux_head: torch.nn.Module,   # Linear(d -> vocab)
     K: int,
 ) -> torch.Tensor:
-    """Direct phoneme-recovery regulariser (v12.1 lever, default-off).
+    """Direct phoneme-recovery regulariser (optional, default-off).
 
     Forces the composed embedding at each masked position to be decodable to
     the exact set of phoneme ids stored in its K-block — a multi-label BCE
-    over the phoneme vocab. This attacks the per-alphabet-marker collapse
-    ([[inpaint-v11-fail-pattern]]) at its root: two positions with different
-    phonemes must produce different composed embeddings or the head cannot
-    recover them. Complements grapheme substitution (which gives the trunk a
-    reason to read the phoneme); this gives the composer a reason to write a
+    over the phoneme vocab. This keeps composed embeddings phoneme-discriminative
+    at the source: two positions with different phonemes must produce different
+    composed embeddings or the head cannot recover them. Complements grapheme
+    substitution (which gives the trunk a reason to read the phoneme); this
+    gives the composer a reason to write a
     distinguishable one. Returns a scalar; 0.0 if no masked positions.
     """
     B, T, d = composed.shape
@@ -477,7 +464,6 @@ def train(cfg: TrainConfig):
         phoneme_keep_prob=cfg.phoneme_keep_prob,
         max_total_tokens=cfg.max_total_tokens,
         max_speech_tokens=cfg.max_speech_tokens,
-        grapheme_subst=cfg.grapheme_subst,
     )
     log.info(f"loading dataset from {cfg.dataset_path}")
     full_ds = InpaintDataset(
@@ -508,7 +494,6 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
-            grapheme_subst=cfg.grapheme_subst,
         ),
         lang_filter=lang_filter,
     )
@@ -520,7 +505,6 @@ def train(cfg: TrainConfig):
             max_total_tokens=cfg.max_total_tokens,
             max_speech_tokens=cfg.max_speech_tokens,
             deterministic_dropout=True,
-            grapheme_subst=cfg.grapheme_subst,
         ),
         lang_filter=lang_filter,
     )
@@ -647,7 +631,7 @@ def train(cfg: TrainConfig):
         )
     composer.train()
 
-    # v12.1 lever — optional phoneme-recovery aux head (trainer-only; NOT part
+    # Optional phoneme-recovery aux head (trainer-only; NOT part
     # of the composer state, so inference strict-load + parity are unaffected).
     aux_head = None
     if cfg.aux_phoneme_loss_weight > 0.0:

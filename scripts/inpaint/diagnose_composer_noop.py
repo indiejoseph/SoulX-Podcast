@@ -1,4 +1,4 @@
-"""Diagnose WHY the v11 composer is a no-op on dei6/yinhang.
+"""Diagnose composer collapse — is the composer a no-op on a phoneme override?
 
 The behavioral gate showed corr↔wrong edit distance = 0.0 on
 ``yue_dei6_byte_fallback`` and ``zh_yinhang_merged`` — the LLM emits
@@ -23,7 +23,7 @@ we can read the failing combos against a working baseline on the same axes.
 
 Usage:
     python scripts/inpaint/diagnose_composer_noop.py \
-        --composer_ckpt outputs/inpaint_h100_v11_padsub/step_0030000/composer.pt
+        --composer_ckpt outputs/inpaint_final/step_0030000/composer.pt
 """
 
 from __future__ import annotations

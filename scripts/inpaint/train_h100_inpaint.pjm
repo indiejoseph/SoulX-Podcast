@@ -1,0 +1,74 @@
+#!/bin/bash -l
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=1
+#PJM -L elapse=8:00:00
+#PJM -j
+
+# Pronunciation-inpaint composer training (final recipe).
+#
+# Spec: docs/pronunciation_inpaint.md
+# Gate: scripts/inpaint/test_alignment_{parity,behavioral}.py
+#       scripts/inpaint/diagnose_composer_noop.py
+#
+# Trains a ~43M PhonemeComposer on top of the FROZEN Qwen3 trunk. Alignment is
+# grapheme substitution: a kept/annotated unit's grapheme BPE(s) are removed
+# and replaced by the phoneme pad(s), so the composer is the only signal at the
+# annotated position. Validated to steer pronunciation across yue + zh + en.
+#
+# Acceptance after 30K steps:
+#   * parity 12/12 (test_alignment_parity.py)
+#   * behavioral: correct↔wrong disagree (M1) and correct-closer-to-baseline
+#     (D1) on the byte-fallback / merged fixtures (yue_dei6, yue_keoi5,
+#     zh_yinhang, zh_zhongguo).
+#   * diagnose_composer_noop: per-fixture cos(correct,wrong) well below collapse.
+#   NOTE: validate EN with sampling + repetition_penalty=1.1, NOT the gate's
+#   default greedy/no-penalty A/B (which loops on short en prompts regardless
+#   of the composer — a harness artifact, not a model failure).
+#
+# Optional lever (off by default): --aux_phoneme_loss_weight 0.2 adds a direct
+# phoneme-recovery BCE on composed embeddings to tighten a weak alphabet
+# (pinyin is the most data-starved: ~5.6k zh rows vs ~261k yue).
+
+module load cuda/12.9.1
+module load gcc-toolset/12
+
+cd /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast
+
+source .venv/bin/activate
+
+python -m soulxpodcast.training.train_inpaint \
+    --dataset_path /home/pj24001684/ku40000295/jc/projects/phoneme_asr_dataset/dataset_filtered.jsonl \
+    --model_path  /home/pj24001684/ku40000295/jc/projects/SoulX-Podcast/runs/merged \
+    --output_dir  runs/inpaint_h100 \
+    \
+    --batch_size 16 \
+    --grad_accum_steps 2 \
+    --max_steps 30000 \
+    \
+    --lr 5e-4 \
+    --warmup_steps 500 \
+    --grad_clip 1.0 \
+    --weight_decay 0.01 \
+    \
+    --lang_balance sqrt \
+    --phoneme_keep_prob 0.25 \
+    --label_smoothing 0.0 \
+    --slots_per_token 6 \
+    \
+    --max_total_tokens 2048 \
+    --max_speech_tokens 500 \
+    --eval_fraction 0.005 \
+    --eval_max_rows 1024 \
+    \
+    --attn_implementation sdpa \
+    \
+    --num_workers 4 \
+    --no_gradient_checkpointing \
+    --log_every 50 \
+    --eval_every 2000 \
+    --save_every 2000 \
+    --dtype bf16 \
+    --seed 42 \
+    --wandb \
+    --wandb_project soulx-inpaint \
+    --wandb_run_name inpaint

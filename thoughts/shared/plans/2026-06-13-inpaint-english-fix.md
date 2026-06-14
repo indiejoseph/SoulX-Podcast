@@ -21,8 +21,26 @@ ready). zh/yue inpaint already GO (v12).
   Conclusion: the base model terminates on English under normal decoding; the
   gate's en-looping is a harness artifact (greedy, no rep-penalty), NOT a
   base-model blocker. **Retrain is worthwhile.**
-- **Phase 1 (retrain) — READY.** `scripts/inpaint/train_h100_v12_en_subst_fix.pjm`
-  (not v12.1 — aux loss off). Submit on the H100 cluster.
+- **Phase 1 (retrain) — DONE, GO (2026-06-14).** `outputs/inpaint_h100_v12_en_subst_fix/step_0030000`.
+  Parity 12/12; behavioral 34/38 (zh/yue cleaner than v12 — zh_yinhang fully
+  passes now). **English is load-bearing**: composed cos(correct,wrong) on
+  differing syllables 0.58–0.80 (READ 0.77), norm ~55–74 (not the ×300 v11
+  marker); steering under rep_penalty=1.1 gives edit(corr,wrong) ~0.55 on
+  LIVE/READ with LIVE textbook (correct≈baseline, wrong diverges). First model
+  steering yue+zh+en. The en_banana / zh_wo gate FAILs are the greedy+no-penalty
+  baseline-loop artifact — validate en with rep_penalty=1.1 only.
+
+## Still open (lower priority)
+
+1. **Durable en gate.** The behavioral gate's greedy/no-penalty A/B loops on en,
+   so it can't validate English. Add realistic full-sentence homograph en
+   fixtures + an en path that uses rep_penalty=1.1 sampling (or compares pre-EOS
+   prefixes), so future retrains are checkable. (Validation done ad-hoc this
+   round; not yet committed as a test.)
+2. **Audio A/B.** Token-level gate passed for all 3 langs; confirm by ear that
+   correct vs wrong actually sound different (flow+HiFT).
+3. **zh still weaker than yue** (5,622 vs 261,338 rows). Optional: more zh data
+   or the aux-loss lever (v12.1) to tighten pinyin.
 Related: `docs/inpaint_v12_spec.md`, memories `inpaint-v12-grapheme-subst`,
 `inpaint-v11-fail-pattern`, `inference-text-must-match-training-format`.
 

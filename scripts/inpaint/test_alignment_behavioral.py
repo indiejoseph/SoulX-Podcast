@@ -1,4 +1,4 @@
-"""Behavioral test against the v10 adversarial fixture library.
+"""Behavioral test against the adversarial fixture library.
 
 For each fixture this script generates THREE speech-token sequences:
 
@@ -33,7 +33,7 @@ What this test CANNOT catch (documented gaps, not bugs in the test):
 Run:
 
   python scripts/inpaint/test_alignment_behavioral.py \
-    --composer_ckpt outputs/inpaint_h100_v10_filtered_meanpool/step_0030000/composer.pt \
+    --composer_ckpt outputs/inpaint_final/step_0030000/composer.pt \
     [--synthesize_audio]   # add audio-level RMS check; slower
     [--use_padsub]         # use upstream-style pad-substitution alignment
 

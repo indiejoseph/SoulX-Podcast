@@ -121,7 +121,7 @@ class InpaintDatasetConfig:
     max_total_tokens: int = 2048
     max_speech_tokens: int = 750
     min_speech_tokens: int = 8
-    # Storage K — must equal PhonemeComposer.K_STORAGE (6 in v11).
+    # Storage K — must equal PhonemeComposer.K_STORAGE (6).
     slots_per_token: int = 6
     strict: bool = False  # if True, raise on alignment overflow; else drop
     # Unit-level random masking — mirrors CosyVoice-Inpaint upstream.
@@ -137,17 +137,6 @@ class InpaintDatasetConfig:
     # __getitem__ uses a fresh `random.random()` so dropout differs every
     # epoch and across DataLoader workers.
     deterministic_dropout: bool = False
-    # v12 — grapheme substitution. When True (the v12 default), a kept
-    # alignment unit's covering BPE token(s) are REMOVED from input_ids and
-    # replaced by the phoneme-carrying pad(s). This makes the composer the
-    # ONLY signal at the annotated position, so the LM cannot read the
-    # natural reading off the surviving grapheme. When False, the v11
-    # behaviour is used (pad INSERTED after the grapheme; grapheme kept —
-    # which left the phoneme redundant and the composer collapsed onto a
-    # per-alphabet marker; see docs/inpaint_v12_spec.md). Dropout is also
-    # made BPE-group-coherent under substitution so merged BPEs (银行, 中国)
-    # are kept/dropped as a whole and actually get masked at rate keep_prob.
-    grapheme_subst: bool = True
 
 
 def _is_cjk(ch: str) -> bool:
@@ -188,205 +177,15 @@ def _block(ids: list[int], K: int) -> list[int]:
     return list(ids) + [0] * (K - len(ids))
 
 
-def _splice_pads(
-    text_ids: list[int],
-    offsets: list[tuple[int, int]],
-    inserts: list[tuple[int, list[list[int]]]],
-    pad_id: int,
-    K: int,
-) -> tuple[list[int], list[list[int]], list[bool]]:
-    """Insert pad tokens after the BPE positions covering each char.
-
-    Args:
-        text_ids: BPE ids of the natural (unmarked) text.
-        offsets: per-BPE (char_start, char_end) offsets, parallel to text_ids.
-        inserts: list of (char_pos, [K-block, K-block, ...]) — each entry
-            requests one pad token per K-block, inserted after the BPE that
-            covers ``char_pos``.
-        pad_id: tokenizer's pad token id (also acts as a marker the LLM
-            sees at composer-injected positions).
-        K: storage K (constant across alphabets).
-
-    Returns:
-        new_text_ids: text_ids with pads inserted.
-        new_slots: per-position K-slot block, parallel to new_text_ids.
-            Zero blocks at non-pad positions.
-        new_mask: per-position bool, True at pad positions only.
-
-    If a char appears as N consecutive byte-fallback BPEs (e.g. CJK chars
-    that tokenize to 2-3 byte tokens), the pad is appended after the LAST
-    of those BPEs. That keeps the composer's fire-position invariant to
-    the char's byte-length, which is what unblocks the "broadcast stutter"
-    on byte-fallback CJK.
-    """
-    # char_pos → index of the LAST BPE that covers it (largest-bi wins on tie)
-    char_to_last_bpe: dict[int, int] = {}
-    for bi, (cs, ce) in enumerate(offsets):
-        for cp in range(cs, ce):
-            char_to_last_bpe[cp] = bi
-
-    # bpe_idx → list of K-blocks to insert immediately after that BPE
-    by_bpe: dict[int, list[list[int]]] = {}
-    for cp, blocks in inserts:
-        if cp not in char_to_last_bpe:
-            continue
-        bi = char_to_last_bpe[cp]
-        by_bpe.setdefault(bi, []).extend(blocks)
-
-    new_text_ids: list[int] = []
-    new_slots: list[list[int]] = []
-    new_mask: list[bool] = []
-    for bi, tid in enumerate(text_ids):
-        new_text_ids.append(tid)
-        new_slots.append([0] * K)
-        new_mask.append(False)
-        if bi in by_bpe:
-            for block in by_bpe[bi]:
-                new_text_ids.append(pad_id)
-                new_slots.append(_block(block, K))
-                new_mask.append(True)
-    return new_text_ids, new_slots, new_mask
-
-
-def _align_padsub_chinese(
-    text: str,
-    text_offsets: list[tuple[int, int]],
-    text_ids: list[int],
-    phonemes: list[str],
-    alphabet: str,
-    tokenizer_obj: PhonemeTokenizer,
-    K: int,
-    pad_id: int,
-    prefix_len: int = 0,
-    keep_prob: float = 1.0,
-    rng: Optional[random.Random] = None,
-) -> tuple[list[int], list[list[int]], list[bool], int, int]:
-    """Pad-substitution alignment for jyutping / pinyin.
-
-    For each CJK char in ``text``, with probability ``keep_prob``, append a
-    pad token after that char's last BPE position; write the syllable's
-    ``[initial, final-with-tone]`` ids into slots 0..1 of the pad's K-block.
-
-    Returns (new_text_ids, new_slots, new_mask, n_kept, n_seen). Lengths of
-    the first three are equal: prefix BPEs + text BPEs + N inserted pads.
-    """
-    rng_ = rng or random
-    queue = [p for p in phonemes if p and p not in NON_PHONEME_TOKENS]
-    qi = 0
-    n_kept = 0
-    n_seen = 0
-    inserts: list[tuple[int, list[list[int]]]] = []
-    for ci, ch in enumerate(text):
-        if qi >= len(queue):
-            break
-        if not _is_cjk(ch):
-            continue
-        syl = queue[qi]
-        if not syl[-1].isdigit():
-            qi += 1
-            continue
-        n_seen += 1
-        qi += 1
-        if rng_.random() >= keep_prob:
-            continue
-        ini, fin = tokenizer_obj.split_whole_syllable(alphabet, syl)
-        try:
-            ids = tokenizer_obj.encode_span(alphabet, [ini, fin])
-        except ValueError:
-            continue
-        # char_pos is measured in the prefix+text string for offsets lookup
-        inserts.append((ci + prefix_len, [list(ids)]))
-        n_kept += 1
-    new_text_ids, new_slots, new_mask = _splice_pads(
-        text_ids, text_offsets, inserts, pad_id, K
-    )
-    return new_text_ids, new_slots, new_mask, n_kept, n_seen
-
-
-def _align_padsub_english(
-    text: str,
-    text_offsets: list[tuple[int, int]],
-    text_ids: list[int],
-    phonemes: list[str],
-    tokenizer_obj: PhonemeTokenizer,
-    K: int,
-    pad_id: int,
-    prefix_len: int = 0,
-    keep_prob: float = 1.0,
-    rng: Optional[random.Random] = None,
-) -> tuple[list[int], list[list[int]], list[bool], int, int]:
-    """Pad-substitution alignment for English (ARPAbet).
-
-    For each word in ``text``, with probability ``keep_prob``, syllabify
-    the word's ARPAbet via ``encode_arpabet_per_syllable`` and append ONE
-    pad token per syllable after the word's last BPE. Each pad's K-block
-    holds the phone ids for its syllable (zero-padded out to K).
-
-    Returns (new_text_ids, new_slots, new_mask, n_kept, n_seen).
-    """
-    from soulxpodcast.inpaint.tokenizer import encode_arpabet_per_syllable
-
-    rng_ = rng or random
-
-    pwords: list[list[str]] = [[]]
-    for p in phonemes:
-        if p == "|":
-            pwords.append([])
-        else:
-            pwords[-1].append(p)
-    pwords = [w for w in pwords if w]
-
-    text_words: list[tuple[int, int]] = []
-    in_word = False
-    start = 0
-    for ci, ch in enumerate(text):
-        if ch.isalpha() or ch == "'":
-            if not in_word:
-                start = ci
-                in_word = True
-        else:
-            if in_word:
-                text_words.append((start, ci))
-                in_word = False
-    if in_word:
-        text_words.append((start, len(text)))
-
-    inserts: list[tuple[int, list[list[int]]]] = []
-    n_kept = 0
-    n_seen = 0
-    for word_idx, (cs, ce) in enumerate(text_words):
-        if word_idx >= len(pwords):
-            break
-        n_seen += 1
-        if rng_.random() >= keep_prob:
-            continue
-        syll_groups = encode_arpabet_per_syllable(pwords[word_idx])
-        if not syll_groups:
-            continue
-        # Insert one pad per syllable after the last char of the word
-        # (which routes to the word's last BPE via _splice_pads).
-        last_char = ce - 1 + prefix_len
-        inserts.append((last_char, [list(g) for g in syll_groups]))
-        n_kept += 1
-    new_text_ids, new_slots, new_mask = _splice_pads(
-        text_ids, text_offsets, inserts, pad_id, K
-    )
-    return new_text_ids, new_slots, new_mask, n_kept, n_seen
-
-
 # --------------------------------------------------------------------- #
-# v12 — grapheme substitution
+# Grapheme substitution
 # --------------------------------------------------------------------- #
 #
-# v11 (above) INSERTED a pad after the covering BPE and kept the grapheme,
-# so at an annotated position the trunk saw both the natural reading (the
-# grapheme) and the composer's phoneme. The phoneme was therefore redundant
-# and the composer collapsed onto a per-alphabet "marker" direction (the LM
-# read the answer off the surviving grapheme). v12 SUBSTITUTES: it removes
-# the unit's grapheme BPE(s) and replaces them with the phoneme pad(s), so
-# the composed embedding is the only signal for that position. The shared
-# splicer below is used by BOTH training and inference so the
-# train/inference contract (guarded by test_alignment_parity.py) holds.
+# At a kept/annotated unit we REMOVE the covering grapheme BPE(s) and replace
+# them with the phoneme pad(s), so the composed embedding is the only signal
+# for that position (the LM cannot read the natural reading off a surviving
+# grapheme). The shared splicer below is used by BOTH training and inference
+# so the train/inference contract (guarded by test_alignment_parity.py) holds.
 
 
 def _bpe_coherence_groups(
@@ -554,7 +353,7 @@ def _align_grapheme_subst_chinese(
     keep_prob: float = 1.0,
     rng: Optional[random.Random] = None,
 ) -> tuple[list[int], list[list[int]], list[bool], int, int]:
-    """Grapheme-substitution alignment for jyutping / pinyin (v12).
+    """Grapheme-substitution alignment for jyutping / pinyin.
 
     Per CJK char, pull its ``[initial, final-with-tone]`` syllable from the
     phoneme queue (skipping non-syllable placeholders, exactly as the v11
@@ -636,13 +435,13 @@ def _align_grapheme_subst_english(
     keep_prob: float = 1.0,
     rng: Optional[random.Random] = None,
 ) -> tuple[list[int], list[list[int]], list[bool], int, int]:
-    """Grapheme-substitution alignment for English (ARPAbet, v12).
+    """Grapheme-substitution alignment for English (ARPAbet).
 
     Per word (kept with prob ``keep_prob``), syllabify its ARPAbet and
     SUBSTITUTE the word's grapheme BPE(s) with one pad per syllable. The
     word's leading space (bundled into its first BPE by the Qwen tokenizer,
     e.g. the ``" B"`` token) is passed as a ``free_char`` so the BPE is cleanly
-    removed rather than triggering the insertion fallback that left the v12
+    removed rather than triggering the insertion fallback that left the
     English composer non-load-bearing (96% of en units fell back before this
     fix). ``n_kept`` counts only units that ACTUALLY substituted (insertion
     fallbacks are excluded) so the training ``keep_frac`` cannot mask a
@@ -794,22 +593,14 @@ class InpaintDataset(Dataset):
             rng = random
         keep_prob = self.cfg.phoneme_keep_prob
 
-        align_english = (
-            _align_grapheme_subst_english if self.cfg.grapheme_subst
-            else _align_padsub_english
-        )
-        align_chinese = (
-            _align_grapheme_subst_chinese if self.cfg.grapheme_subst
-            else _align_padsub_chinese
-        )
         if alphabet == "cmu":
-            text_ids, text_slot_blocks, text_phone_mask, kept, seen = align_english(
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_grapheme_subst_english(
                 text, base_offsets, base_text_ids, phonemes, self.phone_tok, K,
                 pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,
             )
         else:
-            text_ids, text_slot_blocks, text_phone_mask, kept, seen = align_chinese(
+            text_ids, text_slot_blocks, text_phone_mask, kept, seen = _align_grapheme_subst_chinese(
                 text, base_offsets, base_text_ids, phonemes, alphabet, self.phone_tok, K,
                 pad_id=pad_id, prefix_len=prefix_len,
                 keep_prob=keep_prob, rng=rng,

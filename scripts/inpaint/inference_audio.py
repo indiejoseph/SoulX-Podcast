@@ -174,7 +174,7 @@ def parse_args():
     )
     p.add_argument(
         "--composer_ckpt",
-        default="outputs/step_0030000/composer.pt",
+        default="outputs/inpaint_final/step_0030000/composer.pt",
     )
     p.add_argument("--output_dir", default="outputs/inpaint_audio")
     p.add_argument("--max_new_tokens", type=int, default=120)
