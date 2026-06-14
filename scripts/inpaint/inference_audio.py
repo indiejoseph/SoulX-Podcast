@@ -174,7 +174,9 @@ def parse_args():
     )
     p.add_argument(
         "--composer_ckpt",
-        default="outputs/inpaint_final/step_0030000/composer.pt",
+        default=None,
+        help="Composer checkpoint. If omitted, auto-discovers the bundled "
+             "composer.pt in --model_path (an inpaint-capable model dir).",
     )
     p.add_argument("--output_dir", default="outputs/inpaint_audio")
     p.add_argument("--max_new_tokens", type=int, default=120)
@@ -329,7 +331,7 @@ def main():
         pass
 
     # ---- Load Inpaint engine ----
-    log.info(f"loading InpaintInferenceEngine from {args.composer_ckpt}")
+    log.info(f"loading InpaintInferenceEngine (composer_ckpt={args.composer_ckpt or 'auto (bundled)'})")
     inpaint_engine = InpaintInferenceEngine(
         model_path=args.model_path,
         composer_ckpt_path=args.composer_ckpt,
