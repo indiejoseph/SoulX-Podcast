@@ -1,0 +1,111 @@
+# Production deployment: downloads model from HuggingFace on first run.
+#
+# Usage:
+#   cp .env.deploy.example .env.deploy
+#   # Edit .env.deploy — set HF_TOKEN and API_KEY at minimum
+#   docker compose -f docker-compose.deploy.yml --env-file .env.deploy up -d
+#
+# First run: pulls ~2.6 GB from HuggingFace into the `model-data` volume.
+# Subsequent runs: skips download (sentinel file present).
+#
+# To force a re-download: docker volume rm tts-deploy_model-data
+
+name: tts-deploy
+
+services:
+  tts:
+    build:
+      context: .
+      dockerfile: Dockerfile.serve
+      args:
+        INSTALL_TRT: "false"  # skip TRT in deploy — not used with MeanFlow
+    image: tts:deploy
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "16gb"
+    ipc: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    volumes:
+      - model-data:/app/model          # persists downloaded weights
+      - ./api/outputs:/app/api/outputs
+      - ./api/temp:/app/api/temp
+      - ./example:/app/example:ro
+    environment:
+      # --- HuggingFace model download ---
+      HF_REPO: "${HF_REPO:-indiejoseph/SoulX-Podcast-1.7B-AWQ-MeanFlow-InPaint}"
+      HF_TOKEN: "${HF_TOKEN:?HF_TOKEN must be set for private repo download}"
+      MODEL_PATH: /app/model
+
+      # --- Serving ---
+      API_KEY: "${API_KEY:?API_KEY must be set}"
+      REQUIRE_API_KEY: "${REQUIRE_API_KEY:-true}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
+      CORS_ALLOW_CREDENTIALS: "${CORS_ALLOW_CREDENTIALS:-false}"
+      REDIS_URL: "redis://redis:6379/0"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-tts}"
+      TASK_TTL_SECONDS: "${TASK_TTL_SECONDS:-86400}"
+
+      # --- LLM engine: vLLM V1 + AWQ + ngram speculative decoding ---
+      LLM_ENGINE: vllm
+      VLLM_ENFORCE_EAGER: "false"
+      VLLM_GPU_MEMORY_UTILIZATION: "${VLLM_GPU_MEMORY_UTILIZATION:-0.7}"
+      VLLM_USE_V1: "1"
+      VLLM_SPEC_NGRAM: "true"
+      VLLM_SPEC_NUM_SPECULATIVE_TOKENS: "3"
+      VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MAX: "8"
+      VLLM_SPEC_NGRAM_PROMPT_LOOKUP_MIN: "4"
+      VLLM_ENABLE_CHUNKED_PREFILL: "true"
+      ENABLE_MTP: "false"
+
+      # --- Flow: MeanFlow 1-step (auto-detected from flow.pt keys) ---
+      FP16_FLOW: "true"
+      FLOW_STREAMING: "true"
+      FLOW_STEPS: "1"
+      STREAM_CHUNK_SIZE: "${STREAM_CHUNK_SIZE:-150}"
+      STREAM_FIRST_CHUNK_SIZE: "${STREAM_FIRST_CHUNK_SIZE:-4}"
+
+      # --- Multi-stream batching ---
+      FLOW_HIFT_BATCHING: "${FLOW_HIFT_BATCHING:-true}"
+      FLOW_HIFT_BATCH_SIZE: "${FLOW_HIFT_BATCH_SIZE:-4}"
+
+      # --- Prompt audio ---
+      PROMPT_AUDIO_ROOT: /app
+      PROMPT_CACHE_SIZE: "${PROMPT_CACHE_SIZE:-16}"
+      PROMPT_CACHE_TTL_SECONDS: "${PROMPT_CACHE_TTL_SECONDS:-3600}"
+
+      TORCH_COMPILE: "false"
+      TRT_ESTIMATOR: "false"
+
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import json, urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); assert d['status']=='healthy'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s  # extra time for first-run model download
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  model-data:   # persists downloaded model across container restarts
+  redis-data:

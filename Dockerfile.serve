@@ -44,19 +44,17 @@ RUN grep -vE '^(torch|torchaudio|triton)([>=<!]|$)' /tmp/requirements.txt \
 
 COPY . /app
 
-RUN groupadd --system app && \
-    useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app && \
-    mkdir -p /app/api/temp /app/api/outputs && \
-    chown -R app:app /app
+RUN mkdir -p /app/api/temp /app/api/outputs /app/model && \
+    chmod +x /app/scripts/docker_entrypoint.sh
 
-ENV MODEL_PATH=/app/runs/merged \
+ENV MODEL_PATH=/app/model \
     LLM_ENGINE=vllm \
     VLLM_ENFORCE_EAGER=false \
     VLLM_GPU_MEMORY_UTILIZATION=0.7 \
     FP16_FLOW=true \
     ENABLE_MTP=false \
     FLOW_STREAMING=true \
-    FLOW_STEPS=4 \
+    FLOW_STEPS=1 \
     STREAM_CHUNK_SIZE=150 \
     STREAM_FIRST_CHUNK_SIZE=4 \
     PROMPT_AUDIO_ROOT=/app \
@@ -66,7 +64,5 @@ ENV MODEL_PATH=/app/runs/merged \
 
 EXPOSE 8000
 
-USER app
-
-ENTRYPOINT ["python3", "run_api.py"]
+ENTRYPOINT ["/app/scripts/docker_entrypoint.sh"]
 CMD []
